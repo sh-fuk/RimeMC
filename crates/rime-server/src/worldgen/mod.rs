@@ -6,6 +6,7 @@
 
 pub mod biome;
 pub mod biome_builder;
+pub mod carver;
 pub mod chunk;
 pub mod density;
 pub mod noise;
@@ -20,7 +21,7 @@ use serde_json::Value;
 
 use crate::registry::BlockState;
 use biome::BiomeTree;
-use chunk::{NoiseChunk, Settings, HEIGHT, MIN_Y};
+use chunk::{Aquifer, FluidPicker, NoiseChunk, Settings, HEIGHT, MIN_Y};
 use density::{Loader, Router};
 use random::{Xoroshiro, XoroshiroFactory};
 use surface::{BiomeCache, BiomeSource, ChunkBiomes, SurfaceSystem};
@@ -36,6 +37,7 @@ pub struct VanillaGenerator {
     aquifer_random: XoroshiroFactory,
     ore_random: XoroshiroFactory,
     biome_cache: BiomeCache,
+    carvers: Vec<carver::Carver>,
 }
 
 /// A generated chunk: blocks `((y - MIN_Y) * 16 + z) * 16 + x`, biome ids per
@@ -59,6 +61,15 @@ impl VanillaGenerator {
             aquifers: ns["aquifers_enabled"].as_bool().unwrap_or(true),
             ore_veins: ns["ore_veins_enabled"].as_bool().unwrap_or(true),
         };
+        // every overworld biome uses the same carver list
+        let plains: Value = load("worldgen/biome/plains")?;
+        let carvers = plains["carvers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c.as_str())
+            .map(|c| carver::Carver::load(load, c))
+            .collect::<Result<Vec<_>>>()?;
         let tree = BiomeTree::new(&biome_builder::overworld());
         let names = crate::world::chunk::Biomes::get();
         let tree_ids = tree.values.iter().map(|b| names.id(&format!("minecraft:{b}")).unwrap_or(0)).collect();
@@ -72,10 +83,11 @@ impl VanillaGenerator {
             aquifer_random: factory.from_hash_of("minecraft:aquifer").fork_positional(),
             ore_random: factory.from_hash_of("minecraft:ore").fork_positional(),
             biome_cache: BiomeCache::default(),
+            carvers,
         })
     }
 
-    /// noise + biomes + surface (no carvers / features / structures yet).
+    /// noise + biomes + surface + carvers (no features / structures yet).
     pub fn generate(&self, cx: i32, cz: i32) -> Generated {
         let nc = NoiseChunk::new(&self.router.graph, cx, cz);
         let mut blocks = chunk::fill_with(&nc, &self.router, &self.settings, self.aquifer_random, self.ore_random);
@@ -101,6 +113,13 @@ impl VanillaGenerator {
         }
         let bs = BiomeSource::new(&self.router, &self.tree, &nc, &self.tree_ids, &self.biome_cache);
         self.surface.build(&self.router, &bs, cx, cz, &mut blocks, &mut heights);
+        if !self.carvers.is_empty() {
+            let picker = FluidPicker::overworld(self.settings.sea_level, self.settings.default_fluid);
+            let mut aquifer = Aquifer::new(&nc, &self.router, self.aquifer_random, &picker, MIN_Y, HEIGHT);
+            let top = |x: i32, y: i32, z: i32, fluid: bool, h: &[i32; 256]| self.surface.top_material(&self.router, &bs, h, x, y, z, fluid);
+            let mut ctx = carver::Carving { cx, cz, blocks: &mut blocks, heights: &mut heights, mask: vec![false; (16 * 16 * HEIGHT) as usize], aquifer: &mut aquifer, top: &top };
+            carver::apply(&self.carvers, self.seed, &mut ctx);
+        }
         Generated { blocks, biomes, heights }
     }
 }

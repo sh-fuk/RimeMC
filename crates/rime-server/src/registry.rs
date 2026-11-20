@@ -131,6 +131,11 @@ impl BlockRegistry {
         R.get_or_init(parse_blocks)
     }
 
+    /// Number of block states.
+    pub fn state_count(&self) -> usize {
+        self.state_block.len()
+    }
+
     pub fn block(&self, s: BlockState) -> &BlockInfo {
         &self.blocks[*self.state_block.get(s.0 as usize).unwrap_or(&0) as usize]
     }

@@ -541,6 +541,30 @@ fn is_fluid(b: BlockState) -> bool {
 }
 
 impl SurfaceSystem {
+    /// `SurfaceSystem.topMaterial`: the surface rule result for a block
+    /// exposed by a carver (stone depth 1 above and below).
+    #[allow(clippy::too_many_arguments)]
+    pub fn top_material(&self, router: &Router, bs: &BiomeSource, heights: &[i32; 256], x: i32, y: i32, z: i32, has_fluid: bool) -> Option<BlockState> {
+        let ctx = Ctx {
+            sys: self,
+            bs,
+            router,
+            heights,
+            x,
+            y,
+            z,
+            stone_above: 1,
+            stone_below: 1,
+            water_height: if has_fluid { y + 1 } else { i32::MIN },
+            surface_depth: self.surface_depth(x, z),
+            secondary: Cell::new(None),
+            min_surface: Cell::new(None),
+            biome: Cell::new(None),
+            steep: Cell::new(None),
+        };
+        ctx.apply(&self.rule)
+    }
+
     /// `SurfaceSystem.buildSurface` for one chunk. `heights` is the
     /// WORLD_SURFACE_WG heightmap (highest non-air y per column, z*16+x)
     /// and is kept up to date.
