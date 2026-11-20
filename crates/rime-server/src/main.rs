@@ -18,6 +18,7 @@ mod registry;
 mod tick;
 mod vanilla;
 mod world;
+mod worldgen;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
