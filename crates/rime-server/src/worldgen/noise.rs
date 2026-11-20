@@ -342,3 +342,120 @@ impl BlendedNoise {
         clamped_lerp(q, l / 512.0, m / 512.0) / 128.0
     }
 }
+
+const F2: f64 = 0.3660254037844386; // 0.5 * (sqrt(3) - 1)
+const G2: f64 = 0.21132486540518713; // (3 - sqrt(3)) / 6
+
+#[derive(Clone)]
+pub struct SimplexNoise {
+    p: [i32; 512],
+    pub xo: f64,
+    pub yo: f64,
+    pub zo: f64,
+}
+
+impl SimplexNoise {
+    pub fn new(r: &mut dyn Rng) -> Self {
+        let xo = r.next_double() * 256.0;
+        let yo = r.next_double() * 256.0;
+        let zo = r.next_double() * 256.0;
+        let mut p = [0i32; 512];
+        for (i, v) in p.iter_mut().enumerate().take(256) {
+            *v = i as i32;
+        }
+        for i in 0..256 {
+            let j = r.next_int_bound(256 - i as i32) as usize;
+            p.swap(i, j + i);
+        }
+        Self { p, xo, yo, zo }
+    }
+
+    #[inline]
+    fn p(&self, i: i32) -> i32 {
+        self.p[(i & 255) as usize]
+    }
+
+    fn corner(i: i32, x: f64, y: f64, z: f64, base: f64) -> f64 {
+        let f = base - x * x - y * y - z * z;
+        if f < 0.0 {
+            0.0
+        } else {
+            let f = f * f;
+            let g = &GRADIENT[i as usize];
+            f * f * (g[0] * x + g[1] * y + g[2] * z)
+        }
+    }
+
+    pub fn value_2d(&self, d: f64, e: f64) -> f64 {
+        let h = (d + e) * F2;
+        let i = floor(d + h);
+        let j = floor(e + h);
+        let k = (i + j) as f64 * G2;
+        let l = i as f64 - k;
+        let m = j as f64 - k;
+        let n = d - l;
+        let o = e - m;
+        let (q, r) = if n > o { (1, 0) } else { (0, 1) };
+        let s = n - q as f64 + G2;
+        let t = o - r as f64 + G2;
+        let u = n - 1.0 + 2.0 * G2;
+        let v = o - 1.0 + 2.0 * G2;
+        let w = i & 255;
+        let x = j & 255;
+        let y = self.p(w + self.p(x)) % 12;
+        let z = self.p(w + q + self.p(x + r)) % 12;
+        let aa = self.p(w + 1 + self.p(x + 1)) % 12;
+        let ab = Self::corner(y, n, o, 0.0, 0.5);
+        let ac = Self::corner(z, s, t, 0.0, 0.5);
+        let ad = Self::corner(aa, u, v, 0.0, 0.5);
+        70.0 * (ab + ac + ad)
+    }
+}
+
+/// `PerlinSimplexNoise` (only the 2D lookup used by biome temperature).
+#[derive(Clone)]
+pub struct PerlinSimplexNoise {
+    levels: Vec<Option<SimplexNoise>>,
+    highest_freq_input_factor: f64,
+    highest_freq_value_factor: f64,
+}
+
+impl PerlinSimplexNoise {
+    pub fn new(r: &mut Legacy, octaves: &[i32]) -> Self {
+        let first = *octaves.iter().min().unwrap();
+        let last = *octaves.iter().max().unwrap();
+        let i = -first;
+        let j = last;
+        let k = (i + j + 1) as usize;
+        let s = SimplexNoise::new(r);
+        let l = j;
+        let mut levels: Vec<Option<SimplexNoise>> = vec![None; k];
+        let has = |o: i32| octaves.contains(&o);
+        if l >= 0 && (l as usize) < k && has(0) {
+            levels[l as usize] = Some(s.clone());
+        }
+        for m in (l + 1) as usize..k {
+            if has(l - m as i32) {
+                levels[m] = Some(SimplexNoise::new(r));
+            } else {
+                r.consume(262);
+            }
+        }
+        assert!(j <= 0, "positive simplex octaves are not needed");
+        Self { levels, highest_freq_input_factor: 2f64.powi(j), highest_freq_value_factor: 1.0 / (2f64.powi(k as i32) - 1.0) }
+    }
+
+    pub fn value(&self, x: f64, y: f64) -> f64 {
+        let mut d = 0.0;
+        let mut e = self.highest_freq_input_factor;
+        let mut f = self.highest_freq_value_factor;
+        for s in &self.levels {
+            if let Some(s) = s {
+                d += s.value_2d(x * e, y * e) * f;
+            }
+            e /= 2.0;
+            f *= 2.0;
+        }
+        d
+    }
+}

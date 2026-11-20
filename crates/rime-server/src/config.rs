@@ -90,11 +90,22 @@ pub struct WorldCfg {
     pub seed: i64,
     /// zstd level for AirWorld (1..=22)
     pub compression_level: i32,
+    /// "vanilla" = identical to vanilla 26.1 for the same seed (CPU, all
+    /// cores; needs double precision, so it cannot run on the GPU);
+    /// "fast" = RimeMC's own simple terrain (GPU-accelerated).
+    pub generator: GeneratorKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GeneratorKind {
+    Vanilla,
+    Fast,
 }
 
 impl Default for WorldCfg {
     fn default() -> Self {
-        Self { name: "world".into(), format: WorldFormat::Airworld, seed: 0, compression_level: 6 }
+        Self { name: "world".into(), format: WorldFormat::Airworld, seed: 0, compression_level: 6, generator: GeneratorKind::Vanilla }
     }
 }
 

@@ -136,7 +136,7 @@ impl ServerState {
 
     pub fn status(&self) -> String {
         format!(
-            "RimeMC {} | uptime {}s | players {}/{} | mspt {:.2} | RAM world {:.1} MiB, {} dirty region(s) | {} chunk(s) loaded | GPU generator {} | fleet {:?}",
+            "RimeMC {} | uptime {}s | players {}/{} | mspt {:.2} | RAM world {:.1} MiB, {} dirty region(s) | {} chunk(s) loaded | generator {} | fleet {:?}",
             env!("CARGO_PKG_VERSION"),
             self.started.elapsed().as_secs(),
             self.online_players(),
@@ -145,7 +145,7 @@ impl ServerState {
             self.store.memory_used() as f64 / 1048576.0,
             self.store.dirty_regions(),
             self.game.world.loaded(),
-            if self.generator.gpu_active() { "on" } else { "off" },
+            if self.generator.is_vanilla() { "vanilla" } else if self.generator.gpu_active() { "on" } else { "off" },
             self.cfg.fleet.mode
         )
     }
@@ -233,11 +233,18 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
         tracing::info!("RAM world: {n} region file(s) loaded into memory ({:.1} MiB)", bytes as f64 / 1048576.0);
     }
     let seed = load_or_create_seed(&world_dir, cfg.world.seed)?;
-    let generator = Arc::new(Generator::new(seed, cfg.gpu.enabled, cfg.gpu.min_batch));
     let ops = Ops::load(&dir.join("ops.json"))?;
 
     // official vanilla data (registries, tags, worldgen) — downloaded from Mojang once
     let vanilla = vanilla::VanillaData::ensure(&dir)?;
+    let mut generator = Generator::new(seed, cfg.world.generator == config::GeneratorKind::Fast && cfg.gpu.enabled, cfg.gpu.min_batch);
+    if cfg.world.generator == config::GeneratorKind::Vanilla {
+        let load = |rel: &str| vanilla.read_json(&format!("minecraft/{rel}.json"));
+        let t = std::time::Instant::now();
+        generator = generator.with_vanilla(worldgen::VanillaGenerator::new(&load, seed)?);
+        tracing::info!("vanilla 26.1 world generation ready (seed {seed}, {} ms); runs on all CPU cores", t.elapsed().as_millis());
+    }
+    let generator = Arc::new(generator);
     let config_data = net::config_data::ConfigData::build(&vanilla)?;
     tracing::info!("loaded {} synchronized registries from vanilla {} data", config_data.registries.len(), registry::blocks::MC_VERSION);
 

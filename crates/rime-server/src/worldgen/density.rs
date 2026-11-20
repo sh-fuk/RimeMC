@@ -93,6 +93,16 @@ pub struct Graph {
     pub slot: Vec<u32>,
 }
 
+/// `RandomState.getOrCreateNoise(key)`
+pub fn make_noise(load: &Loader, factory: &XoroshiroFactory, name: &str) -> Result<NormalNoise> {
+    let name = if name.contains(':') { name.to_string() } else { format!("minecraft:{name}") };
+    let key = name.trim_start_matches("minecraft:");
+    let p = load(&format!("worldgen/noise/{key}"))?;
+    let first = p["firstOctave"].as_i64().context("firstOctave")? as i32;
+    let amps: Vec<f64> = p["amplitudes"].as_array().context("amplitudes")?.iter().filter_map(Value::as_f64).collect();
+    Ok(NormalNoise::new(&mut factory.from_hash_of(&name), first, &amps))
+}
+
 pub struct Builder<'a> {
     load: &'a Loader<'a>,
     factory: XoroshiroFactory,
@@ -138,11 +148,7 @@ impl<'a> Builder<'a> {
         if let Some(&i) = self.noise_ids.get(&name) {
             return Ok(i);
         }
-        let key = name.trim_start_matches("minecraft:");
-        let p = (self.load)(&format!("worldgen/noise/{key}"))?;
-        let first = p["firstOctave"].as_i64().context("firstOctave")? as i32;
-        let amps: Vec<f64> = p["amplitudes"].as_array().context("amplitudes")?.iter().filter_map(Value::as_f64).collect();
-        let n = NormalNoise::new(&mut self.factory.from_hash_of(&name), first, &amps);
+        let n = make_noise(self.load, &self.factory, &name)?;
         let i = self.g.noises.len();
         self.g.noises.push(Arc::new(n));
         self.g.noise_names.push(name.clone());

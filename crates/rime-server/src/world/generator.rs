@@ -166,6 +166,8 @@ pub fn build_chunk(cx: i32, cz: i32, seed: u32, heights: &[i32; 256]) -> Chunk {
 /// Generator front-end: batches go to the GPU when available, else to all CPU cores.
 pub struct Generator {
     pub seed: u32,
+    /// vanilla-identical generator (preferred when set)
+    vanilla: Option<std::sync::Arc<crate::worldgen::VanillaGenerator>>,
     #[cfg(feature = "gpu")]
     gpu: Option<super::gpu::GpuHeights>,
     min_gpu_batch: usize,
@@ -182,15 +184,24 @@ impl Generator {
                 None if use_gpu => tracing::info!("no usable GPU found; world generation runs on all CPU cores"),
                 None => {}
             }
-            Self { seed, gpu, min_gpu_batch }
+            Self { seed, vanilla: None, gpu, min_gpu_batch }
         }
         #[cfg(not(feature = "gpu"))]
         {
             if use_gpu {
                 tracing::info!("built without the `gpu` feature; world generation runs on all CPU cores");
             }
-            Self { seed, min_gpu_batch }
+            Self { seed, vanilla: None, min_gpu_batch }
         }
+    }
+
+    pub fn with_vanilla(mut self, v: crate::worldgen::VanillaGenerator) -> Self {
+        self.vanilla = Some(std::sync::Arc::new(v));
+        self
+    }
+
+    pub fn is_vanilla(&self) -> bool {
+        self.vanilla.is_some()
     }
 
     pub fn gpu_active(&self) -> bool {
@@ -206,6 +217,9 @@ impl Generator {
 
     /// Generate many chunks at once (parallel / GPU-batched).
     pub fn generate_batch(&self, coords: &[(i32, i32)]) -> Vec<Chunk> {
+        if let Some(v) = &self.vanilla {
+            return coords.par_iter().map(|&(x, z)| vanilla_chunk(v, x, z)).collect();
+        }
         let heights: Vec<[i32; 256]> = self.heights_batch(coords);
         coords.par_iter().zip(heights.par_iter()).map(|(&(x, z), h)| build_chunk(x, z, self.seed, h)).collect()
     }
@@ -223,6 +237,27 @@ impl Generator {
         let _ = self.min_gpu_batch;
         coords.par_iter().map(|&(x, z)| chunk_heights_cpu(x, z, self.seed)).collect()
     }
+}
+
+fn vanilla_chunk(v: &crate::worldgen::VanillaGenerator, cx: i32, cz: i32) -> Chunk {
+    let g = v.generate(cx, cz);
+    let mut c = Chunk::empty(cx, cz);
+    for (i, &b) in g.blocks.iter().enumerate() {
+        if !b.is_air() {
+            let i = i as i32;
+            c.set((i & 15) as usize, MIN_Y + (i >> 8), ((i >> 4) & 15) as usize, b);
+        }
+    }
+    for (dst, src) in c.biomes.iter_mut().zip(&g.biomes) {
+        *dst = *src;
+    }
+    for (h, &g) in c.heightmap.iter_mut().zip(&g.heights) {
+        *h = g as i16;
+    }
+    for s in &mut c.sections {
+        s.optimize();
+    }
+    c
 }
 
 #[cfg(test)]

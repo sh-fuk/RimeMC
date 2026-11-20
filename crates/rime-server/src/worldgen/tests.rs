@@ -181,3 +181,129 @@ fn biome_parameters_match_vanilla() {
     }
     assert_eq!(got.len(), want.len());
 }
+
+#[test]
+fn full_chunks_match_vanilla() {
+    let Some(dir) = data_dir() else { return };
+    if vref_chunk(0, 0).is_none() {
+        return;
+    }
+    let generator = super::VanillaGenerator::new(&loader(dir), 12345).unwrap();
+    let mut total = 0;
+    let mut tested = 0;
+    let mut by_kind: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut coords: Vec<(i32, i32)> = (-8..8).flat_map(|x| (-8..8).map(move |z| (x, z))).filter(|(x, z)| (x * 5 + z * 11) % 4 == 0).collect();
+    // RIME_CHUNKS="x,z;x,z": extra reference chunks (special biomes)
+    if let Ok(list) = std::env::var("RIME_CHUNKS") {
+        for p in list.split(';') {
+            let mut it = p.split(',').map(|v| v.trim().parse::<i32>().unwrap());
+            coords.push((it.next().unwrap(), it.next().unwrap()));
+        }
+    }
+    {
+        for (cx, cz) in coords {
+            let Some(v) = vref_chunk(cx, cz) else { eprintln!("no reference for {cx},{cz}"); continue };
+            tested += 1;
+            let g = generator.generate(cx, cz);
+            let mut bad = 0;
+            let mut bb = 0;
+            for (si, sec) in g.biomes.iter().enumerate() {
+                for (i, &b) in sec.iter().enumerate() {
+                    if b != v.biomes[si][i] {
+                        bb += 1;
+                    }
+                }
+            }
+            if bb > 0 {
+                eprintln!("chunk {cx},{cz}: {bb} biome mismatches");
+                *by_kind.entry("biome".into()).or_default() += bb;
+                bad += bb;
+            }
+            for y in -64..320 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let a = g.blocks[(((y + 64) * 16 + z) * 16 + x) as usize];
+                        let b = v.get(x as usize, y, z as usize);
+                        if a == b {
+                            continue;
+                        }
+                        // fluid ticks that ran after generation
+                        let reg = crate::registry::BlockRegistry::get();
+                        if a.is_air() && reg.property(b, "level").is_some_and(|l| l != "0") {
+                            continue;
+                        }
+                        *by_kind.entry(format!("{} -> {}", a.name(), b.name())).or_default() += 1;
+                        if bad < 3 {
+                            eprintln!("chunk {cx},{cz} at {x},{y},{z}: ours {} vanilla {}", a.name(), b.name());
+                        }
+                        bad += 1;
+                    }
+                }
+            }
+            total += bad;
+        }
+    }
+    eprintln!("{tested} chunks, {total} mismatches: {by_kind:?}");
+    assert!(tested > 0);
+    assert_eq!(total, 0);
+}
+
+/// Debug aid: RIME_FIND=1 prints chunks whose surface biome is one of the
+/// rarely-covered surface-rule cases.
+#[test]
+fn find_special_biomes() {
+    let (Some(dir), Ok(_)) = (data_dir(), std::env::var("RIME_FIND")) else { return };
+    let load = loader(dir);
+    let settings = load("worldgen/noise_settings/overworld").unwrap();
+    let r = Router::new(&load, &settings, Xoroshiro::new(12345).fork_positional()).unwrap();
+    let tree = super::biome::BiomeTree::new(&super::biome_builder::overworld());
+    use super::chunk::r as ri;
+    let fns = [ri::TEMPERATURE, ri::VEGETATION, ri::CONTINENTS, ri::EROSION, ri::DEPTH, ri::RIDGES];
+    let mut found: std::collections::BTreeMap<&str, (i32, i32)> = Default::default();
+    for d in 0i32..200 {
+        for cx in -d..=d {
+            for cz in -d..=d {
+                if cx.abs() != d && cz.abs() != d {
+                    continue;
+                }
+                if (cx + cz) % 3 != 0 {
+                    continue;
+                }
+                let t = fns.map(|f| super::biome::quantize(r.eval(f, cx * 16 + 8, 64, cz * 16 + 8)));
+                let b = tree.values[tree.find(t)];
+                if ["eroded_badlands", "badlands", "wooded_badlands", "frozen_ocean", "deep_frozen_ocean", "frozen_peaks", "snowy_slopes", "jagged_peaks", "ice_spikes", "mangrove_swamp", "swamp", "desert", "stony_peaks", "mushroom_fields", "grove", "snowy_beach", "windswept_gravelly_hills"].contains(&b) {
+                    found.entry(b).or_insert((cx, cz));
+                }
+            }
+        }
+    }
+    eprintln!("{found:?}");
+}
+
+/// Debug aid: RIME_COLUMN="cx,cz,x,z" prints a column (ours vs vanilla).
+#[test]
+fn column_dump() {
+    let (Some(dir), Ok(c)) = (data_dir(), std::env::var("RIME_COLUMN")) else { return };
+    let v: Vec<i32> = c.split(',').map(|s| s.parse().unwrap()).collect();
+    let generator = super::VanillaGenerator::new(&loader(dir), 12345).unwrap();
+    let g = generator.generate(v[0], v[1]);
+    let r = vref_chunk(v[0], v[1]).unwrap();
+    for y in (20..80).rev() {
+        let a = g.blocks[(((y + 64) * 16 + v[3]) * 16 + v[2]) as usize];
+        let b = r.get(v[2] as usize, y, v[3] as usize);
+        eprintln!("{y}: {} {} {}", a.name(), b.name(), if a == b { "" } else { "<<<" });
+    }
+}
+
+/// RIME_BENCH=1: chunks per second on all cores.
+#[test]
+fn bench_generation() {
+    let (Some(dir), Ok(_)) = (data_dir(), std::env::var("RIME_BENCH")) else { return };
+    use rayon::prelude::*;
+    let generator = super::VanillaGenerator::new(&loader(dir), 42).unwrap();
+    let coords: Vec<(i32, i32)> = (0..16).flat_map(|x| (0..16).map(move |z| (x + 100, z - 300))).collect();
+    let t = std::time::Instant::now();
+    let n: usize = coords.par_iter().map(|&(x, z)| generator.generate(x, z).blocks.len()).count();
+    let s = t.elapsed().as_secs_f64();
+    eprintln!("{n} chunks in {s:.2}s = {:.0} chunks/s on {} threads", n as f64 / s, rayon::current_num_threads());
+}

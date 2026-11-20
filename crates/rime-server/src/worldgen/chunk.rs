@@ -522,8 +522,12 @@ pub struct Settings {
 /// Terrain of one chunk: blocks indexed `((y - MIN_Y) * 16 + z) * 16 + x`.
 pub fn fill(router: &Router, settings: &Settings, aquifer_random: XoroshiroFactory, ore_random: XoroshiroFactory, cx: i32, cz: i32) -> Vec<BlockState> {
     let nc = NoiseChunk::new(&router.graph, cx, cz);
+    fill_with(&nc, router, settings, aquifer_random, ore_random)
+}
+
+pub fn fill_with(nc: &NoiseChunk, router: &Router, settings: &Settings, aquifer_random: XoroshiroFactory, ore_random: XoroshiroFactory) -> Vec<BlockState> {
     let picker = FluidPicker::overworld(settings.sea_level, settings.default_fluid);
-    let mut aq = Aquifer::new(&nc, router, aquifer_random, &picker, MIN_Y, HEIGHT);
+    let mut aq = Aquifer::new(nc, router, aquifer_random, &picker, MIN_Y, HEIGHT);
     let fd = router.ids[r::FINAL_DENSITY];
     let mut out = vec![blocks::AIR; (16 * 16 * HEIGHT) as usize];
     for y in MIN_Y..MIN_Y + HEIGHT {
@@ -540,7 +544,7 @@ pub fn fill(router: &Router, settings: &Settings, aquifer_random: XoroshiroFacto
                 };
                 let state = match state {
                     Some(s) => Some(s),
-                    None if settings.ore_veins => ore_vein(&nc, router, &ore_random, bx, y, bz),
+                    None if settings.ore_veins => ore_vein(nc, router, &ore_random, bx, y, bz),
                     None => None,
                 }
                 .unwrap_or(settings.default_block);
