@@ -406,6 +406,10 @@ impl Carver {
             }
         };
         ctx.blocks[i] = state;
+        // (the lava branch reads the flag left by the previous aquifer call, like vanilla)
+        if ctx.aquifer.schedule && crate::registry::vstate::has_fluid(state) {
+            ctx.marks.push([wx, y, wz]);
+        }
         let col = (lz * 16 + lx) as usize;
         if state.is_air() && ctx.heights[col] == y {
             let mut h = y - 1;
@@ -420,6 +424,9 @@ impl Carver {
                 let fluid = BlockRegistry::get().has_fluid(state);
                 if let Some(s) = (ctx.top)(wx, y - 1, wz, fluid, ctx.heights) {
                     ctx.blocks[below] = s;
+                    if crate::registry::vstate::has_fluid(s) {
+                        ctx.marks.push([wx, y - 1, wz]);
+                    }
                 }
             }
         }
@@ -461,6 +468,8 @@ pub struct Carving<'c, 'n, 'a> {
     pub mask: Vec<bool>,
     pub aquifer: &'c mut Aquifer<'n, 'a>,
     pub top: &'c TopMaterial<'c>,
+    /// positions marked for post processing (fluids to update)
+    pub marks: &'c mut Vec<[i32; 3]>,
 }
 
 impl Carving<'_, '_, '_> {

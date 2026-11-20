@@ -3,3 +3,4 @@
 /run/
 *.air.tmp
 /cache/
+.DS_Store

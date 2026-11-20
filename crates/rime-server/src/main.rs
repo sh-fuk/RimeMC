@@ -239,12 +239,16 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
     let vanilla = vanilla::VanillaData::ensure(&dir)?;
     let mut generator = Generator::new(seed, cfg.world.generator == config::GeneratorKind::Fast && cfg.gpu.enabled, cfg.gpu.min_batch);
     if cfg.world.generator == config::GeneratorKind::Vanilla {
-        let load = |rel: &str| vanilla.read_json(&format!("minecraft/{rel}.json"));
+        let load = |rel: &str| match rel.strip_prefix("structure/") {
+            Some(_) => crate::nbt::gz_file_json(&vanilla.path(&format!("minecraft/{rel}.nbt"))),
+            None => vanilla.read_json(&format!("minecraft/{rel}.json")),
+        };
         let t = std::time::Instant::now();
         generator = generator.with_vanilla(worldgen::VanillaGenerator::new(&load, seed)?);
         tracing::info!("vanilla 26.1 world generation ready (seed {seed}, {} ms); runs on all CPU cores", t.elapsed().as_millis());
     }
     let generator = Arc::new(generator);
+    backup_on_generator_change(&world_dir, generator.gen_id())?;
     let config_data = net::config_data::ConfigData::build(&vanilla)?;
     tracing::info!("loaded {} synchronized registries from vanilla {} data", config_data.registries.len(), registry::blocks::MC_VERSION);
 
@@ -451,6 +455,33 @@ fn load_or_find_spawn(world_dir: &Path, game: &game::Game, store: &WorldStore, g
     };
     std::fs::write(&p, format!("{} {} {}", spawn[0], spawn[1], spawn[2]))?;
     Ok(spawn)
+}
+
+/// Chunks saved by another generator are generated again (unless edited by
+/// players). Before the first run with a new generator the old region files
+/// are copied to `region-backup-<old id>` so nothing is ever lost.
+fn backup_on_generator_change(world_dir: &Path, id: u32) -> anyhow::Result<()> {
+    let p = world_dir.join("rime-generator.txt");
+    let old = std::fs::read_to_string(&p).ok().and_then(|s| s.trim().parse::<u32>().ok());
+    if old == Some(id) {
+        return Ok(());
+    }
+    let region = world_dir.join("region");
+    if region.is_dir() && std::fs::read_dir(&region)?.next().is_some() {
+        let dst = world_dir.join(format!("region-backup-{}", old.unwrap_or(0)));
+        if !dst.exists() {
+            std::fs::create_dir_all(&dst)?;
+            for e in std::fs::read_dir(&region)? {
+                let e = e?;
+                if e.file_type()?.is_file() {
+                    std::fs::copy(e.path(), dst.join(e.file_name()))?;
+                }
+            }
+            tracing::info!("world generator changed: old chunks backed up to {}; unedited old chunks will be generated again", dst.display());
+        }
+    }
+    std::fs::write(&p, id.to_string())?;
+    Ok(())
 }
 
 fn load_or_create_seed(world_dir: &Path, cfg_seed: i64) -> anyhow::Result<i64> {

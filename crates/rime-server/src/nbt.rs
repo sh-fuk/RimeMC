@@ -157,7 +157,36 @@ impl Tag {
     }
 }
 
+/// Read a gzipped NBT file (e.g. a structure template) as JSON:
+/// compounds become objects, lists and arrays become arrays.
+pub fn gz_file_json(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+    use std::io::Read;
+    let raw = std::fs::read(path)?;
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(&raw[..]).take(64 << 20).read_to_end(&mut out)?;
+    let (_, tag) = Tag::from_root_bytes(&out)?;
+    Ok(tag.to_json())
+}
+
 impl Tag {
+    pub fn to_json(&self) -> serde_json::Value {
+        use serde_json::Value as V;
+        match self {
+            Tag::Byte(v) => V::from(*v),
+            Tag::Short(v) => V::from(*v),
+            Tag::Int(v) => V::from(*v),
+            Tag::Long(v) => V::from(*v),
+            Tag::Float(v) => V::from(*v as f64),
+            Tag::Double(v) => V::from(*v),
+            Tag::ByteArray(v) => V::Array(v.iter().map(|x| V::from(*x)).collect()),
+            Tag::String(v) => V::from(v.clone()),
+            Tag::List(v) => V::Array(v.iter().map(Tag::to_json).collect()),
+            Tag::Compound(v) => V::Object(v.iter().map(|(k, t)| (k.clone(), t.to_json())).collect()),
+            Tag::IntArray(v) => V::Array(v.iter().map(|x| V::from(*x)).collect()),
+            Tag::LongArray(v) => V::Array(v.iter().map(|x| V::from(*x)).collect()),
+        }
+    }
+
     /// Convert JSON (datapack format) to NBT the way vanilla's codecs accept it:
     /// integers → Int/Long, fractions → Double, booleans → Byte, and
     /// heterogeneous lists wrapped as `{"": value}` compounds.

@@ -2,9 +2,15 @@
 //! placed features, the global feature order (`FeatureSorter`), decoration
 //! seeds and a `WorldGenRegion`-like 3x3 chunk view.
 
+pub mod extra;
+pub mod extra2;
+pub mod extra3;
+pub mod extra4;
+pub mod fossil;
 pub mod feat;
 pub mod place;
 pub mod survive;
+pub mod tree;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -65,6 +71,10 @@ pub struct Proto {
     pub biomes: Vec<[u8; 64]>,
     /// top block y per heightmap kind (MIN_Y - 1 when empty)
     pub hm: [[i32; 256]; 4],
+    /// positions marked for post processing (`markPosForPostprocessing`)
+    pub post: Vec<[i32; 3]>,
+    /// scheduled fluid ticks (`scheduleTick`)
+    pub ticks: Vec<[i32; 3]>,
 }
 
 #[inline]
@@ -88,7 +98,7 @@ impl Proto {
                 }
             }
         }
-        Proto { blocks, biomes, hm }
+        Proto { blocks, biomes, hm, post: Vec::new(), ticks: Vec::new() }
     }
 
     pub fn get(&self, x: i32, y: i32, z: i32) -> BlockState {
@@ -129,6 +139,8 @@ pub struct Region<'a> {
     pub chunks: Vec<Box<Proto>>,
     pub lib: &'a Lib,
     pub zoom_seed: i64,
+    /// world seed (`WorldGenLevel.getSeed`)
+    pub seed: i64,
     /// noise biome outside the region (computed from the biome source)
     pub outside: &'a (dyn Fn(i32, i32, i32) -> u8 + Sync),
 }
@@ -185,6 +197,20 @@ impl Region<'_> {
         }
     }
 
+    /// `getFluidTicks().schedule` (world coordinates)
+    pub fn schedule_tick(&mut self, p: [i32; 3]) {
+        if let Some(i) = self.slot(p[0], p[2]) {
+            self.chunks[i].ticks.push(p);
+        }
+    }
+
+    /// `markPosForPostprocessing` (world coordinates)
+    pub fn mark_post(&mut self, p: [i32; 3]) {
+        if let Some(i) = self.slot(p[0], p[2]) {
+            self.chunks[i].post.push(p);
+        }
+    }
+
     pub fn is_empty(&self, p: [i32; 3]) -> bool {
         vstate::air(self.get(p))
     }
@@ -201,6 +227,22 @@ impl Region<'_> {
     /// `getBiome(pos)` (fuzzy zoom), network biome id.
     pub fn biome(&self, p: [i32; 3]) -> u8 {
         super::surface::fuzzy_biome(self.zoom_seed, p[0], p[1], p[2], &|x, y, z| self.noise_biome(x, y, z))
+    }
+}
+
+/// `LevelChunk.postProcessGeneration` for the centre chunk of `lv`:
+/// `Block.updateFromNeighbourShapes` at each marked position, which for the
+/// blocks features leave there means plants that lost their support break.
+pub fn post_process(lv: &mut Region) {
+    let marks = std::mem::take(&mut lv.chunks[4].post);
+    for p in marks {
+        let s = lv.get(p);
+        if vstate::air(s) || vstate::liquid(s) {
+            continue;
+        }
+        if !survive::can_survive(lv, s, p) {
+            lv.set(p, if vstate::is_water(s) { blocks::WATER } else { blocks::AIR });
+        }
     }
 }
 
@@ -257,6 +299,9 @@ pub struct Lib {
     pub climates: Vec<super::surface::Climate>,
     pub sea_level: i32,
     pub tags: survive::Tags,
+    /// per block state: 0 other, 1 has a leaf `distance`, 2 prevents nearby leaf decay
+    pub leaf_kind: Vec<u8>,
+    pub extra_tags: extra::Tags,
 }
 
 /// Parsing state (tags and shared configured / placed features).
@@ -414,8 +459,23 @@ impl Lib {
             }
         }
         let tags = survive::Tags::load(&mut b)?;
+        let no_decay = b.tag("prevents_nearby_leaf_decay")?;
+        let reg = crate::registry::BlockRegistry::get();
+        let leaf_kind = (0..reg.state_count())
+            .map(|i| {
+                let s = BlockState(i as u16);
+                if no_decay.contains(s) {
+                    2
+                } else if reg.property(s, "distance").is_some() && reg.property(s, "persistent").is_some() {
+                    1
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let extra_tags = extra::Tags::load(&mut b)?;
         let missing = std::mem::take(&mut b.missing);
-        let lib = Lib { steps, biome_steps, biome_features, info_noise: PerlinSimplexNoise::new(&mut Legacy::new(2345), &[0]), temps, climates, sea_level, tags };
+        let lib = Lib { steps, biome_steps, biome_features, info_noise: PerlinSimplexNoise::new(&mut Legacy::new(2345), &[0]), temps, climates, sea_level, tags, leaf_kind, extra_tags };
         Ok((lib, missing))
     }
 

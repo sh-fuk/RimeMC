@@ -239,6 +239,8 @@ pub struct Aquifer<'n, 'a> {
     size_x: i32,
     size_z: i32,
     skip_sampling_above_y: i32,
+    /// `shouldScheduleFluidUpdate` after the last `compute_substance`
+    pub schedule: bool,
 }
 
 impl<'n, 'a> Aquifer<'n, 'a> {
@@ -268,6 +270,7 @@ impl<'n, 'a> Aquifer<'n, 'a> {
             size_x,
             size_z,
             skip_sampling_above_y: from_grid_y(gy, 11) - 1,
+            schedule: false,
         }
     }
 
@@ -277,6 +280,7 @@ impl<'n, 'a> Aquifer<'n, 'a> {
 
     /// None = keep the solid default block.
     pub fn compute_substance(&mut self, x: i32, y: i32, z: i32, density: f64) -> Option<BlockState> {
+        self.schedule = false;
         if density > 0.0 {
             return None;
         }
@@ -288,8 +292,8 @@ impl<'n, 'a> Aquifer<'n, 'a> {
             return Some(blocks::LAVA);
         }
         let (gx, gy, gz) = (grid_x(x - 5), grid_y(y + 1), grid_x(z - 5));
-        let (mut d1, mut d2, mut d3) = (i32::MAX, i32::MAX, i32::MAX);
-        let (mut i1, mut i2, mut i3) = (0usize, 0usize, 0usize);
+        let (mut d1, mut d2, mut d3, mut d4) = (i32::MAX, i32::MAX, i32::MAX, i32::MAX);
+        let (mut i1, mut i2, mut i3, mut i4) = (0usize, 0usize, 0usize, 0usize);
         for dx in 0..=1 {
             for dy in -1..=1 {
                 for dz in 0..=1 {
@@ -307,31 +311,47 @@ impl<'n, 'a> Aquifer<'n, 'a> {
                     let (ex, ey, ez) = (loc.0 - x, loc.1 - y, loc.2 - z);
                     let d = ex * ex + ey * ey + ez * ez;
                     if d1 >= d {
+                        i4 = i3;
                         i3 = i2;
                         i2 = i1;
                         i1 = idx;
+                        d4 = d3;
                         d3 = d2;
                         d2 = d1;
                         d1 = d;
                     } else if d2 >= d {
+                        i4 = i3;
                         i3 = i2;
                         i2 = idx;
+                        d4 = d3;
                         d3 = d2;
                         d2 = d;
                     } else if d3 >= d {
+                        i4 = i3;
                         i3 = idx;
+                        d4 = d3;
                         d3 = d;
+                    } else if d4 >= d {
+                        i4 = idx;
+                        d4 = d;
                     }
                 }
             }
         }
+        // `FLOWING_UPDATE_SIMULARITY = similarity(10^2, 12^2)`
+        let flowing = similarity(100, 144);
         let s1 = self.status(i1);
         let sim = similarity(d1, d2);
         let state = s1.at(y);
         if sim <= 0.0 {
+            if sim >= flowing {
+                let s2 = self.status(i2);
+                self.schedule = s1 != s2;
+            }
             return Some(state);
         }
         if state == blocks::WATER && self.picker.compute(x, y - 1, z).at(y - 1) == blocks::LAVA {
+            self.schedule = true;
             return Some(state);
         }
         let mut barrier = f64::NAN;
@@ -355,6 +375,14 @@ impl<'n, 'a> Aquifer<'n, 'a> {
                 return None;
             }
         }
+        let b12 = s1 != s2;
+        let b23 = sim23 >= flowing && s2 != s3;
+        let b13 = sim13 >= flowing && s1 != s3;
+        self.schedule = if b12 || b23 || b13 {
+            true
+        } else {
+            sim13 >= flowing && similarity(d1, d4) >= flowing && s1 != self.status(i4)
+        };
         Some(state)
     }
 
@@ -522,10 +550,12 @@ pub struct Settings {
 /// Terrain of one chunk: blocks indexed `((y - MIN_Y) * 16 + z) * 16 + x`.
 pub fn fill(router: &Router, settings: &Settings, aquifer_random: XoroshiroFactory, ore_random: XoroshiroFactory, cx: i32, cz: i32) -> Vec<BlockState> {
     let nc = NoiseChunk::new(&router.graph, cx, cz);
-    fill_with(&nc, router, settings, aquifer_random, ore_random)
+    fill_with(&nc, router, settings, aquifer_random, ore_random, &mut Vec::new())
 }
 
-pub fn fill_with(nc: &NoiseChunk, router: &Router, settings: &Settings, aquifer_random: XoroshiroFactory, ore_random: XoroshiroFactory) -> Vec<BlockState> {
+/// `marks` receives the fluid blocks the aquifer wants updated once the
+/// chunk is loaded (`markPosForPostprocessing`, world coordinates).
+pub fn fill_with(nc: &NoiseChunk, router: &Router, settings: &Settings, aquifer_random: XoroshiroFactory, ore_random: XoroshiroFactory, marks: &mut Vec<[i32; 3]>) -> Vec<BlockState> {
     let picker = FluidPicker::overworld(settings.sea_level, settings.default_fluid);
     let mut aq = Aquifer::new(nc, router, aquifer_random, &picker, MIN_Y, HEIGHT);
     let fd = router.ids[r::FINAL_DENSITY];
@@ -536,7 +566,11 @@ pub fn fill_with(nc: &NoiseChunk, router: &Router, settings: &Settings, aquifer_
                 let (bx, bz) = (nc.min_x + x, nc.min_z + z);
                 let density = nc.in_chunk(fd, bx, y, bz);
                 let state = if settings.aquifers {
-                    aq.compute_substance(bx, y, bz, density)
+                    let s = aq.compute_substance(bx, y, bz, density);
+                    if aq.schedule && s.is_some_and(crate::registry::vstate::has_fluid) {
+                        marks.push([bx, y, bz]);
+                    }
+                    s
                 } else if density > 0.0 {
                     None
                 } else {

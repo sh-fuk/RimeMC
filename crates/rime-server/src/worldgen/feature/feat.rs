@@ -28,6 +28,8 @@ pub enum Feature {
     RandomSelector { features: Vec<(Arc<Placed>, f32)>, default: Arc<Placed> },
     SimpleRandomSelector(Vec<Arc<Placed>>),
     RandomBoolean(Arc<Placed>, Arc<Placed>),
+    Tree(Box<super::tree::Tree>),
+    Extra(Box<super::extra::Extra>),
 }
 
 fn targets(b: &mut Builder, v: &Value) -> Result<Vec<OreTarget>> {
@@ -62,11 +64,25 @@ impl Feature {
                 };
                 Feature::SimpleRandomSelector(list.iter().map(|f| b.placed(f)).collect::<Result<_>>()?)
             }
+            "tree" => match super::tree::Tree::parse(b, c) {
+                Ok(t) => Feature::Tree(Box::new(t)),
+                Err(e) => {
+                    *b.missing.entry(format!("tree ({e})")).or_default() += 1;
+                    Feature::Unsupported(ty)
+                }
+            },
             "random_boolean_selector" => Feature::RandomBoolean(b.placed(&c["feature_true"])?, b.placed(&c["feature_false"])?),
-            _ => {
-                *b.missing.entry(ty.clone()).or_default() += 1;
-                Feature::Unsupported(ty)
-            }
+            _ => match super::extra::Extra::parse(b, &ty, c) {
+                Some(Ok(e)) => Feature::Extra(Box::new(e)),
+                Some(Err(e)) => {
+                    *b.missing.entry(format!("{ty} ({e})")).or_default() += 1;
+                    Feature::Unsupported(ty)
+                }
+                None => {
+                    *b.missing.entry(ty.clone()).or_default() += 1;
+                    Feature::Unsupported(ty)
+                }
+            },
         })
     }
 
@@ -77,6 +93,8 @@ impl Feature {
         }
         match self {
             Feature::NoOp | Feature::Unsupported(_) => false,
+            Feature::Tree(t) => t.place(lv, r, p),
+            Feature::Extra(e) => e.place(lv, r, p),
             Feature::Ore { size, discard, targets } => ore(lv, r, p, *size, *discard, targets),
             Feature::ScatteredOre { size, discard, targets } => {
                 let n = r.next_int_bound(size + 1);

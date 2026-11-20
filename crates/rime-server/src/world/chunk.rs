@@ -84,6 +84,12 @@ pub struct Chunk {
     pub biomes: Vec<[u8; 64]>,
     /// highest non-air block per column (absolute Y), MIN_Y-1 if empty
     pub heightmap: [i16; 256],
+    /// generator that produced the chunk (`Generator::gen_id`; 0 = unknown/old)
+    pub gen_id: u32,
+    /// changed by players since it was generated
+    pub edited: bool,
+    /// fluids to tick once the freshly generated chunk is loaded (not saved)
+    pub fluid_ticks: Vec<[i32; 3]>,
 }
 
 impl Chunk {
@@ -94,6 +100,9 @@ impl Chunk {
             sections: vec![Section::Uniform(blocks::AIR); SECTIONS],
             biomes: vec![[Biomes::plains(); 64]; SECTIONS],
             heightmap: [(MIN_Y - 1) as i16; 256],
+            gen_id: 0,
+            edited: false,
+            fluid_ticks: Vec::new(),
         }
     }
 
@@ -201,6 +210,8 @@ impl Chunk {
             ("fluid_ticks", Tag::List(vec![])),
             ("PostProcessing", Tag::List(vec![])),
             ("structures", compound![("References", compound![]), ("starts", compound![])]),
+            ("RimeGen", Tag::Int(self.gen_id as i32)),
+            ("RimeEdited", Tag::Byte(self.edited as i8)),
         ];
         root.to_root_bytes("")
     }
@@ -213,6 +224,8 @@ impl Chunk {
         let x = root.get("xPos")?.as_i64()? as i32;
         let z = root.get("zPos")?.as_i64()? as i32;
         let mut c = Chunk::empty(x, z);
+        c.gen_id = root.get("RimeGen").and_then(|t| t.as_i64()).unwrap_or(0) as u32;
+        c.edited = root.get("RimeEdited").and_then(|t| t.as_i64()).unwrap_or(0) != 0;
         if let Some(Tag::List(secs)) = root.get("sections") {
             for s in secs {
                 let y = s.get("Y").and_then(|t| t.as_i64()).unwrap_or(i64::MIN);

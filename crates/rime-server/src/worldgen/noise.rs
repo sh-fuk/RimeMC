@@ -183,6 +183,17 @@ impl PerlinNoise {
         Self::finish(levels, first_octave, amplitudes.to_vec())
     }
 
+    /// `PerlinNoise.create` with a legacy random (new initialization).
+    pub fn new_legacy(r: &mut Legacy, first_octave: i32, amplitudes: &[f64]) -> Self {
+        let f = r.fork_positional();
+        let levels = amplitudes
+            .iter()
+            .enumerate()
+            .map(|(k, &a)| if a != 0.0 { Some(ImprovedNoise::new(&mut f.from_hash_of(&format!("octave_{}", first_octave + k as i32)))) } else { None })
+            .collect();
+        Self::finish(levels, first_octave, amplitudes.to_vec())
+    }
+
     /// Legacy initialization (`createLegacyForBlendedNoise`): octaves
     /// `first..=0`, all with amplitude 1.
     pub fn legacy(r: &mut AnyRng, first_octave: i32) -> Self {
@@ -259,6 +270,18 @@ impl NormalNoise {
     pub fn new(r: &mut Xoroshiro, first_octave: i32, amplitudes: &[f64]) -> Self {
         let first = PerlinNoise::new(r, first_octave, amplitudes);
         let second = PerlinNoise::new(r, first_octave, amplitudes);
+        Self::finish(first, second, amplitudes)
+    }
+
+    /// `NormalNoise.create(new WorldgenRandom(new LegacyRandomSource(seed)), ...)`
+    pub fn new_legacy(seed: i64, first_octave: i32, amplitudes: &[f64]) -> Self {
+        let mut r = Legacy::new(seed);
+        let first = PerlinNoise::new_legacy(&mut r, first_octave, amplitudes);
+        let second = PerlinNoise::new_legacy(&mut r, first_octave, amplitudes);
+        Self::finish(first, second, amplitudes)
+    }
+
+    fn finish(first: PerlinNoise, second: PerlinNoise, amplitudes: &[f64]) -> Self {
         let mut j = i32::MAX;
         let mut k = i32::MIN;
         for (l, &a) in amplitudes.iter().enumerate() {

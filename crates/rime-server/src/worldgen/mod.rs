@@ -51,6 +51,10 @@ pub struct Generated {
     pub blocks: Vec<BlockState>,
     pub biomes: Vec<[u8; 64]>,
     pub heights: [i32; 256],
+    /// Before decoration: positions marked for post processing by the noise
+    /// fill and carvers. Final chunks: fluid blocks that get a fluid tick
+    /// when the chunk is loaded (world coordinates).
+    pub fluid_ticks: Vec<[i32; 3]>,
 }
 
 impl VanillaGenerator {
@@ -89,6 +93,7 @@ impl VanillaGenerator {
         let (lib, missing) = feature::Lib::new(load, &possible, surface::BiomeTemps::new(), surface.climates.clone(), settings.sea_level)?;
         if !missing.is_empty() {
             let list: Vec<String> = missing.iter().map(|(k, v)| format!("{k} x{v}")).collect();
+            if cfg!(test) { eprintln!("missing feature types: {}", list.join(", ")); }
             tracing::info!("feature types not ported yet (skipped): {}", list.join(", "));
         }
         Ok(VanillaGenerator {
@@ -127,7 +132,8 @@ impl VanillaGenerator {
     /// noise + biomes + surface + carvers: a proto chunk before features.
     pub fn generate(&self, cx: i32, cz: i32) -> Generated {
         let nc = NoiseChunk::new(&self.router.graph, cx, cz);
-        let mut blocks = chunk::fill_with(&nc, &self.router, &self.settings, self.aquifer_random, self.ore_random);
+        let mut marks = Vec::new();
+        let mut blocks = chunk::fill_with(&nc, &self.router, &self.settings, self.aquifer_random, self.ore_random, &mut marks);
         let raw = match self.biome_cache.get(cx, cz) {
             Some(b) => b,
             None => {
@@ -154,9 +160,9 @@ impl VanillaGenerator {
             let picker = FluidPicker::overworld(self.settings.sea_level, self.settings.default_fluid);
             let mut aquifer = Aquifer::new(&nc, &self.router, self.aquifer_random, &picker, MIN_Y, HEIGHT);
             let top = |x: i32, y: i32, z: i32, fluid: bool, h: &[i32; 256]| self.surface.top_material(&self.router, &bs, h, x, y, z, fluid);
-            let mut ctx = carver::Carving { cx, cz, blocks: &mut blocks, heights: &mut heights, mask: vec![false; (16 * 16 * HEIGHT) as usize], aquifer: &mut aquifer, top: &top };
+            let mut ctx = carver::Carving { cx, cz, blocks: &mut blocks, heights: &mut heights, mask: vec![false; (16 * 16 * HEIGHT) as usize], aquifer: &mut aquifer, top: &top, marks: &mut marks };
             carver::apply(&self.carvers, self.seed, &mut ctx);
         }
-        Generated { blocks, biomes, heights }
+        Generated { blocks, biomes, heights, fluid_ticks: marks }
     }
 }

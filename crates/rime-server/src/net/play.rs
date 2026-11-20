@@ -48,7 +48,7 @@ pub fn hashed_seed(seed: i64) -> i64 {
 }
 
 /// Body of `level_chunk_with_light`.
-pub fn chunk_body(c: &Chunk) -> Vec<u8> {
+pub fn chunk_body(c: &Chunk, light: &crate::world::light::ChunkLight) -> Vec<u8> {
     let mut b = Vec::with_capacity(24 * 1024);
     b.i32(c.x).i32(c.z);
     let hms = c.network_heightmaps();
@@ -62,7 +62,6 @@ pub fn chunk_body(c: &Chunk) -> Vec<u8> {
     let data = c.network_sections();
     b.vi(data.len() as i32).raw(&data);
     b.vi(0); // block entities
-    let (sky, sky_empty, arrays) = c.sky_light();
     let bits = |b: &mut Vec<u8>, m: u64| {
         if m == 0 {
             b.vi(0);
@@ -70,16 +69,17 @@ pub fn chunk_body(c: &Chunk) -> Vec<u8> {
             b.vi(1).i64(m as i64);
         }
     };
-    let all = (1u64 << (crate::world::chunk::SECTIONS + 2)) - 1;
-    bits(&mut b, sky);
-    bits(&mut b, 0); // block light mask
-    bits(&mut b, sky_empty);
-    bits(&mut b, all); // every block light section is empty
-    b.vi(arrays.len() as i32);
-    for a in arrays {
-        b.vi(2048).raw(&a);
+    let mask = |v: &[Option<Box<[u8; 2048]>>], set: bool| v.iter().enumerate().filter(|(_, a)| a.is_some() == set).fold(0u64, |m, (i, _)| m | 1 << i);
+    bits(&mut b, mask(&light.sky, true));
+    bits(&mut b, mask(&light.block, true));
+    bits(&mut b, mask(&light.sky, false));
+    bits(&mut b, mask(&light.block, false));
+    for v in [&light.sky, &light.block] {
+        b.vi(v.iter().flatten().count() as i32);
+        for a in v.iter().flatten() {
+            b.vi(2048).raw(&a[..]);
+        }
     }
-    b.vi(0);
     b
 }
 
@@ -549,7 +549,14 @@ impl Session {
         }
         let st = self.st.clone();
         let coords = batch.clone();
-        let _ = tokio::task::spawn_blocking(move || st.game.world.ensure_loaded(&coords, &st.store, &st.generator)).await;
+        // neighbours too: a chunk's light depends on its 3x3 neighbourhood
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut all: Vec<(i32, i32)> = coords.iter().flat_map(|&(x, z)| (-1..=1).flat_map(move |dx| (-1..=1).map(move |dz| (x + dx, z + dz)))).collect();
+            all.sort_unstable();
+            all.dedup();
+            st.game.world.ensure_loaded(&all, &st.store, &st.generator)
+        })
+        .await;
         let world = &self.st.game.world;
         let xray_mode = self.st.cfg.anticheat.xray;
         let seed = self.st.generator.seed;
@@ -557,11 +564,14 @@ impl Session {
         let mut count = 0;
         for c in batch {
             let pkt = world.chunk_packet(c.0, c.1, &|chunk: &Chunk| {
+                let around: Vec<Option<Chunk>> = (0..9).map(|i| if i == 4 { None } else { world.chunk_copy(c.0 + i / 3 - 1, c.1 + i % 3 - 1) }).collect();
+                let refs: [Option<&Chunk>; 9] = std::array::from_fn(|i| if i == 4 { Some(chunk) } else { around[i].as_ref() });
+                let light = crate::world::light::compute(&refs);
                 if xray_mode != XrayMode::Off && self.st.cfg.anticheat.enabled {
                     let safe = xray::obfuscate(chunk, xray_mode, seed, &|x, y, z| world.get_block(x, y, z));
-                    chunk_body(&safe)
+                    chunk_body(&safe, &light)
                 } else {
-                    chunk_body(chunk)
+                    chunk_body(chunk, &light)
                 }
             });
             if let Some(body) = pkt {
@@ -1106,7 +1116,7 @@ impl Session {
             }
             // a waterlogged block leaves its water behind
             let after = if BlockRegistry::get().property(cur, "waterlogged") == Some("true") { blocks::WATER } else { blocks::AIR };
-            st.game.change_block([pos.0, pos.1, pos.2], after, gm == 0, tool);
+            st.game.player_change_block([pos.0, pos.1, pos.2], after, gm == 0, tool);
             self.ack(seq);
             self.after_change(pos);
         } else {
@@ -1243,7 +1253,7 @@ impl Session {
                         "lava" if fluid::fluid_state(b).is_source() => "lava_bucket",
                         _ => return,
                     };
-                    game.change_block([c.0, c.1, c.2], blocks::AIR, false, None);
+                    game.player_change_block([c.0, c.1, c.2], blocks::AIR, false, None);
                     if gm != 1 {
                         let mut inv = self.me.inv.lock();
                         inv.consume(slot, 1);
@@ -1268,7 +1278,7 @@ impl Session {
                     if !game.is_replaceable(cur) || !self.within_reach(target) {
                         return;
                     }
-                    game.change_block([target.0, target.1, target.2], fluid_block, !cur.is_air() && !BlockRegistry::get().is_fluid(cur), None);
+                    game.player_change_block([target.0, target.1, target.2], fluid_block, !cur.is_air() && !BlockRegistry::get().is_fluid(cur), None);
                     game.schedule([target.0, target.1, target.2], crate::game::TickKind::Fluid, fluid::tick_delay(if name == "water_bucket" { fluid::Fluid::Water } else { fluid::Fluid::Lava }));
                     if gm != 1 {
                         self.me.inv.lock().set(slot, Some(Stack::new(items.id("bucket").unwrap_or(0), 1)));
@@ -1448,9 +1458,9 @@ impl Session {
         if !game.data.block_in("replaceable", info.name.as_str()) {
             let _ = info;
         }
-        game.change_block([target.0, target.1, target.2], state, false, None);
+        game.player_change_block([target.0, target.1, target.2], state, false, None);
         if let Some((p, b)) = extra {
-            game.change_block([p.0, p.1, p.2], b, false, None);
+            game.player_change_block([p.0, p.1, p.2], b, false, None);
         }
         if fluid::fluid_state(state).fluid().is_some() {
             game.schedule([target.0, target.1, target.2], crate::game::TickKind::Fluid, 5);

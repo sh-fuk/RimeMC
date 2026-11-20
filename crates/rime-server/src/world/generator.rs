@@ -163,6 +163,11 @@ pub fn build_chunk(cx: i32, cz: i32, seed: u32, heights: &[i32; 256]) -> Chunk {
     c
 }
 
+/// `Generator::gen_id` of the vanilla generator (bump on output changes).
+pub const VANILLA_GEN: u32 = 3;
+/// `Generator::gen_id` of the fast noise generator.
+pub const FAST_GEN: u32 = 1_000_001;
+
 /// Generator front-end: batches go to the GPU when available, else to all CPU cores.
 pub struct Generator {
     pub seed: u32,
@@ -219,14 +224,32 @@ impl Generator {
         }
     }
 
+    /// Identifies the terrain this generator produces. Saved chunks from a
+    /// different generator (and never edited by players) are generated again
+    /// so the world has no seams. Bump `VANILLA_GEN` whenever the vanilla
+    /// generator's output changes.
+    pub fn gen_id(&self) -> u32 {
+        if self.vanilla.is_some() {
+            VANILLA_GEN
+        } else {
+            FAST_GEN
+        }
+    }
+
     /// Generate many chunks at once (parallel / GPU-batched).
     pub fn generate_batch(&self, coords: &[(i32, i32)]) -> Vec<Chunk> {
-        if let Some(v) = &self.vanilla {
+        let id = self.gen_id();
+        let mut out: Vec<Chunk> = if let Some(v) = &self.vanilla {
             let gens = v.generate_many(coords);
-            return coords.par_iter().zip(gens.into_par_iter()).map(|(&(x, z), g)| vanilla_chunk(g, x, z)).collect();
+            coords.par_iter().zip(gens.into_par_iter()).map(|(&(x, z), g)| vanilla_chunk(g, x, z)).collect()
+        } else {
+            let heights: Vec<[i32; 256]> = self.heights_batch(coords);
+            coords.par_iter().zip(heights.par_iter()).map(|(&(x, z), h)| build_chunk(x, z, self.seed, h)).collect()
+        };
+        for c in &mut out {
+            c.gen_id = id;
         }
-        let heights: Vec<[i32; 256]> = self.heights_batch(coords);
-        coords.par_iter().zip(heights.par_iter()).map(|(&(x, z), h)| build_chunk(x, z, self.seed, h)).collect()
+        out
     }
 
     fn heights_batch(&self, coords: &[(i32, i32)]) -> Vec<[i32; 256]> {
@@ -261,6 +284,7 @@ fn vanilla_chunk(g: crate::worldgen::Generated, cx: i32, cz: i32) -> Chunk {
     for s in &mut c.sections {
         s.optimize();
     }
+    c.fluid_ticks = g.fluid_ticks;
     c
 }
 

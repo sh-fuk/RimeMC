@@ -10,6 +10,7 @@ use super::{Builder, Hm, Region};
 use crate::registry::{vstate, BlockRegistry, BlockState};
 use crate::worldgen::carver::{anchor, random_between};
 use crate::worldgen::chunk::{HEIGHT, MIN_Y};
+use crate::worldgen::noise::NormalNoise;
 use crate::worldgen::random::{Rng, WgRandom};
 
 // ---------------------------------------------------------------- helpers
@@ -90,6 +91,7 @@ impl IntP {
         }
         let g = |k: &str| v[k].as_i64().map(|x| x as i32).ok_or_else(|| anyhow!("int provider missing {k}: {v}"));
         Ok(match v["type"].as_str().unwrap_or("") {
+            "" if v["min_inclusive"].is_i64() => IntP::Uniform(g("min_inclusive")?, g("max_inclusive")?),
             "minecraft:constant" => IntP::Const(g("value")?),
             "minecraft:uniform" => IntP::Uniform(g("min_inclusive")?, g("max_inclusive")?),
             "minecraft:biased_to_bottom" => IntP::Biased(g("min_inclusive")?, g("max_inclusive")?),
@@ -355,8 +357,37 @@ pub enum StateP {
     RandomizedInt { source: Box<StateP>, property: String, values: IntP },
     Rotated(BlockState),
     RuleBased { fallback: Option<Box<StateP>>, rules: Vec<(Pred, StateP)> },
-    /// noise based providers (not ported yet): their default state
+    /// `noise_provider`
+    Noise { noise: Arc<NormalNoise>, scale: f32, states: Vec<BlockState> },
+    /// `noise_threshold_provider`
+    NoiseThreshold { noise: Arc<NormalNoise>, scale: f32, threshold: f32, high_chance: f32, default: BlockState, low: Vec<BlockState>, high: Vec<BlockState> },
+    /// `dual_noise_provider`
+    DualNoise { noise: Arc<NormalNoise>, scale: f32, states: Vec<BlockState>, slow: Arc<NormalNoise>, slow_scale: f32, variety: (i32, i32) },
+    /// unknown providers: their default state
     Unsupported(BlockState),
+}
+
+fn noise_params(v: &Value) -> (i32, Vec<f64>) {
+    (v["firstOctave"].as_i64().unwrap_or(0) as i32, v["amplitudes"].as_array().into_iter().flatten().filter_map(|a| a.as_f64()).collect())
+}
+
+fn make_noise(seed: i64, v: &Value) -> Arc<NormalNoise> {
+    let (o, a) = noise_params(v);
+    Arc::new(NormalNoise::new_legacy(seed, o, &a))
+}
+
+fn states(v: &Value) -> Result<Vec<BlockState>> {
+    v.as_array().into_iter().flatten().map(parse_state).collect()
+}
+
+/// `NoiseProvider.getRandomState(list, noise)`
+fn noise_pick(list: &[BlockState], d: f64) -> BlockState {
+    let e = ((1.0 + d) / 2.0).clamp(0.0, 0.9999);
+    list[(e * list.len() as f64) as usize]
+}
+
+fn noise_at(n: &NormalNoise, p: [i32; 3], scale: f64) -> f64 {
+    n.value(p[0] as f64 * scale, p[1] as f64 * scale, p[2] as f64 * scale)
 }
 
 impl StateP {
@@ -380,6 +411,32 @@ impl StateP {
                     rules.push((Pred::parse(lib, &r["if_true"])?, StateP::parse(lib, &r["then"])?));
                 }
                 StateP::RuleBased { fallback, rules }
+            }
+            "minecraft:noise_provider" | "minecraft:noise_threshold_provider" | "minecraft:dual_noise_provider" => {
+                let seed = v["seed"].as_i64().unwrap_or(0);
+                let noise = make_noise(seed, &v["noise"]);
+                let scale = v["scale"].as_f64().unwrap_or(1.0) as f32;
+                match v["type"].as_str().unwrap_or("") {
+                    "minecraft:noise_provider" => StateP::Noise { noise, scale, states: states(&v["states"])? },
+                    "minecraft:noise_threshold_provider" => StateP::NoiseThreshold {
+                        noise,
+                        scale,
+                        threshold: v["threshold"].as_f64().unwrap_or(0.0) as f32,
+                        high_chance: v["high_chance"].as_f64().unwrap_or(0.0) as f32,
+                        default: parse_state(&v["default_state"])?,
+                        low: states(&v["low_states"])?,
+                        high: states(&v["high_states"])?,
+                    },
+                    _ => {
+                        let var = &v["variety"];
+                        let variety = match var {
+                            Value::Array(a) => (a.first().and_then(|x| x.as_i64()).unwrap_or(1) as i32, a.get(1).and_then(|x| x.as_i64()).unwrap_or(1) as i32),
+                            Value::Number(n) => (n.as_i64().unwrap_or(1) as i32, n.as_i64().unwrap_or(1) as i32),
+                            o => (o["min_inclusive"].as_i64().unwrap_or(1) as i32, o["max_inclusive"].as_i64().unwrap_or(1) as i32),
+                        };
+                        StateP::DualNoise { noise, scale, states: states(&v["states"])?, slow: make_noise(seed, &v["slow_noise"]), slow_scale: v["slow_scale"].as_f64().unwrap_or(1.0) as f32, variety }
+                    }
+                }
             }
             _ => {
                 let s = v["default_state"].as_object().map(|_| parse_state(&v["default_state"])).transpose()?.or_else(|| v["states"].as_array().and_then(|a| a.first()).and_then(|s| parse_state(s).ok()));
@@ -409,6 +466,27 @@ impl StateP {
                 let s = source.get(lv, r, p)?;
                 let v = values.sample(r);
                 BlockRegistry::get().with(s, property, &v.to_string()).unwrap_or(s)
+            }
+            StateP::Noise { noise, scale, states } => noise_pick(states, noise_at(noise, p, *scale as f64)),
+            StateP::NoiseThreshold { noise, scale, threshold, high_chance, default, low, high } => {
+                let d = noise_at(noise, p, *scale as f64);
+                if d < *threshold as f64 {
+                    low[r.next_int_bound(low.len() as i32) as usize]
+                } else if r.next_float() < *high_chance {
+                    high[r.next_int_bound(high.len() as i32) as usize]
+                } else {
+                    *default
+                }
+            }
+            StateP::DualNoise { noise, scale, states, slow, slow_scale, variety } => {
+                let sv = |q: [i32; 3]| slow.value((q[0] as f32 * slow_scale) as f64, (q[1] as f32 * slow_scale) as f64, (q[2] as f32 * slow_scale) as f64);
+                let d = sv(p);
+                let i = crate::worldgen::noise::clamped_map(d, -1.0, 1.0, variety.0 as f64, (variety.1 + 1) as f64) as i32;
+                let mut list = Vec::with_capacity(i.max(0) as usize);
+                for j in 0..i {
+                    list.push(noise_pick(states, sv([p[0] + j * 54545, p[1], p[2] + j * 34234])));
+                }
+                noise_pick(&list, noise_at(noise, p, *scale as f64))
             }
             StateP::Rotated(s) => {
                 let axis = ["x", "y", "z"][r.next_int_bound(3) as usize];
