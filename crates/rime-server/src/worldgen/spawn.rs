@@ -91,8 +91,7 @@ impl VanillaGenerator {
 }
 
 fn full_top_face(b: BlockState) -> bool {
-    let reg = BlockRegistry::get();
-    reg.is_opaque(b) || b.name().ends_with("leaves") || b.name().ends_with("glass")
+    crate::registry::vstate::full_up_face(b)
 }
 
 /// `PlayerSpawnFinder.getSpawnPosInChunk` on a freshly generated chunk.
@@ -103,7 +102,7 @@ pub fn spawn_in_chunk(g: &Generated, cx: i32, cz: i32) -> Option<(i32, i32, i32)
     let height = |x: i32, z: i32, pred: &dyn Fn(BlockState) -> bool| {
         (MIN_Y..MIN_Y + HEIGHT).rev().find(|&y| pred(at(x, y, z))).map_or(MIN_Y, |y| y + 1)
     };
-    let blocks_motion = |b: BlockState| reg.is_solid(b);
+    let blocks_motion = crate::registry::vstate::blocks_motion;
     for x in 0..16 {
         for z in 0..16 {
             let mb = height(x, z, &|b| blocks_motion(b) || reg.has_fluid(b));

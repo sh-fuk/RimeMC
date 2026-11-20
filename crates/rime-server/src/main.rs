@@ -443,7 +443,7 @@ fn load_or_find_spawn(world_dir: &Path, game: &game::Game, store: &WorldStore, g
         }
     }
     let spawn = if let Some(v) = generator.vanilla() {
-        let (x, y, z) = v.find_spawn(&|cx, cz| v.generate(cx, cz));
+        let (x, y, z) = v.find_spawn(&|cx, cz| v.generate_many(&[(cx, cz)]).pop().expect("chunk"));
         [x as f64 + 0.5, y as f64, z as f64 + 0.5]
     } else {
         game.world.ensure_loaded(&[(0, 0)], store, generator);

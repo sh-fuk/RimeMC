@@ -246,3 +246,88 @@ mod tests {
         assert_eq!(r.next_int_bound(10), 3);
     }
 }
+
+/// `WorldgenRandom` wrapping a `XoroshiroRandomSource`: every draw goes
+/// through `next(bits)` = top bits of the xoroshiro `nextLong`, using the
+/// `BitRandomSource` (java.util.Random style) algorithms.
+#[derive(Clone, Debug)]
+pub struct WgRandom {
+    x: Xoroshiro,
+    gauss: Option<f64>,
+}
+
+impl WgRandom {
+    pub fn new(seed: i64) -> Self {
+        WgRandom { x: Xoroshiro::new(seed), gauss: None }
+    }
+    /// `setSeed` (does not reset the cached gaussian, like vanilla)
+    pub fn set_seed(&mut self, seed: i64) {
+        self.x = Xoroshiro::new(seed);
+    }
+    pub fn next(&mut self, bits: u32) -> i32 {
+        ((self.x.next_long() as u64) >> (64 - bits)) as i32
+    }
+    /// `setDecorationSeed`; returns the decoration seed.
+    pub fn set_decoration_seed(&mut self, seed: i64, x: i32, z: i32) -> i64 {
+        self.set_seed(seed);
+        let a = self.next_long() | 1;
+        let b = self.next_long() | 1;
+        let s = (x as i64).wrapping_mul(a).wrapping_add((z as i64).wrapping_mul(b)) ^ seed;
+        self.set_seed(s);
+        s
+    }
+    /// `setFeatureSeed`
+    pub fn set_feature_seed(&mut self, decoration: i64, index: i32, step: i32) {
+        self.set_seed(decoration.wrapping_add(index as i64).wrapping_add(10000 * step as i64));
+    }
+    pub fn next_gaussian(&mut self) -> f64 {
+        if let Some(g) = self.gauss.take() {
+            return g;
+        }
+        loop {
+            let a = 2.0 * self.next_double() - 1.0;
+            let b = 2.0 * self.next_double() - 1.0;
+            let s = a * a + b * b;
+            if s < 1.0 && s != 0.0 {
+                let m = (-2.0 * s.ln() / s).sqrt();
+                self.gauss = Some(b * m);
+                return a * m;
+            }
+        }
+    }
+}
+
+impl Rng for WgRandom {
+    fn next_long(&mut self) -> i64 {
+        let a = self.next(32) as i64;
+        let b = self.next(32) as i64;
+        (a << 32).wrapping_add(b)
+    }
+    fn next_int(&mut self) -> i32 {
+        self.next(32)
+    }
+    fn next_int_bound(&mut self, bound: i32) -> i32 {
+        assert!(bound > 0);
+        if bound & (bound - 1) == 0 {
+            return ((bound as i64 * self.next(31) as i64) >> 31) as i32;
+        }
+        loop {
+            let i = self.next(31);
+            let j = i % bound;
+            if i.wrapping_sub(j).wrapping_add(bound - 1) >= 0 {
+                return j;
+            }
+        }
+    }
+    fn next_double(&mut self) -> f64 {
+        let i = self.next(26) as i64;
+        let j = self.next(27) as i64;
+        ((i << 27) + j) as f64 * 1.110223E-16f32 as f64
+    }
+    fn next_float(&mut self) -> f32 {
+        self.next(24) as f32 * 5.9604645E-8
+    }
+    fn next_bool(&mut self) -> bool {
+        self.next(1) != 0
+    }
+}

@@ -8,7 +8,9 @@ pub mod biome;
 pub mod biome_builder;
 pub mod carver;
 pub mod chunk;
+pub mod decorate;
 pub mod density;
+pub mod feature;
 pub mod noise;
 pub mod random;
 pub mod spawn;
@@ -39,6 +41,8 @@ pub struct VanillaGenerator {
     ore_random: XoroshiroFactory,
     biome_cache: BiomeCache,
     carvers: Vec<carver::Carver>,
+    features: Option<feature::Lib>,
+    pipeline: parking_lot::Mutex<decorate::PipeState>,
 }
 
 /// A generated chunk: blocks `((y - MIN_Y) * 16 + z) * 16 + x`, biome ids per
@@ -74,6 +78,19 @@ impl VanillaGenerator {
         let tree = BiomeTree::new(&biome_builder::overworld());
         let names = crate::world::chunk::Biomes::get();
         let tree_ids = tree.values.iter().map(|b| names.id(&format!("minecraft:{b}")).unwrap_or(0)).collect();
+        // possibleBiomes(): distinct biomes in parameter list order
+        let mut possible: Vec<String> = Vec::new();
+        for (_, b) in biome_builder::overworld() {
+            let n = format!("minecraft:{b}");
+            if !possible.contains(&n) {
+                possible.push(n);
+            }
+        }
+        let (lib, missing) = feature::Lib::new(load, &possible, surface::BiomeTemps::new(), surface.climates.clone(), settings.sea_level)?;
+        if !missing.is_empty() {
+            let list: Vec<String> = missing.iter().map(|(k, v)| format!("{k} x{v}")).collect();
+            tracing::info!("feature types not ported yet (skipped): {}", list.join(", "));
+        }
         Ok(VanillaGenerator {
             seed,
             router,
@@ -85,10 +102,29 @@ impl VanillaGenerator {
             ore_random: factory.from_hash_of("minecraft:ore").fork_positional(),
             biome_cache: BiomeCache::default(),
             carvers,
+            features: Some(lib),
+            pipeline: Default::default(),
         })
     }
 
-    /// noise + biomes + surface + carvers (no features / structures yet).
+    /// `BiomeSource.getNoiseBiome` for any quart position (network id).
+    pub fn noise_biome_uncached(&self, qx: i32, qy: i32, qz: i32) -> u8 {
+        let (cx, cz) = (qx >> 2, qz >> 2);
+        let raw = match self.biome_cache.get(cx, cz) {
+            Some(b) => b,
+            None => {
+                let nc = NoiseChunk::new(&self.router.graph, cx, cz);
+                let b = ChunkBiomes::new(biome::chunk_biomes(&self.router, &nc, &self.tree, cx, cz));
+                self.biome_cache.insert(cx, cz, b.clone());
+                b
+            }
+        };
+        let qy = qy.clamp(MIN_Y >> 2, ((MIN_Y + HEIGHT) >> 2) - 1);
+        let sec = &raw[((qy - (MIN_Y >> 2)) >> 2) as usize];
+        self.tree_ids[sec[(((qy & 3) << 4) | ((qz & 3) << 2) | (qx & 3)) as usize] as usize]
+    }
+
+    /// noise + biomes + surface + carvers: a proto chunk before features.
     pub fn generate(&self, cx: i32, cz: i32) -> Generated {
         let nc = NoiseChunk::new(&self.router.graph, cx, cz);
         let mut blocks = chunk::fill_with(&nc, &self.router, &self.settings, self.aquifer_random, self.ore_random);

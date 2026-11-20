@@ -315,6 +315,91 @@ fn bench_generation() {
 fn spawn_matches_vanilla() {
     let Some(dir) = data_dir() else { return };
     let generator = super::VanillaGenerator::new(&loader(dir), 12345).unwrap();
-    let spawn = generator.find_spawn(&|cx, cz| generator.generate(cx, cz));
+    let spawn = generator.find_spawn(&|cx, cz| generator.generate_many(&[(cx, cz)]).pop().unwrap());
     assert_eq!(spawn, (96, 136, -32));
+}
+
+/// Featured chunks against a vanilla reference whose not-yet-ported
+/// configured features are replaced with `no_op` (RIME_VREF_F = its `region`
+/// directory). Prints mismatches by kind.
+#[test]
+fn features_match_vanilla() {
+    let Some(dir) = data_dir() else { return };
+    let Ok(vdir) = std::env::var("RIME_VREF_F") else { return };
+    let generator = super::VanillaGenerator::new(&loader(dir), 12345).unwrap();
+    let r = std::env::var("RIME_RADIUS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let coords: Vec<(i32, i32)> = (-r..r).flat_map(|x| (-r..r).map(move |z| (x, z))).collect();
+    let t = std::time::Instant::now();
+    let mut gens = generator.generate_many(&coords);
+    eprintln!("{} chunks in {:.2}s", coords.len(), t.elapsed().as_secs_f64());
+    let read = |cx: i32, cz: i32| {
+        let (rx, rz) = (cx >> 5, cz >> 5);
+        let (chunks, _) = airworld::mca::read_mca(&PathBuf::from(&vdir).join(format!("r.{rx}.{rz}.mca")), rx, rz).ok()?;
+        let idx = ((cz & 31) * 32 + (cx & 31)) as usize;
+        let c = chunks.into_iter().find(|c| c.index == idx)?;
+        crate::world::chunk::Chunk::from_nbt(&c.raw)
+    };
+    // RIME_VREF_F2: compare two vanilla runs instead (how much vanilla itself varies)
+    if let Ok(d2) = std::env::var("RIME_VREF_F2") {
+        for (&(cx, cz), g) in coords.iter().zip(gens.iter_mut()) {
+            let (rx, rz) = (cx >> 5, cz >> 5);
+            let (chunks, _) = airworld::mca::read_mca(&PathBuf::from(&d2).join(format!("r.{rx}.{rz}.mca")), rx, rz).unwrap();
+            let idx = ((cz & 31) * 32 + (cx & 31)) as usize;
+            let c = crate::world::chunk::Chunk::from_nbt(&chunks.into_iter().find(|c| c.index == idx).unwrap().raw).unwrap();
+            for y in -64..320 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        g.blocks[(((y + 64) * 16 + z) * 16 + x) as usize] = c.get(x as usize, y, z as usize);
+                    }
+                }
+            }
+        }
+    }
+    let mut total = 0;
+    let mut by_kind: std::collections::BTreeMap<String, usize> = Default::default();
+    for (&(cx, cz), g) in coords.iter().zip(&gens) {
+        let Some(v) = read(cx, cz) else { eprintln!("no reference for {cx},{cz}"); continue };
+        let mut shown = 0;
+        for y in -64..320 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    let a = g.blocks[(((y + 64) * 16 + z) * 16 + x) as usize];
+                    let b = v.get(x as usize, y, z as usize);
+                    if a == b {
+                        continue;
+                    }
+                    let reg = crate::registry::BlockRegistry::get();
+                    if a.is_air() && reg.property(b, "level").is_some_and(|l| l != "0") {
+                        continue;
+                    }
+                    *by_kind.entry(format!("{} -> {}", a.name(), b.name())).or_default() += 1;
+                    if std::env::var("RIME_SHOW").is_ok_and(|v| shown < v.parse().unwrap_or(2)) {
+                        eprintln!("{cx},{cz} at {},{y},{}: ours {} vanilla {}", cx * 16 + x, cz * 16 + z, a.name(), b.name());
+                        shown += 1;
+                    }
+                    total += 1;
+                }
+            }
+        }
+    }
+    eprintln!("{total} mismatches: {by_kind:?}");
+    assert_eq!(total, 0);
+}
+
+#[test]
+fn vstate_water() {
+    use crate::registry::{blocks, vstate};
+    let w = blocks::WATER;
+    eprintln!("water {} {:?} fluid={} air={}", w.0, w.name(), vstate::fluid(w), vstate::air(blocks::AIR));
+    assert_eq!(vstate::fluid(w), 1);
+}
+
+#[test]
+fn vstate_lava() {
+    use crate::registry::{vstate, BlockState};
+    for i in 0..crate::registry::BlockRegistry::get().state_count() {
+        let s = BlockState(i as u16);
+        let f = vstate::fluid(s);
+        assert_eq!(matches!(f, 3 | 4), s.name() == "lava", "{} {f}", s.name());
+    }
 }

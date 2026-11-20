@@ -222,7 +222,8 @@ impl Generator {
     /// Generate many chunks at once (parallel / GPU-batched).
     pub fn generate_batch(&self, coords: &[(i32, i32)]) -> Vec<Chunk> {
         if let Some(v) = &self.vanilla {
-            return coords.par_iter().map(|&(x, z)| vanilla_chunk(v, x, z)).collect();
+            let gens = v.generate_many(coords);
+            return coords.par_iter().zip(gens.into_par_iter()).map(|(&(x, z), g)| vanilla_chunk(g, x, z)).collect();
         }
         let heights: Vec<[i32; 256]> = self.heights_batch(coords);
         coords.par_iter().zip(heights.par_iter()).map(|(&(x, z), h)| build_chunk(x, z, self.seed, h)).collect()
@@ -243,8 +244,7 @@ impl Generator {
     }
 }
 
-fn vanilla_chunk(v: &crate::worldgen::VanillaGenerator, cx: i32, cz: i32) -> Chunk {
-    let g = v.generate(cx, cz);
+fn vanilla_chunk(g: crate::worldgen::Generated, cx: i32, cz: i32) -> Chunk {
     let mut c = Chunk::empty(cx, cz);
     for (i, &b) in g.blocks.iter().enumerate() {
         if !b.is_air() {

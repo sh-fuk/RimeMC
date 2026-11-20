@@ -342,34 +342,39 @@ impl<'a> BiomeSource<'a> {
 
     /// `BiomeManager.getBiome(pos)` (fuzzy zoom).
     pub fn biome(&self, zoom_seed: i64, x: i32, y: i32, z: i32) -> u8 {
-        let i = x - 2;
-        let j = y - 2;
-        let k = z - 2;
-        let (l, m, n) = (i >> 2, j >> 2, k >> 2);
-        let d = (i & 3) as f64 / 4.0;
-        let e = (j & 3) as f64 / 4.0;
-        let f = (k & 3) as f64 / 4.0;
-        let mut o = 0;
-        let mut g = f64::INFINITY;
-        for p in 0..8 {
-            let (bx, by, bz) = (p & 4 == 0, p & 2 == 0, p & 1 == 0);
-            let q = if bx { l } else { l + 1 };
-            let r = if by { m } else { m + 1 };
-            let s = if bz { n } else { n + 1 };
-            let h = if bx { d } else { d - 1.0 };
-            let t = if by { e } else { e - 1.0 };
-            let u = if bz { f } else { f - 1.0 };
-            let v = fiddled_distance(zoom_seed, q, r, s, h, t, u);
-            if g > v {
-                o = p;
-                g = v;
-            }
-        }
-        let q = if o & 4 == 0 { l } else { l + 1 };
-        let r = if o & 2 == 0 { m } else { m + 1 };
-        let s = if o & 1 == 0 { n } else { n + 1 };
-        self.noise_biome(q, r, s)
+        fuzzy_biome(zoom_seed, x, y, z, &|q, r, s| self.noise_biome(q, r, s))
     }
+}
+
+/// `BiomeManager.getBiome(pos)`: fuzzy zoom over noise biomes `nb(qx, qy, qz)`.
+pub fn fuzzy_biome(zoom_seed: i64, x: i32, y: i32, z: i32, nb: &dyn Fn(i32, i32, i32) -> u8) -> u8 {
+    let i = x - 2;
+    let j = y - 2;
+    let k = z - 2;
+    let (l, m, n) = (i >> 2, j >> 2, k >> 2);
+    let d = (i & 3) as f64 / 4.0;
+    let e = (j & 3) as f64 / 4.0;
+    let f = (k & 3) as f64 / 4.0;
+    let mut o = 0;
+    let mut g = f64::INFINITY;
+    for p in 0..8 {
+        let (bx, by, bz) = (p & 4 == 0, p & 2 == 0, p & 1 == 0);
+        let q = if bx { l } else { l + 1 };
+        let r = if by { m } else { m + 1 };
+        let s = if bz { n } else { n + 1 };
+        let h = if bx { d } else { d - 1.0 };
+        let t = if by { e } else { e - 1.0 };
+        let u = if bz { f } else { f - 1.0 };
+        let v = fiddled_distance(zoom_seed, q, r, s, h, t, u);
+        if g > v {
+            o = p;
+            g = v;
+        }
+    }
+    let q = if o & 4 == 0 { l } else { l + 1 };
+    let r = if o & 2 == 0 { m } else { m + 1 };
+    let s = if o & 1 == 0 { n } else { n + 1 };
+    nb(q, r, s)
 }
 
 #[inline]

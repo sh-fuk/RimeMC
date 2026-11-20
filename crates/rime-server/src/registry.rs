@@ -315,3 +315,79 @@ mod tests {
         assert_eq!(p.id("play", "serverbound", "move_player_pos"), 30);
     }
 }
+
+/// Exact per-state facts dumped from vanilla 26.1 (`assets/26.1/state_flags.bin`):
+/// four tables of one byte per state id: flags, fluid, sturdy faces, extra flags.
+pub mod vstate {
+    use super::BlockState;
+
+    const DATA: &[u8] = include_bytes!("../assets/26.1/state_flags.bin");
+
+    #[inline]
+    fn flags(s: BlockState) -> u8 {
+        DATA.get(s.0 as usize).copied().unwrap_or(0)
+    }
+    /// `BlockState.isAir`
+    pub fn air(s: BlockState) -> bool {
+        flags(s) & 1 != 0
+    }
+    /// `BlockState.blocksMotion`
+    pub fn blocks_motion(s: BlockState) -> bool {
+        flags(s) & 2 != 0
+    }
+    /// `BlockState.isSolid` (legacy solid)
+    pub fn solid(s: BlockState) -> bool {
+        flags(s) & 4 != 0
+    }
+    /// `BlockState.canBeReplaced`
+    pub fn replaceable(s: BlockState) -> bool {
+        flags(s) & 8 != 0
+    }
+    /// collision shape has a full top face
+    pub fn full_up_face(s: BlockState) -> bool {
+        flags(s) & 16 != 0
+    }
+    /// `isCollisionShapeFullBlock`
+    pub fn full_block(s: BlockState) -> bool {
+        flags(s) & 32 != 0
+    }
+    /// 0 none, 1 water source, 2 flowing water, 3 lava source, 4 flowing lava
+    pub fn fluid(s: BlockState) -> u8 {
+        table(1, s)
+    }
+    #[inline]
+    fn table(i: usize, s: BlockState) -> u8 {
+        let n = DATA.len() / 4;
+        DATA.get(i * n + s.0 as usize).copied().unwrap_or(0)
+    }
+    /// `isFaceSturdy(dir, FULL)`; dir in vanilla order down, up, north, south, west, east
+    pub fn sturdy(s: BlockState, dir: u8) -> bool {
+        table(2, s) >> dir & 1 != 0
+    }
+    /// `isSolidRender`
+    pub fn solid_render(s: BlockState) -> bool {
+        table(3, s) & 1 != 0
+    }
+    /// `isFaceSturdy(UP, CENTER)`
+    pub fn sturdy_up_center(s: BlockState) -> bool {
+        table(3, s) & 2 != 0
+    }
+    /// collision shape's top face is empty
+    pub fn up_face_empty(s: BlockState) -> bool {
+        table(3, s) & 4 != 0
+    }
+    /// `BlockState.liquid()`
+    pub fn liquid(s: BlockState) -> bool {
+        table(3, s) & 8 != 0
+    }
+    /// fluid is a source
+    pub fn fluid_source(s: BlockState) -> bool {
+        table(3, s) & 16 != 0
+    }
+    pub fn has_fluid(s: BlockState) -> bool {
+        fluid(s) != 0
+    }
+    pub fn is_water(s: BlockState) -> bool {
+        matches!(fluid(s), 1 | 2)
+    }
+}
