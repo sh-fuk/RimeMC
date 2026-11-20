@@ -11,29 +11,30 @@
 //! a ratio far above the natural distribution raises an alert (never an
 //! automatic ban, since lucky caving exists).
 
-use crate::world::chunk::{Block, Chunk, MIN_Y};
+use crate::registry::{blocks, BlockState};
+use crate::world::chunk::{Chunk, MIN_Y};
 use crate::world::generator::hash2;
 
 use super::movement::Flag;
 use super::Check;
 use crate::config::XrayMode;
 
-fn base_stone(y: i32) -> Block {
-    if y < 0 { Block::Deepslate } else { Block::Stone }
+fn base_stone(y: i32) -> BlockState {
+    if y < 0 { blocks::DEEPSLATE } else { blocks::STONE }
 }
 
 /// Return the copy of `chunk` that is safe to send to clients.
 /// `neighbor(x, y, z)` answers for world coordinates outside this chunk
 /// (return `None` if that chunk is not loaded → treated as exposed, i.e. the
 /// ore stays visible; this errs on the side of correctness).
-pub fn obfuscate(chunk: &Chunk, mode: XrayMode, seed: u32, neighbor: &dyn Fn(i32, i32, i32) -> Option<Block>) -> Chunk {
+pub fn obfuscate(chunk: &Chunk, mode: XrayMode, seed: u32, neighbor: &dyn Fn(i32, i32, i32) -> Option<BlockState>) -> Chunk {
     if mode == XrayMode::Off {
         return chunk.clone();
     }
     let mut out = chunk.clone();
     let bx = chunk.x * 16;
     let bz = chunk.z * 16;
-    let get = |x: i32, y: i32, z: i32| -> Option<Block> {
+    let get = |x: i32, y: i32, z: i32| -> Option<BlockState> {
         if (0..16).contains(&x) && (0..16).contains(&z) {
             Some(chunk.get(x as usize, y, z as usize))
         } else {
@@ -45,7 +46,7 @@ pub fn obfuscate(chunk: &Chunk, mode: XrayMode, seed: u32, neighbor: &dyn Fn(i32
         for z in 0..16i32 {
             for x in 0..16i32 {
                 let b = chunk.get(x as usize, y, z as usize);
-                let candidate = b.is_ore() || (mode == XrayMode::Obfuscate && matches!(b, Block::Stone | Block::Deepslate));
+                let candidate = b.is_ore() || (mode == XrayMode::Obfuscate && matches!(b, blocks::STONE | blocks::DEEPSLATE));
                 if !candidate {
                     continue;
                 }
@@ -65,9 +66,9 @@ pub fn obfuscate(chunk: &Chunk, mode: XrayMode, seed: u32, neighbor: &dyn Fn(i32
                     let h = hash2(bx + x, bz + z, seed ^ (y as u32).wrapping_mul(0x9E37_79B9));
                     if h % 23 == 0 {
                         let fake = if y < 0 {
-                            [Block::DeepslateDiamondOre, Block::DeepslateGoldOre, Block::DeepslateIronOre, Block::DeepslateRedstoneOre][(h >> 8) as usize % 4]
+                            [blocks::DEEPSLATE_DIAMOND_ORE, blocks::DEEPSLATE_GOLD_ORE, blocks::DEEPSLATE_IRON_ORE, blocks::DEEPSLATE_REDSTONE_ORE][(h >> 8) as usize % 4]
                         } else {
-                            [Block::DiamondOre, Block::GoldOre, Block::IronOre, Block::CoalOre][(h >> 8) as usize % 4]
+                            [blocks::DIAMOND_ORE, blocks::GOLD_ORE, blocks::IRON_ORE, blocks::COAL_ORE][(h >> 8) as usize % 4]
                         };
                         out.set(x as usize, y, z as usize, fake);
                     }
@@ -95,10 +96,10 @@ pub struct MiningStats {
 }
 
 impl MiningStats {
-    pub fn on_break(&mut self, b: Block) -> Option<Flag> {
+    pub fn on_break(&mut self, b: BlockState) -> Option<Flag> {
         match b {
-            Block::Stone | Block::Deepslate => self.stone += 1,
-            Block::DiamondOre | Block::DeepslateDiamondOre | Block::EmeraldOre | Block::DeepslateEmeraldOre | Block::GoldOre | Block::DeepslateGoldOre => {
+            blocks::STONE | blocks::DEEPSLATE => self.stone += 1,
+            blocks::DIAMOND_ORE | blocks::DEEPSLATE_DIAMOND_ORE | blocks::EMERALD_ORE | blocks::DEEPSLATE_EMERALD_ORE | blocks::GOLD_ORE | blocks::DEEPSLATE_GOLD_ORE => {
                 self.valuable += 1
             }
             _ => return None,
@@ -123,7 +124,7 @@ mod tests {
         for y in -64..60 {
             for x in 0..16 {
                 for z in 0..16 {
-                    c.set(x, y, z, if y < 0 { Block::Deepslate } else { Block::Stone });
+                    c.set(x, y, z, if y < 0 { blocks::DEEPSLATE } else { blocks::STONE });
                 }
             }
         }
@@ -134,30 +135,30 @@ mod tests {
     #[test]
     fn hidden_ore_removed_exposed_ore_kept() {
         let mut c = solid_chunk();
-        c.set(8, 10, 8, Block::DiamondOre); // buried
-        c.set(8, 59, 8, Block::CoalOre); // top layer, air above → visible
-        c.set(3, -10, 3, Block::DeepslateGoldOre);
-        c.set(3, -9, 3, Block::Air); // cave next to it
-        let solid = |_x, _y, _z| Some(Block::Stone);
+        c.set(8, 10, 8, blocks::DIAMOND_ORE); // buried
+        c.set(8, 59, 8, blocks::COAL_ORE); // top layer, air above → visible
+        c.set(3, -10, 3, blocks::DEEPSLATE_GOLD_ORE);
+        c.set(3, -9, 3, blocks::AIR); // cave next to it
+        let solid = |_x, _y, _z| Some(blocks::STONE);
         let o = obfuscate(&c, XrayMode::Hide, 1, &solid);
-        assert_eq!(o.get(8, 10, 8), Block::Stone);
-        assert_eq!(o.get(8, 59, 8), Block::CoalOre);
-        assert_eq!(o.get(3, -10, 3), Block::DeepslateGoldOre);
+        assert_eq!(o.get(8, 10, 8), blocks::STONE);
+        assert_eq!(o.get(8, 59, 8), blocks::COAL_ORE);
+        assert_eq!(o.get(3, -10, 3), blocks::DEEPSLATE_GOLD_ORE);
     }
 
     #[test]
     fn border_uses_neighbor_and_unknown_is_exposed() {
         let mut c = solid_chunk();
-        c.set(0, 10, 5, Block::DiamondOre);
+        c.set(0, 10, 5, blocks::DIAMOND_ORE);
         let o = obfuscate(&c, XrayMode::Hide, 1, &|_, _, _| None);
-        assert_eq!(o.get(0, 10, 5), Block::DiamondOre);
-        let o = obfuscate(&c, XrayMode::Hide, 1, &|_, _, _| Some(Block::Stone));
-        assert_eq!(o.get(0, 10, 5), Block::Stone);
+        assert_eq!(o.get(0, 10, 5), blocks::DIAMOND_ORE);
+        let o = obfuscate(&c, XrayMode::Hide, 1, &|_, _, _| Some(blocks::STONE));
+        assert_eq!(o.get(0, 10, 5), blocks::STONE);
     }
 
     #[test]
     fn obfuscate_adds_fakes() {
-        let o = obfuscate(&solid_chunk(), XrayMode::Obfuscate, 1, &|_, _, _| Some(Block::Stone));
+        let o = obfuscate(&solid_chunk(), XrayMode::Obfuscate, 1, &|_, _, _| Some(blocks::STONE));
         let mut fakes = 0;
         for y in -60..50 {
             for x in 1..15 {
@@ -175,9 +176,9 @@ mod tests {
         let mut alert = false;
         for _ in 0..10 {
             for _ in 0..3 {
-                s.on_break(Block::Stone);
+                s.on_break(blocks::STONE);
             }
-            alert |= s.on_break(Block::DiamondOre).is_some();
+            alert |= s.on_break(blocks::DIAMOND_ORE).is_some();
         }
         assert!(alert);
     }

@@ -13,8 +13,8 @@ use tokio::time::timeout;
 use super::codec::{frame, read_packet, write_string, Reader};
 use crate::ServerState;
 
-pub const PROTOCOL_VERSION: i32 = 769; // 1.21.4
-pub const VERSION_NAME: &str = "RimeMC 1.21.4";
+pub use crate::registry::PROTOCOL_VERSION;
+pub const VERSION_NAME: &str = "RimeMC 26.1";
 
 /// Per-IP connection accounting (anti connection-flood / slowloris).
 #[derive(Default)]
@@ -78,11 +78,9 @@ pub async fn listen(state: Arc<ServerState>) -> anyhow::Result<()> {
         let st = state.clone();
         tokio::spawn(async move {
             let _guard = guard;
-            // hard cap on the whole pre-play conversation
-            match timeout(Duration::from_secs(15), handle(sock, st)).await {
-                Ok(Err(e)) => tracing::debug!("{addr}: {e:#}"),
-                Err(_) => tracing::debug!("{addr}: handshake timed out"),
-                Ok(Ok(())) => {}
+            // every pre-play phase has its own timeout inside `handle`
+            if let Err(e) = handle(sock, st).await {
+                tracing::debug!("{addr}: {e:#}");
             }
         });
     }
@@ -93,7 +91,7 @@ fn json_text(msg: &str) -> String {
 }
 
 async fn handle(mut sock: TcpStream, state: Arc<ServerState>) -> anyhow::Result<()> {
-    let pkt = read_packet(&mut sock, 1024).await?;
+    let pkt = timeout(Duration::from_secs(10), read_packet(&mut sock, 1024)).await??;
     let mut r = Reader::new(&pkt);
     anyhow::ensure!(r.varint()? == 0x00, "expected handshake");
     let protocol = r.varint()?;
@@ -101,7 +99,7 @@ async fn handle(mut sock: TcpStream, state: Arc<ServerState>) -> anyhow::Result<
     let _port = r.u16()?;
     let next = r.varint()?;
     match next {
-        1 => status(sock, state, protocol).await,
+        1 => timeout(Duration::from_secs(15), status(sock, state, protocol)).await?,
         2 | 3 => login(sock, state, protocol).await,
         _ => anyhow::bail!("invalid next state {next}"),
     }
@@ -145,11 +143,12 @@ pub fn offline_uuid(name: &str) -> uuid::Uuid {
     uuid::Uuid::from_bytes(h)
 }
 
-async fn login(mut sock: TcpStream, _state: Arc<ServerState>, protocol: i32) -> anyhow::Result<()> {
-    let pkt = read_packet(&mut sock, 256).await?;
+async fn login(mut sock: TcpStream, state: Arc<ServerState>, protocol: i32) -> anyhow::Result<()> {
+    let pkt = timeout(Duration::from_secs(10), read_packet(&mut sock, 256)).await??;
     let mut r = Reader::new(&pkt);
     anyhow::ensure!(r.varint()? == 0x00, "expected login start");
     let name = r.string(16)?.to_owned();
+    let _client_uuid = r.uuid()?; // ignored in offline mode (derived from the name like vanilla)
     let disconnect = |msg: String| {
         let mut out = Vec::new();
         write_string(&mut out, &json_text(&msg));
@@ -163,11 +162,16 @@ async fn login(mut sock: TcpStream, _state: Arc<ServerState>, protocol: i32) -> 
         sock.write_all(&disconnect(format!("Please use Minecraft {}", VERSION_NAME.trim_start_matches("RimeMC ")))).await?;
         return Ok(());
     }
-    tracing::info!("{name} ({}) tried to join", offline_uuid(&name));
-    // The play-state protocol (configuration → play) is the next milestone;
-    // until it lands we refuse cleanly instead of half-joining the client.
-    sock.write_all(&disconnect("RimeMC: gameplay protocol is not available in this build yet.".into())).await?;
-    Ok(())
+    if state.online_players() >= state.cfg.server.max_players {
+        sock.write_all(&disconnect("The server is full!".into())).await?;
+        return Ok(());
+    }
+    if let Some(left) = state.banned_for(&name) {
+        sock.write_all(&disconnect(format!("You are temporarily banned ({} min left)", left.div_ceil(60)))).await?;
+        return Ok(());
+    }
+    // offline mode: same UUID derivation as vanilla
+    super::play::run(sock, state, name.clone(), offline_uuid(&name)).await
 }
 
 #[cfg(test)]

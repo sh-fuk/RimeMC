@@ -7,11 +7,15 @@ mod anticheat;
 mod config;
 mod control;
 mod fleet_net;
+mod game;
 mod net;
 #[allow(dead_code)]
 mod nbt;
 mod ops;
+#[allow(dead_code)]
+mod registry;
 mod tick;
+mod vanilla;
 mod world;
 
 use std::path::{Path, PathBuf};
@@ -60,7 +64,14 @@ pub struct ServerState {
     pub store: WorldStore,
     pub generator: Arc<Generator>,
     pub ops: Ops,
-    online: AtomicU32,
+    pub game: game::Game,
+    pub config_data: net::config_data::ConfigData,
+    pub seed: i64,
+    /// where new players appear (feet position)
+    pub spawn: [f64; 3],
+    pub pregen: Mutex<Option<Pregen>>,
+    bans: Mutex<std::collections::HashMap<String, Instant>>,
+    pub online: AtomicU32,
     mspt_bits: AtomicU64,
     redstone_role: AtomicBool,
     cell_costs: Mutex<std::collections::HashMap<CellId, f32>>,
@@ -75,6 +86,23 @@ impl ServerState {
     }
     pub fn mspt(&self) -> f32 {
         f64::from_bits(self.mspt_bits.load(Ordering::Relaxed)) as f32
+    }
+    /// Temporary anti-cheat ban (kept until it expires or the server restarts).
+    pub fn ban(&self, name: &str, minutes: u64) {
+        self.bans.lock().insert(name.to_ascii_lowercase(), Instant::now() + Duration::from_secs(minutes * 60));
+    }
+    /// Seconds left on a ban, if any.
+    pub fn banned_for(&self, name: &str) -> Option<u64> {
+        let mut b = self.bans.lock();
+        let key = name.to_ascii_lowercase();
+        match b.get(&key) {
+            Some(until) if *until > Instant::now() => Some((*until - Instant::now()).as_secs()),
+            Some(_) => {
+                b.remove(&key);
+                None
+            }
+            None => None,
+        }
     }
     pub fn cell_cost(&self, c: &CellId) -> f32 {
         self.cell_costs.lock().get(c).copied().unwrap_or(0.0)
@@ -92,7 +120,12 @@ impl ServerState {
 
     pub async fn sync(self: &Arc<Self>) -> String {
         let st = self.clone();
-        match tokio::task::spawn_blocking(move || st.store.flush()).await {
+        match tokio::task::spawn_blocking(move || {
+            st.game.world.save(&st.store, true);
+            st.store.flush()
+        })
+        .await
+        {
             Ok(r) if r.failures == 0 => format!("OK synced {} region(s) to disk in {} ms", r.regions_written, r.millis),
             Ok(r) => format!("ERR {} region(s) failed to save ({} saved); see server log", r.failures, r.regions_written),
             Err(e) => format!("ERR sync task failed: {e}"),
@@ -101,7 +134,7 @@ impl ServerState {
 
     pub fn status(&self) -> String {
         format!(
-            "RimeMC {} | uptime {}s | players {}/{} | mspt {:.2} | RAM world {:.1} MiB, {} dirty region(s) | GPU generator {} | fleet {:?}",
+            "RimeMC {} | uptime {}s | players {}/{} | mspt {:.2} | RAM world {:.1} MiB, {} dirty region(s) | {} chunk(s) loaded | GPU generator {} | fleet {:?}",
             env!("CARGO_PKG_VERSION"),
             self.started.elapsed().as_secs(),
             self.online_players(),
@@ -109,6 +142,7 @@ impl ServerState {
             self.mspt(),
             self.store.memory_used() as f64 / 1048576.0,
             self.store.dirty_regions(),
+            self.game.world.loaded(),
             if self.generator.gpu_active() { "on" } else { "off" },
             self.cfg.fleet.mode
         )
@@ -200,11 +234,28 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
     let generator = Arc::new(Generator::new(seed, cfg.gpu.enabled, cfg.gpu.min_batch));
     let ops = Ops::load(&dir.join("ops.json"))?;
 
+    // official vanilla data (registries, tags, worldgen) — downloaded from Mojang once
+    let vanilla = vanilla::VanillaData::ensure(&dir)?;
+    let config_data = net::config_data::ConfigData::build(&vanilla)?;
+    tracing::info!("loaded {} synchronized registries from vanilla {} data", config_data.registries.len(), registry::blocks::MC_VERSION);
+
+    let game = game::Game::new(cfg.server.compression_threshold);
+    // spawn: surface at 0,0
+    game.world.ensure_loaded(&[(0, 0)], &store, &generator);
+    let spawn_y = game.world.surface_y(0, 0).unwrap_or(64) + 1;
+    let spawn = [0.5, spawn_y as f64, 0.5];
+
     let state = Arc::new(ServerState {
         cfg,
         store,
         generator,
         ops,
+        game,
+        config_data,
+        seed,
+        spawn,
+        pregen: Mutex::new(None),
+        bans: Mutex::new(Default::default()),
         online: AtomicU32::new(0),
         mspt_bits: AtomicU64::new(0f64.to_bits()),
         redstone_role: AtomicBool::new(false),
@@ -215,7 +266,7 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
     });
 
     // ---- pre-generation pool (leaves one core for the tick thread)
-    let pregen = if state.cfg.pregen.enabled {
+    if state.cfg.pregen.enabled {
         let threads = if state.cfg.pregen.threads == 0 { threads.saturating_sub(1).max(1) } else { state.cfg.pregen.threads };
         let (s1, s2) = (state.clone(), state.clone());
         let p = Pregen::start(
@@ -236,10 +287,8 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
         spawn.sort_by_key(|(x, z)| x * x + z * z);
         p.enqueue(&spawn);
         p.enqueue(&predict((0.0, 0.0), (0.0, 0.0), view, 1.0, state.cfg.pregen.candidates));
-        Some(p)
-    } else {
-        None
-    };
+        *state.pregen.lock() = Some(p);
+    }
 
     // ---- tick thread (20 TPS, fixed timestep, parallel cells)
     let tick_thread = {
@@ -313,9 +362,11 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
     });
 
     let _ = tick_thread.join();
-    if let Some(p) = pregen {
+    if let Some(p) = state.pregen.lock().take() {
         p.shutdown();
     }
+    let saved = state.game.world.save(&state.store, false);
+    tracing::info!("saved {saved} modified chunk(s)");
     let r = state.store.flush();
     tracing::info!("saved {} region(s) on shutdown ({} failed)", r.regions_written, r.failures);
     let _ = std::fs::remove_file(dir.join(control::CONTROL_FILE));

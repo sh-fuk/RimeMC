@@ -38,6 +38,80 @@ pub fn write_string(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
+/// Big-endian writers for packet bodies.
+pub trait Out {
+    fn vi(&mut self, v: i32) -> &mut Self;
+    fn vl(&mut self, v: i64) -> &mut Self;
+    fn str(&mut self, s: &str) -> &mut Self;
+    fn u8(&mut self, v: u8) -> &mut Self;
+    fn i32(&mut self, v: i32) -> &mut Self;
+    fn i64(&mut self, v: i64) -> &mut Self;
+    fn f32(&mut self, v: f32) -> &mut Self;
+    fn f64(&mut self, v: f64) -> &mut Self;
+    fn bool(&mut self, v: bool) -> &mut Self;
+    fn uuid(&mut self, v: uuid::Uuid) -> &mut Self;
+    fn pos(&mut self, x: i32, y: i32, z: i32) -> &mut Self;
+    fn raw(&mut self, b: &[u8]) -> &mut Self;
+}
+
+impl Out for Vec<u8> {
+    fn vi(&mut self, v: i32) -> &mut Self {
+        write_varint(self, v);
+        self
+    }
+    fn vl(&mut self, v: i64) -> &mut Self {
+        let mut v = v as u64;
+        loop {
+            if v & !0x7F == 0 {
+                self.push(v as u8);
+                return self;
+            }
+            self.push((v as u8 & 0x7F) | 0x80);
+            v >>= 7;
+        }
+    }
+    fn str(&mut self, s: &str) -> &mut Self {
+        write_string(self, s);
+        self
+    }
+    fn u8(&mut self, v: u8) -> &mut Self {
+        self.push(v);
+        self
+    }
+    fn i32(&mut self, v: i32) -> &mut Self {
+        self.extend_from_slice(&v.to_be_bytes());
+        self
+    }
+    fn i64(&mut self, v: i64) -> &mut Self {
+        self.extend_from_slice(&v.to_be_bytes());
+        self
+    }
+    fn f32(&mut self, v: f32) -> &mut Self {
+        self.extend_from_slice(&v.to_be_bytes());
+        self
+    }
+    fn f64(&mut self, v: f64) -> &mut Self {
+        self.extend_from_slice(&v.to_be_bytes());
+        self
+    }
+    fn bool(&mut self, v: bool) -> &mut Self {
+        self.push(v as u8);
+        self
+    }
+    fn uuid(&mut self, v: uuid::Uuid) -> &mut Self {
+        self.extend_from_slice(v.as_bytes());
+        self
+    }
+    fn pos(&mut self, x: i32, y: i32, z: i32) -> &mut Self {
+        let v = ((x as i64 & 0x3FF_FFFF) << 38) | ((z as i64 & 0x3FF_FFFF) << 12) | (y as i64 & 0xFFF);
+        self.i64(v)
+    }
+    fn raw(&mut self, b: &[u8]) -> &mut Self {
+        self.extend_from_slice(b);
+        self
+    }
+}
+
 /// Build a framed packet: length ‖ id ‖ body (no compression).
 pub fn frame(id: i32, body: &[u8]) -> Vec<u8> {
     let mut inner = Vec::with_capacity(body.len() + 5);
@@ -88,6 +162,33 @@ impl<'a> Reader<'a> {
     pub fn i64(&mut self) -> Result<i64, CodecError> {
         Ok(i64::from_be_bytes(self.bytes(8)?.try_into().unwrap()))
     }
+    pub fn u8(&mut self) -> Result<u8, CodecError> {
+        Ok(self.bytes(1)?[0])
+    }
+    pub fn i8(&mut self) -> Result<i8, CodecError> {
+        Ok(self.u8()? as i8)
+    }
+    pub fn bool(&mut self) -> Result<bool, CodecError> {
+        Ok(self.u8()? != 0)
+    }
+    pub fn i16(&mut self) -> Result<i16, CodecError> {
+        Ok(i16::from_be_bytes(self.bytes(2)?.try_into().unwrap()))
+    }
+    pub fn f32(&mut self) -> Result<f32, CodecError> {
+        Ok(f32::from_be_bytes(self.bytes(4)?.try_into().unwrap()))
+    }
+    pub fn f64(&mut self) -> Result<f64, CodecError> {
+        Ok(f64::from_be_bytes(self.bytes(8)?.try_into().unwrap()))
+    }
+    pub fn uuid(&mut self) -> Result<uuid::Uuid, CodecError> {
+        Ok(uuid::Uuid::from_bytes(self.bytes(16)?.try_into().unwrap()))
+    }
+    /// Block position (x 26 bits, z 26 bits, y 12 bits).
+    pub fn pos(&mut self) -> Result<(i32, i32, i32), CodecError> {
+        let v = self.i64()?;
+        Ok(((v >> 38) as i32, (v << 52 >> 52) as i32, (v << 26 >> 38) as i32))
+    }
+
     /// String with a maximum length in *characters* (vanilla semantics).
     pub fn string(&mut self, max_chars: usize) -> Result<&'a str, CodecError> {
         let len = self.varint()?;
@@ -139,6 +240,15 @@ mod tests {
             assert_eq!(Reader::new(&b).varint().unwrap(), v);
         }
         assert_eq!(Reader::new(&[0xFF; 6]).varint(), Err(CodecError::VarIntTooLong));
+    }
+
+    #[test]
+    fn block_positions() {
+        for (x, y, z) in [(0, 0, 0), (-1, -64, -1), (33_554_431, 2047, -33_554_432), (123, -5, -456)] {
+            let mut b = Vec::new();
+            b.pos(x, y, z);
+            assert_eq!(Reader::new(&b).pos().unwrap(), (x, y, z));
+        }
     }
 
     #[test]

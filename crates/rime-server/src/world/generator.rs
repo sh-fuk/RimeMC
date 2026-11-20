@@ -7,7 +7,8 @@
 
 use rayon::prelude::*;
 
-use super::chunk::{Biome, Block, Chunk, MIN_Y};
+use super::chunk::{Biomes, Chunk, MIN_Y};
+use crate::registry::{blocks, BlockState};
 
 pub const SEA_LEVEL: i32 = 63;
 
@@ -67,8 +68,8 @@ pub fn chunk_heights_cpu(cx: i32, cz: i32, seed: u32) -> [i32; 256] {
 }
 
 struct OreSpec {
-    stone: Block,
-    deep: Block,
+    stone: BlockState,
+    deep: BlockState,
     tries: u32,
     min_y: i32,
     max_y: i32,
@@ -76,14 +77,14 @@ struct OreSpec {
 }
 
 const ORES: [OreSpec; 8] = [
-    OreSpec { stone: Block::CoalOre, deep: Block::DeepslateCoalOre, tries: 20, min_y: 0, max_y: 192, size: 12 },
-    OreSpec { stone: Block::IronOre, deep: Block::DeepslateIronOre, tries: 12, min_y: -64, max_y: 72, size: 8 },
-    OreSpec { stone: Block::CopperOre, deep: Block::DeepslateCopperOre, tries: 8, min_y: -16, max_y: 112, size: 9 },
-    OreSpec { stone: Block::GoldOre, deep: Block::DeepslateGoldOre, tries: 4, min_y: -64, max_y: 32, size: 7 },
-    OreSpec { stone: Block::RedstoneOre, deep: Block::DeepslateRedstoneOre, tries: 6, min_y: -64, max_y: 16, size: 7 },
-    OreSpec { stone: Block::LapisOre, deep: Block::DeepslateLapisOre, tries: 2, min_y: -64, max_y: 64, size: 6 },
-    OreSpec { stone: Block::DiamondOre, deep: Block::DeepslateDiamondOre, tries: 3, min_y: -64, max_y: 16, size: 5 },
-    OreSpec { stone: Block::EmeraldOre, deep: Block::DeepslateEmeraldOre, tries: 1, min_y: 0, max_y: 160, size: 1 },
+    OreSpec { stone: blocks::COAL_ORE, deep: blocks::DEEPSLATE_COAL_ORE, tries: 20, min_y: 0, max_y: 192, size: 12 },
+    OreSpec { stone: blocks::IRON_ORE, deep: blocks::DEEPSLATE_IRON_ORE, tries: 12, min_y: -64, max_y: 72, size: 8 },
+    OreSpec { stone: blocks::COPPER_ORE, deep: blocks::DEEPSLATE_COPPER_ORE, tries: 8, min_y: -16, max_y: 112, size: 9 },
+    OreSpec { stone: blocks::GOLD_ORE, deep: blocks::DEEPSLATE_GOLD_ORE, tries: 4, min_y: -64, max_y: 32, size: 7 },
+    OreSpec { stone: blocks::REDSTONE_ORE, deep: blocks::DEEPSLATE_REDSTONE_ORE, tries: 6, min_y: -64, max_y: 16, size: 7 },
+    OreSpec { stone: blocks::LAPIS_ORE, deep: blocks::DEEPSLATE_LAPIS_ORE, tries: 2, min_y: -64, max_y: 64, size: 6 },
+    OreSpec { stone: blocks::DIAMOND_ORE, deep: blocks::DEEPSLATE_DIAMOND_ORE, tries: 3, min_y: -64, max_y: 16, size: 5 },
+    OreSpec { stone: blocks::EMERALD_ORE, deep: blocks::DEEPSLATE_EMERALD_ORE, tries: 1, min_y: 0, max_y: 160, size: 1 },
 ];
 
 /// Build a full chunk from its height field (CPU, cheap compared to noise).
@@ -97,35 +98,42 @@ pub fn build_chunk(cx: i32, cz: i32, seed: u32, heights: &[i32; 256]) -> Chunk {
             let r = hash2(wx, wz, seed ^ 0x5bd1_e995);
             for y in MIN_Y..=h.max(SEA_LEVEL - 1) {
                 let b = if y == MIN_Y || (y < MIN_Y + 5 && (r >> ((y - MIN_Y) as u32 * 3)) & 7 < (5 - (y - MIN_Y)) as u32) {
-                    Block::Bedrock
+                    blocks::BEDROCK
                 } else if y > h {
-                    Block::Water
+                    blocks::WATER
                 } else if y < 0 {
-                    Block::Deepslate
+                    blocks::DEEPSLATE
                 } else if y < h - 3 {
-                    Block::Stone
+                    blocks::STONE
                 } else if h <= SEA_LEVEL + 1 {
-                    if y < h - 1 && h < SEA_LEVEL - 4 { Block::Gravel } else if y < h - 2 { Block::Sandstone } else { Block::Sand }
+                    if y < h - 1 && h < SEA_LEVEL - 4 { blocks::GRAVEL } else if y < h - 2 { blocks::SANDSTONE } else { blocks::SAND }
                 } else if y < h {
-                    Block::Dirt
+                    blocks::DIRT
                 } else {
-                    Block::GrassBlock
+                    blocks::GRASS_BLOCK
                 };
                 c.set(x, y, z, b);
             }
-            c.heightmap[z * 16 + x] = h.max(SEA_LEVEL - 1) as i16;
+            c.heightmap[z * 16 + x] = h.max(SEA_LEVEL - 1) as i16; // water surface counts
         }
     }
+    let b = Biomes::get();
+    let (ocean, beach, plains) = (b.id("minecraft:ocean").unwrap_or(0), b.id("minecraft:beach").unwrap_or(0), Biomes::plains());
     for bz in 0..4 {
         for bx in 0..4 {
             let h = heights[(bz * 4 + 2) * 16 + bx * 4 + 2];
-            c.biomes[bz * 4 + bx] = if h < SEA_LEVEL - 4 {
-                Biome::Ocean
+            let id = if h < SEA_LEVEL - 4 {
+                ocean
             } else if h <= SEA_LEVEL + 1 {
-                Biome::Beach
+                beach
             } else {
-                Biome::Plains
+                plains
             };
+            for sec in c.biomes.iter_mut() {
+                for by in 0..4 {
+                    sec[(by << 4) | (bz << 2) | bx] = id;
+                }
+            }
         }
     }
     // Ores: deterministic per-chunk blobs, replacing only stone/deepslate.
@@ -142,8 +150,8 @@ pub fn build_chunk(cx: i32, cz: i32, seed: u32, heights: &[i32; 256]) -> Chunk {
                 let y = oy + ((s >> 2) & 3) as i32 - 1;
                 let z = (oz + ((s >> 4) & 3) as i32 - 1).clamp(0, 15) as usize;
                 match c.get(x, y, z) {
-                    Block::Stone => c.set(x, y, z, ore.stone),
-                    Block::Deepslate => c.set(x, y, z, ore.deep),
+                    blocks::STONE => c.set(x, y, z, ore.stone),
+                    blocks::DEEPSLATE => c.set(x, y, z, ore.deep),
                     _ => {}
                 }
             }
@@ -226,7 +234,7 @@ mod tests {
         let a = build_chunk(5, -7, 42, &chunk_heights_cpu(5, -7, 42));
         let b = build_chunk(5, -7, 42, &chunk_heights_cpu(5, -7, 42));
         assert_eq!(a.to_nbt(0), b.to_nbt(0));
-        assert_eq!(a.get(0, MIN_Y, 0), Block::Bedrock);
+        assert_eq!(a.get(0, MIN_Y, 0), blocks::BEDROCK);
         for x in -2000..2000 {
             let h = column_height(x * 7, x * -13, 1);
             assert!((MIN_Y + 8..=250).contains(&h));

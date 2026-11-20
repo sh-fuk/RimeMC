@@ -36,6 +36,23 @@ pub struct ServerCfg {
     /// Max new connections per second from one IP.
     pub connection_rate_per_ip: u32,
     pub compression_threshold: i32,
+    /// Game mode for joining players: survival / creative / adventure / spectator
+    pub default_gamemode: GameMode,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GameMode {
+    Survival,
+    Creative,
+    Adventure,
+    Spectator,
+}
+
+impl GameMode {
+    pub fn id(self) -> i32 {
+        self as i32
+    }
 }
 
 impl Default for ServerCfg {
@@ -50,6 +67,7 @@ impl Default for ServerCfg {
             max_connections_per_ip: 5,
             connection_rate_per_ip: 5,
             compression_threshold: 256,
+            default_gamemode: GameMode::Survival,
         }
     }
 }

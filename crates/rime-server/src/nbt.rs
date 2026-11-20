@@ -157,6 +157,42 @@ impl Tag {
     }
 }
 
+impl Tag {
+    /// Convert JSON (datapack format) to NBT the way vanilla's codecs accept it:
+    /// integers → Int/Long, fractions → Double, booleans → Byte, and
+    /// heterogeneous lists wrapped as `{"": value}` compounds.
+    pub fn from_json(v: &serde_json::Value) -> Tag {
+        use serde_json::Value as V;
+        match v {
+            V::Null => Tag::Compound(vec![]),
+            V::Bool(b) => Tag::Byte(*b as i8),
+            V::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    if i >= i32::MIN as i64 && i <= i32::MAX as i64 { Tag::Int(i as i32) } else { Tag::Long(i) }
+                } else {
+                    Tag::Double(n.as_f64().unwrap_or(0.0))
+                }
+            }
+            V::String(s) => Tag::String(s.clone()),
+            V::Array(a) => {
+                let items: Vec<Tag> = a.iter().map(Tag::from_json).collect();
+                let homogeneous = items.windows(2).all(|w| w[0].id() == w[1].id());
+                if homogeneous {
+                    Tag::List(items)
+                } else {
+                    Tag::List(items.into_iter().map(|t| if let Tag::Compound(_) = t { t } else { Tag::Compound(vec![(String::new(), t)]) }).collect())
+                }
+            }
+            V::Object(o) => Tag::Compound(o.iter().map(|(k, v)| (k.clone(), Tag::from_json(v))).collect()),
+        }
+    }
+
+    /// Plain text chat component.
+    pub fn text(s: &str) -> Tag {
+        Tag::Compound(vec![("text".into(), Tag::String(s.into()))])
+    }
+}
+
 /// Java "modified UTF-8" is identical to UTF-8 for everything except NUL and
 /// supplementary characters; we write plain UTF-8, which vanilla accepts.
 fn write_str(out: &mut Vec<u8>, s: &str) {
