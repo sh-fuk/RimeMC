@@ -1,0 +1,15 @@
+[package]
+name = "rime-fleet"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bincode = "1"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+parking_lot = "0.13.0"
+rand = "0.8"
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2.0.21"

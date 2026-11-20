@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/airworld", "crates/rime-fleet", "crates/rime-server"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# keep unwinding so a panic in one subsystem can be isolated instead of killing the server
+panic = "unwind"
+
+[profile.dev.package."*"]
+opt-level = 2

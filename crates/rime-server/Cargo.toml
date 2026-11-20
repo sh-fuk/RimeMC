@@ -1,0 +1,22 @@
+[package]
+name = "rime-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+airworld = { version = "0.1.0", path = "../airworld" }
+anyhow = "1.0.104"
+hex = "0.4.3"
+md-5 = "0.10"
+parking_lot = "0.13.0"
+rand = "0.8"
+rayon = "1.12.0"
+rime-fleet = { version = "0.1.0", path = "../rime-fleet" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.10"
+tokio = { version = "1.54.1", features = ["full"] }
+toml = "1.2.1"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+uuid = { version = "1.29.3", features = ["v3", "v4"] }
