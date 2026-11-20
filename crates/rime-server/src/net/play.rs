@@ -62,6 +62,12 @@ pub fn chunk_body(c: &Chunk, light: &crate::world::light::ChunkLight) -> Vec<u8>
     let data = c.network_sections();
     b.vi(data.len() as i32).raw(&data);
     b.vi(0); // block entities
+    light_data(&mut b, light);
+    b
+}
+
+/// The light part of `level_chunk_with_light` / `light_update`.
+pub fn light_data(b: &mut Vec<u8>, light: &crate::world::light::ChunkLight) {
     let bits = |b: &mut Vec<u8>, m: u64| {
         if m == 0 {
             b.vi(0);
@@ -70,17 +76,16 @@ pub fn chunk_body(c: &Chunk, light: &crate::world::light::ChunkLight) -> Vec<u8>
         }
     };
     let mask = |v: &[Option<Box<[u8; 2048]>>], set: bool| v.iter().enumerate().filter(|(_, a)| a.is_some() == set).fold(0u64, |m, (i, _)| m | 1 << i);
-    bits(&mut b, mask(&light.sky, true));
-    bits(&mut b, mask(&light.block, true));
-    bits(&mut b, mask(&light.sky, false));
-    bits(&mut b, mask(&light.block, false));
+    bits(b, mask(&light.sky, true));
+    bits(b, mask(&light.block, true));
+    bits(b, mask(&light.sky, false));
+    bits(b, mask(&light.block, false));
     for v in [&light.sky, &light.block] {
         b.vi(v.iter().flatten().count() as i32);
         for a in v.iter().flatten() {
             b.vi(2048).raw(&a[..]);
         }
     }
-    b
 }
 
 /// The `commands` tree: a few literals, each taking an optional greedy string.
@@ -191,7 +196,7 @@ pub async fn run(mut sock: TcpStream, st: Arc<ServerState>, name: String, uuid: 
 
     let (rd, wr) = sock.into_split();
     let writer = tokio::spawn(writer_task(wr, rx));
-    let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(1024);
+    let (in_tx, in_rx) = mpsc::channel::<(Instant, Vec<u8>)>(1024);
     let reader = tokio::spawn(reader_task(rd, in_tx));
 
     let mut s = Session::new(st.clone(), me.clone(), view);
@@ -241,7 +246,7 @@ async fn writer_task(mut wr: tokio::net::tcp::OwnedWriteHalf, mut rx: mpsc::Rece
     let _ = wr.shutdown().await;
 }
 
-async fn reader_task(mut rd: tokio::net::tcp::OwnedReadHalf, tx: mpsc::Sender<Vec<u8>>) {
+async fn reader_task(mut rd: tokio::net::tcp::OwnedReadHalf, tx: mpsc::Sender<(Instant, Vec<u8>)>) {
     let mut window = Instant::now();
     let mut count = 0u32;
     loop {
@@ -254,7 +259,9 @@ async fn reader_task(mut rd: tokio::net::tcp::OwnedReadHalf, tx: mpsc::Sender<Ve
             window = Instant::now();
             count = 0;
         }
-        if count > MAX_PACKETS_PER_SEC || tx.send(p).await.is_err() {
+        // stamped on arrival: packets queued while the session was busy
+        // must not look like a timer cheat when they are handled in a burst
+        if count > MAX_PACKETS_PER_SEC || tx.send((Instant::now(), p)).await.is_err() {
             return;
         }
     }
@@ -289,6 +296,8 @@ struct Session {
     last_second_pos: [f64; 3],
     tick: u64,
     epoch: Instant,
+    /// arrival time of the packet being handled (ms since `epoch`)
+    arrived_ms: u64,
 }
 
 enum Flow {
@@ -328,6 +337,7 @@ impl Session {
             last_second_pos: p,
             tick: 0,
             epoch: Instant::now(),
+            arrived_ms: 0,
         }
     }
 
@@ -347,15 +357,16 @@ impl Session {
         self.me.gamemode.load(Ordering::Relaxed)
     }
 
-    async fn run(&mut self, mut rx: mpsc::Receiver<Vec<u8>>) -> anyhow::Result<()> {
+    async fn run(&mut self, mut rx: mpsc::Receiver<(Instant, Vec<u8>)>) -> anyhow::Result<()> {
         self.join_sequence().await;
         let mut ticker = tokio::time::interval(Duration::from_millis(50));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let flow = tokio::select! {
                 p = rx.recv() => match p {
-                    Some(p) => {
+                    Some((at, p)) => {
                         self.act_packets += 1;
+                        self.arrived_ms = at.saturating_duration_since(self.epoch).as_millis() as u64;
                         match self.handle(&p) {
                             Ok(f) => f,
                             Err(e) => Flow::Disconnect(format!("Bad packet: {e}")),
@@ -549,31 +560,46 @@ impl Session {
         }
         let st = self.st.clone();
         let coords = batch.clone();
-        // neighbours too: a chunk's light depends on its 3x3 neighbourhood
-        let _ = tokio::task::spawn_blocking(move || {
+        // load/generate (with neighbours: a chunk's light depends on its 3x3
+        // neighbourhood) and build the packets on the blocking pool, in
+        // parallel, so this player's packets keep flowing meanwhile
+        let built = tokio::task::spawn_blocking(move || {
             let mut all: Vec<(i32, i32)> = coords.iter().flat_map(|&(x, z)| (-1..=1).flat_map(move |dx| (-1..=1).map(move |dz| (x + dx, z + dz)))).collect();
             all.sort_unstable();
             all.dedup();
-            st.game.world.ensure_loaded(&all, &st.store, &st.generator)
+            let world = &st.game.world;
+            world.ensure_loaded(&all, &st.store, &st.generator);
+            let xray_mode = st.cfg.anticheat.xray;
+            let xray_on = xray_mode != XrayMode::Off && st.cfg.anticheat.enabled;
+            let seed = st.generator.seed;
+            use rayon::prelude::*;
+            coords
+                .par_iter()
+                .map(|&c| {
+                    let pkt = world.chunk_packet(c.0, c.1, &|chunk: &Chunk| {
+                        let around: Vec<Option<Chunk>> = (0..9).map(|i| if i == 4 { None } else { world.chunk_copy(c.0 + i / 3 - 1, c.1 + i % 3 - 1) }).collect();
+                        let refs: [Option<&Chunk>; 9] = std::array::from_fn(|i| if i == 4 { Some(chunk) } else { around[i].as_ref() });
+                        let light = crate::world::light::compute(&refs);
+                        if xray_on {
+                            let safe = xray::obfuscate(chunk, xray_mode, seed, &|x, y, z| world.get_block(x, y, z));
+                            chunk_body(&safe, &light)
+                        } else {
+                            chunk_body(chunk, &light)
+                        }
+                    });
+                    (c, pkt)
+                })
+                .collect::<Vec<_>>()
         })
-        .await;
+        .await
+        .unwrap_or_default();
         let world = &self.st.game.world;
-        let xray_mode = self.st.cfg.anticheat.xray;
-        let seed = self.st.generator.seed;
         self.send("chunk_batch_start", &[]);
         let mut count = 0;
-        for c in batch {
-            let pkt = world.chunk_packet(c.0, c.1, &|chunk: &Chunk| {
-                let around: Vec<Option<Chunk>> = (0..9).map(|i| if i == 4 { None } else { world.chunk_copy(c.0 + i / 3 - 1, c.1 + i % 3 - 1) }).collect();
-                let refs: [Option<&Chunk>; 9] = std::array::from_fn(|i| if i == 4 { Some(chunk) } else { around[i].as_ref() });
-                let light = crate::world::light::compute(&refs);
-                if xray_mode != XrayMode::Off && self.st.cfg.anticheat.enabled {
-                    let safe = xray::obfuscate(chunk, xray_mode, seed, &|x, y, z| world.get_block(x, y, z));
-                    chunk_body(&safe, &light)
-                } else {
-                    chunk_body(chunk, &light)
-                }
-            });
+        for (c, pkt) in built {
+            if !self.in_view(c, self.center, self.view) || self.sent.contains(&c) {
+                continue;
+            }
             if let Some(body) = pkt {
                 self.send("level_chunk_with_light", &body);
                 world.add_viewer(c.0, c.1);
@@ -824,7 +850,7 @@ impl Session {
     }
 
     fn on_move(&mut self, pos: Option<[f64; 3]>, rot: Option<(f32, f32)>, on_ground: bool) -> Flow {
-        if let Some(f) = self.checker.on_move_packet(self.now_ms()) {
+        if let Some(f) = self.checker.on_move_packet(self.arrived_ms) {
             if let Some(flow) = self.apply_flag(f.check, f.amount, f.detail) {
                 return flow;
             }
@@ -889,7 +915,12 @@ impl Session {
             teleporting: self.pending_tp.is_some(),
             sprinting: self.sprinting,
             solid_below: below_solid,
-            on_ice: matches!(at(-1).name(), "ice" | "packed_ice" | "blue_ice" | "frosted_ice"),
+            friction: match at(-1).name() {
+                "ice" | "packed_ice" | "frosted_ice" => 0.98,
+                "blue_ice" => 0.989,
+                "slime_block" => 0.8,
+                _ => 0.6,
+            },
             bounced: matches!(at(-1).name(), "slime_block") || at(-1).name().ends_with("_bed"),
             ..Default::default()
         }

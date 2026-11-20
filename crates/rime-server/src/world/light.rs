@@ -79,6 +79,14 @@ pub fn face_full(s: BlockState, dir: usize) -> bool {
     t.masks[t.faces[i][dir] as usize] == [u64::MAX; 4]
 }
 
+/// Whether replacing `a` by `b` can change light (emission, dampening or
+/// occlusion shape differ).
+pub fn affects_light(a: BlockState, b: BlockState) -> bool {
+    let t = table();
+    let (i, j) = (a.0 as usize, b.0 as usize);
+    t.emission.get(i) != t.emission.get(j) || t.damp.get(i) != t.damp.get(j) || t.flags.get(i) != t.flags.get(j) || t.faces.get(i) != t.faces.get(j)
+}
+
 /// `Direction` ordinals
 const DOWN: usize = 0;
 const OPPOSITE: [usize; 6] = [1, 0, 3, 2, 5, 4];

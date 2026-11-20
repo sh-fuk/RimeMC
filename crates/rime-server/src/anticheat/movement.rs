@@ -39,7 +39,8 @@ pub struct MoveContext {
     pub teleporting: bool,
     pub speed_amplifier: u8,
     pub jump_boost: u8,
-    pub on_ice: bool,
+    /// friction of the block under the feet (0 = default 0.6)
+    pub friction: f64,
     pub sprinting: bool,
     /// is there a solid block directly under the player's feet (server world)?
     pub solid_below: bool,
@@ -64,6 +65,12 @@ pub struct MovementChecker {
     pub last_legit: [f64; 3],
     last_pos: Option<[f64; 3]>,
     last_dy: f64,
+    /// horizontal distance of the previous move (momentum)
+    last_h: f64,
+    /// raw vertical move of the previous packet
+    prev_dy: f64,
+    /// friction under the feet on the previous move
+    last_friction: f64,
     air_ticks: u32,
     hover_ticks: u32,
     grace: u32,
@@ -81,6 +88,9 @@ impl Default for MovementChecker {
             last_legit: [0.0; 3],
             last_pos: None,
             last_dy: 0.0,
+            last_h: 0.0,
+            prev_dy: 0.0,
+            last_friction: 0.6,
             air_ticks: 0,
             hover_ticks: 0,
             grace: GRACE,
@@ -164,6 +174,7 @@ impl MovementChecker {
         }
 
         let in_air = !ctx.solid_below;
+        let mut carried = horizontal;
         if in_air {
             self.air_ticks += 1;
         } else {
@@ -203,15 +214,19 @@ impl MovementChecker {
             }
 
             // ---------------------------------------------------------- speed
-            let mut limit = if in_air { 0.62 } else if ctx.sprinting { 0.36 } else { 0.29 };
-            limit *= 1.0 + 0.2 * ctx.speed_amplifier as f64;
-            if ctx.on_ice {
-                limit *= 2.6;
-            }
+            // vanilla horizontal physics: each tick the velocity is multiplied
+            // by the friction of the previous tick and the input acceleration
+            // is added. Whether the previous tick was on the ground cannot be
+            // known exactly server-side, so the larger of the ground and air
+            // predictions is the limit; a jump adds the sprint-jump boost.
+            let limit = self.max_horizontal(ctx, dy);
+            // carry only the legal part of the speed: otherwise a constant
+            // speed multiplier would raise its own limit tick after tick
+            carried = horizontal.min(limit);
             if horizontal > limit {
-                self.speed_buffer += (horizontal - limit) * 4.0;
+                self.speed_buffer += (horizontal - limit) * 6.0;
             } else {
-                self.speed_buffer = (self.speed_buffer - 0.05).max(0.0);
+                self.speed_buffer = (self.speed_buffer - 0.04).max(0.0);
             }
             if self.speed_buffer > 1.0 {
                 res.flags.push(Flag { check: Check::Speed, amount: self.speed_buffer.min(5.0), detail: format!("h={horizontal:.3} max={limit:.3}") });
@@ -227,11 +242,29 @@ impl MovementChecker {
         }
 
         self.last_dy = if in_air { dy } else { 0.0 };
+        self.prev_dy = dy;
+        self.last_h = carried;
+        self.last_friction = if ctx.friction > 0.0 { ctx.friction } else { 0.6 };
         self.last_pos = Some(to);
         if res.flags.is_empty() {
             self.last_legit = to;
         }
         res
+    }
+
+    /// Largest legal horizontal move this tick (with a small tolerance).
+    fn max_horizontal(&self, ctx: &MoveContext, dy: f64) -> f64 {
+        // the friction applied this tick is the one of the previous block
+        let fr = if ctx.friction > 0.0 { ctx.friction } else { 0.6 }.max(self.last_friction);
+        // movement speed attribute, always assuming sprint (the sprint flag
+        // arrives in a separate packet and may lag behind the movement)
+        let attr = 0.1 * (1.0 + 0.2 * ctx.speed_amplifier as f64) * 1.3;
+        let ground = self.last_h * fr * 0.91 + attr * (0.216 / (fr * fr * fr));
+        let air = self.last_h * 0.91 + 0.026 * (1.0 + 0.2 * ctx.speed_amplifier as f64);
+        // a jump starts when the player begins to rise (headhitters jump
+        // without ever leaving the "near ground" zone)
+        let jump = if dy > 0.0 && self.prev_dy <= 0.0 { 0.2 } else { 0.0 };
+        ground.max(air) * 1.02 + jump + 0.005
     }
 
     /// NoFall: the client claims to be on the ground but the server world has
@@ -249,6 +282,8 @@ impl MovementChecker {
         self.last_pos = Some(to);
         self.last_legit = to;
         self.last_dy = 0.0;
+        self.prev_dy = 0.0;
+        self.last_h = 0.0;
         self.grace = GRACE;
         self.fall_distance = 0.0;
     }
@@ -342,9 +377,10 @@ mod tests {
         let mut m = MovementChecker::default();
         settle(&mut m);
         let sprint = MoveContext { sprinting: true, solid_below: true, ..Default::default() };
-        let mut x = 0.0;
+        let (mut x, mut v) = (0.0, 0.0);
         for _ in 0..100 {
-            x += 0.28;
+            v = v * 0.546 + 0.13 * 0.98;
+            x += v;
             assert!(m.on_move([x, 64.0, 0.0], &sprint).flags.is_empty());
         }
         let mut flagged = false;
@@ -353,6 +389,42 @@ mod tests {
             flagged |= m.on_move([x, 64.0, 0.0], &sprint).flags.iter().any(|f| f.check == Check::Speed);
         }
         assert!(flagged);
+    }
+
+    /// vanilla sprint-jumping (ground accel 0.13*0.98, air 0.026*0.98,
+    /// jump boost 0.2, friction 0.546 / 0.91) is never flagged, also on ice
+    /// and when jumping under a ceiling; a 30% speed hack is.
+    #[test]
+    fn sprint_jumping_is_clean_speed_hack_flagged() {
+        for (fr, ceiling, hack) in [(0.6, false, 1.0), (0.98, false, 1.0), (0.989, false, 1.0), (0.6, true, 1.0), (0.98, true, 1.0), (0.6, false, 1.3)] {
+            let mut m = MovementChecker::default();
+            settle(&mut m);
+            let (mut x, mut y, mut v, mut vy) = (0.0f64, 64.0f64, 0.0f64, 0.0f64);
+            let mut on_ground = true;
+            let mut flagged = false;
+            for _ in 0..400 {
+                if on_ground {
+                    v = v * fr * 0.91 + 0.13 * 0.98 * 0.216 / (fr * fr * fr);
+                    // jump as soon as possible
+                    v += 0.2;
+                    vy = if ceiling { 0.2 } else { 0.42 };
+                    on_ground = false;
+                } else {
+                    v = v * 0.91 + 0.026 * 0.98;
+                }
+                x += v * hack;
+                y += vy;
+                vy = (vy - GRAVITY) * DRAG;
+                if y <= 64.0 {
+                    y = 64.0;
+                    vy = 0.0;
+                    on_ground = true;
+                }
+                let ctx = MoveContext { sprinting: true, solid_below: y - 64.0 < 1.0, friction: fr, ..Default::default() };
+                flagged |= m.on_move([x, y, 0.0], &ctx).flags.iter().any(|f| f.check == Check::Speed);
+            }
+            assert_eq!(flagged, hack > 1.0, "friction {fr} ceiling {ceiling} hack {hack}");
+        }
     }
 
     #[test]

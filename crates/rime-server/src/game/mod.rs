@@ -43,6 +43,8 @@ pub struct World {
     shards: Vec<Mutex<HashMap<(i32, i32), Entry>>>,
     /// fluid ticks of freshly generated chunks, scheduled by the next game tick
     pending_fluid: Mutex<Vec<[i32; 3]>>,
+    /// chunks whose light must be recomputed and sent again
+    light_dirty: Mutex<HashSet<(i32, i32)>>,
 }
 
 fn shard(x: i32, z: i32) -> usize {
@@ -55,7 +57,7 @@ fn now_ms() -> i64 {
 
 impl World {
     pub fn new() -> Self {
-        Self { shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(), pending_fluid: Mutex::new(Vec::new()) }
+        Self { shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(), pending_fluid: Mutex::new(Vec::new()), light_dirty: Mutex::new(HashSet::new()) }
     }
 
     pub fn loaded(&self) -> usize {
@@ -165,6 +167,15 @@ impl World {
             e.version += 1;
             e.packet = None;
             drop(s);
+            if crate::world::light::affects_light(old, b) {
+                // light reaches 15 blocks: the 3x3 chunks around may change
+                let mut d = self.light_dirty.lock();
+                for dx in -1..=1 {
+                    for dz in -1..=1 {
+                        d.insert(((x >> 4) + dx, (z >> 4) + dz));
+                    }
+                }
+            }
             for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)] {
                 let (nx, nz) = ((x >> 4) + dx, (z >> 4) + dz);
                 if let Some(n) = self.shards[shard(nx, nz)].lock().get_mut(&(nx, nz)) {
@@ -174,6 +185,31 @@ impl World {
             }
         }
         Some(old)
+    }
+
+    /// Recompute the light of chunks changed since the last call (at most
+    /// `max` of them, in parallel); returns `(chunk, light_update body)`.
+    pub fn relight(&self, max: usize) -> Vec<((i32, i32), Vec<u8>)> {
+        let todo: Vec<(i32, i32)> = {
+            let mut d = self.light_dirty.lock();
+            let v: Vec<(i32, i32)> = d.iter().copied().take(max).collect();
+            for c in &v {
+                d.remove(c);
+            }
+            v
+        };
+        todo.into_par_iter()
+            .filter_map(|(cx, cz)| {
+                let around: Vec<Option<Chunk>> = (0..9).map(|i| self.chunk_copy(cx + i / 3 - 1, cz + i % 3 - 1)).collect();
+                around[4].as_ref()?;
+                let refs: [Option<&Chunk>; 9] = std::array::from_fn(|i| around[i].as_ref());
+                let light = crate::world::light::compute(&refs);
+                let mut b = Vec::with_capacity(8 * 1024);
+                b.vi(cx).vi(cz);
+                crate::net::play::light_data(&mut b, &light);
+                Some(((cx, cz), b))
+            })
+            .collect()
     }
 
     /// Remember that players changed this chunk (it is then never
@@ -684,6 +720,17 @@ impl Game {
             }
         }
         self.tick_entities();
+        // light changed by block updates
+        let relit = self.world.relight(256);
+        if !relit.is_empty() {
+            let players = self.players();
+            for ((cx, cz), body) in relit {
+                let pkt = self.encode("light_update", &body);
+                for p in players.iter().filter(|p| p.sees_chunk(cx, cz)) {
+                    p.send(pkt.clone());
+                }
+            }
+        }
     }
 
     fn tick_entities(&self) {
@@ -844,6 +891,26 @@ mod tests {
         w.ensure_loaded(&[(0, 0)], &store, &g);
         assert_eq!(w.get_block(1, 100, 1), Some(blocks::GLASS));
         assert_eq!(w.set_block(1, 9999, 1, blocks::GLASS), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn block_changes_relight_the_3x3_chunks() {
+        let w = World::new();
+        let g = Generator::new(1, false, 1);
+        let dir = std::env::temp_dir().join(format!("rime-light-test-{}", std::process::id()));
+        let store = WorldStore::open(&dir, crate::config::WorldFormat::Airworld, 3, true, 64).unwrap();
+        let around: Vec<(i32, i32)> = (-1..=1).flat_map(|x| (-1..=1).map(move |z| (x, z))).collect();
+        w.ensure_loaded(&around, &store, &g);
+        assert!(w.relight(1000).is_empty());
+        // air -> cave_air does not change light; a torch does
+        w.set_block(3, 200, 3, blocks::CAVE_AIR);
+        assert!(w.relight(1000).is_empty());
+        let torch = BlockRegistry::get().state("torch", &[]).unwrap();
+        w.set_block(3, 200, 3, torch);
+        let mut got: Vec<(i32, i32)> = w.relight(1000).into_iter().map(|(c, _)| c).collect();
+        got.sort_unstable();
+        assert_eq!(got, around);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
