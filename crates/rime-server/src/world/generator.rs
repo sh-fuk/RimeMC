@@ -200,6 +200,10 @@ impl Generator {
         self
     }
 
+    pub fn vanilla(&self) -> Option<&crate::worldgen::VanillaGenerator> {
+        self.vanilla.as_deref()
+    }
+
     pub fn is_vanilla(&self) -> bool {
         self.vanilla.is_some()
     }

@@ -11,6 +11,7 @@ pub mod chunk;
 pub mod density;
 pub mod noise;
 pub mod random;
+pub mod spawn;
 pub mod surface;
 
 #[cfg(test)]

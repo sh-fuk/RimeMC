@@ -251,10 +251,8 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
     let game_data = data::GameData::load(&vanilla)?;
     tracing::info!("loaded {} crafting recipes and vanilla loot tables", game_data.recipes.len());
     let game = game::Game::new(cfg.server.compression_threshold, game_data);
-    // spawn: surface at 0,0
-    game.world.ensure_loaded(&[(0, 0)], &store, &generator);
-    let spawn_y = game.world.surface_y(0, 0).unwrap_or(64) + 1;
-    let spawn = [0.5, spawn_y as f64, 0.5];
+    let spawn = load_or_find_spawn(&world_dir, &game, &store, &generator)?;
+    tracing::info!("world spawn at {:.0} {:.0} {:.0}", spawn[0], spawn[1], spawn[2]);
 
     let state = Arc::new(ServerState {
         cfg,
@@ -292,12 +290,14 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
                 }
             }),
         );
-        // spawn area first: everything within view distance of 0,0
+        // spawn area first: everything within view distance of the spawn
         let view = state.cfg.server.view_distance as i32;
+        let (scx, scz) = ((state.spawn[0].floor() as i32) >> 4, (state.spawn[2].floor() as i32) >> 4);
         let mut spawn: Vec<(i32, i32)> = (-view..=view).flat_map(|x| (-view..=view).map(move |z| (x, z))).collect();
         spawn.sort_by_key(|(x, z)| x * x + z * z);
+        let spawn: Vec<(i32, i32)> = spawn.into_iter().map(|(x, z)| (x + scx, z + scz)).collect();
         p.enqueue(&spawn);
-        p.enqueue(&predict((0.0, 0.0), (0.0, 0.0), view, 1.0, state.cfg.pregen.candidates));
+        p.enqueue(&predict((state.spawn[0], state.spawn[2]), (0.0, 0.0), view, 1.0, state.cfg.pregen.candidates));
         *state.pregen.lock() = Some(p);
     }
 
@@ -430,6 +430,27 @@ fn tick_loop(state: Arc<ServerState>) {
             next = now;
         }
     }
+}
+
+/// World spawn, chosen once per world: the vanilla spawn search for
+/// vanilla worlds, otherwise the surface at 0,0.
+fn load_or_find_spawn(world_dir: &Path, game: &game::Game, store: &WorldStore, generator: &Generator) -> anyhow::Result<[f64; 3]> {
+    let p = world_dir.join("rime-spawn.txt");
+    if let Ok(s) = std::fs::read_to_string(&p) {
+        let v: Vec<f64> = s.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+        if let [x, y, z] = v[..] {
+            return Ok([x, y, z]);
+        }
+    }
+    let spawn = if let Some(v) = generator.vanilla() {
+        let (x, y, z) = v.find_spawn(&|cx, cz| v.generate(cx, cz));
+        [x as f64 + 0.5, y as f64, z as f64 + 0.5]
+    } else {
+        game.world.ensure_loaded(&[(0, 0)], store, generator);
+        [0.5, (game.world.surface_y(0, 0).unwrap_or(64) + 1) as f64, 0.5]
+    };
+    std::fs::write(&p, format!("{} {} {}", spawn[0], spawn[1], spawn[2]))?;
+    Ok(spawn)
 }
 
 fn load_or_create_seed(world_dir: &Path, cfg_seed: i64) -> anyhow::Result<i64> {

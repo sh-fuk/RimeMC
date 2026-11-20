@@ -307,3 +307,14 @@ fn bench_generation() {
     let s = t.elapsed().as_secs_f64();
     eprintln!("{n} chunks in {s:.2}s = {:.0} chunks/s on {} threads", n as f64 / s, rayon::current_num_threads());
 }
+
+/// World spawn for seed 12345, as chosen by a vanilla 26.1 server whose
+/// biomes had no features (terrain + carvers only, like this generator so
+/// far).
+#[test]
+fn spawn_matches_vanilla() {
+    let Some(dir) = data_dir() else { return };
+    let generator = super::VanillaGenerator::new(&loader(dir), 12345).unwrap();
+    let spawn = generator.find_spawn(&|cx, cz| generator.generate(cx, cz));
+    assert_eq!(spawn, (96, 136, -32));
+}
