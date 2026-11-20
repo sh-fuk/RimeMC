@@ -6,6 +6,7 @@
 mod anticheat;
 mod config;
 mod control;
+mod data;
 mod fleet_net;
 mod game;
 mod net;
@@ -239,7 +240,9 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
     let config_data = net::config_data::ConfigData::build(&vanilla)?;
     tracing::info!("loaded {} synchronized registries from vanilla {} data", config_data.registries.len(), registry::blocks::MC_VERSION);
 
-    let game = game::Game::new(cfg.server.compression_threshold);
+    let game_data = data::GameData::load(&vanilla)?;
+    tracing::info!("loaded {} crafting recipes and vanilla loot tables", game_data.recipes.len());
+    let game = game::Game::new(cfg.server.compression_threshold, game_data);
     // spawn: surface at 0,0
     game.world.ensure_loaded(&[(0, 0)], &store, &generator);
     let spawn_y = game.world.surface_y(0, 0).unwrap_or(64) + 1;
@@ -389,7 +392,13 @@ fn tick_loop(state: Arc<ServerState>) {
     let mut next = Instant::now();
     let mut avg = 0.0f64;
     while !state.stopping.load(Ordering::Relaxed) {
-        let stats = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sched.tick(&state.cfg.level_tick)));
+        let stats = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let t = Instant::now();
+            state.game.tick();
+            let mut s = sched.tick(&state.cfg.level_tick);
+            s.mspt += t.elapsed().as_secs_f64() * 1000.0;
+            s
+        }));
         match stats {
             Ok(s) => {
                 avg = avg * 0.95 + s.mspt * 0.05;

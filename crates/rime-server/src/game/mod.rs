@@ -1,0 +1,805 @@
+//! Live game state shared by all connections: loaded chunks and online players.
+//!
+//! Chunks live in 64 independently locked shards so connections on different
+//! cores never contend. Each loaded chunk caches its encoded network packet,
+//! so sending a chunk to N players costs one serialisation, not N.
+
+pub mod entity;
+pub mod fluid;
+pub mod inventory;
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::Arc;
+
+use parking_lot::{Mutex, RwLock};
+use rand::Rng;
+use rayon::prelude::*;
+use tokio::sync::mpsc;
+
+use crate::data::{GameData, Items, Stack};
+use crate::net::codec::Out;
+use crate::registry::{blocks, BlockRegistry, BlockState, PacketIds, Registries};
+use crate::world::chunk::{Chunk, HEIGHT, MIN_Y};
+use entity::{Cell, EKind, Entity};
+use fluid::{fluid_state, Flow, FluidWorld};
+use inventory::Inventory;
+use crate::world::generator::Generator;
+use crate::world::storage::{Dim, Kind, WorldStore};
+
+const SHARDS: usize = 64;
+
+struct Entry {
+    chunk: Chunk,
+    dirty: bool,
+    viewers: u32,
+    /// bumped on every change (lets packets be built outside the lock)
+    version: u64,
+    /// encoded `level_chunk_with_light` body (invalidated on change)
+    packet: Option<Arc<Vec<u8>>>,
+}
+
+pub struct World {
+    shards: Vec<Mutex<HashMap<(i32, i32), Entry>>>,
+}
+
+fn shard(x: i32, z: i32) -> usize {
+    ((x as u32).wrapping_mul(0x9E37_79B9) ^ (z as u32).wrapping_mul(0x85EB_CA6B)) as usize % SHARDS
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+impl World {
+    pub fn new() -> Self {
+        Self { shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect() }
+    }
+
+    pub fn loaded(&self) -> usize {
+        self.shards.iter().map(|s| s.lock().len()).sum()
+    }
+
+    /// Make sure all `coords` are in memory: read from the world store when
+    /// present, otherwise generate them in one batch (GPU / all cores).
+    /// Blocking; call from a blocking context.
+    pub fn ensure_loaded(&self, coords: &[(i32, i32)], store: &WorldStore, generator: &Generator) {
+        let missing: Vec<(i32, i32)> = coords.iter().copied().filter(|&(x, z)| !self.shards[shard(x, z)].lock().contains_key(&(x, z))).collect();
+        if missing.is_empty() {
+            return;
+        }
+        let loaded: Vec<((i32, i32), Option<Chunk>)> = missing
+            .par_iter()
+            .map(|&(x, z)| {
+                let c = match store.load_chunk(Dim::Overworld, Kind::Region, x, z) {
+                    Ok(Some(b)) => Chunk::from_nbt(&b).filter(|c| c.x == x && c.z == z),
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::error!("loading chunk {x},{z}: {e:#}");
+                        None
+                    }
+                };
+                ((x, z), c)
+            })
+            .collect();
+        let to_gen: Vec<(i32, i32)> = loaded.iter().filter(|(_, c)| c.is_none()).map(|(k, _)| *k).collect();
+        let generated = if to_gen.is_empty() { Vec::new() } else { generator.generate_batch(&to_gen) };
+        let insert = |c: Chunk, dirty: bool| {
+            let mut s = self.shards[shard(c.x, c.z)].lock();
+            s.entry((c.x, c.z)).or_insert(Entry { chunk: c, dirty, viewers: 0, version: 0, packet: None });
+        };
+        for (_, c) in loaded {
+            if let Some(c) = c {
+                insert(c, false);
+            }
+        }
+        for c in generated {
+            insert(c, true); // new chunks are persisted with the next save
+        }
+    }
+
+    pub fn add_viewer(&self, x: i32, z: i32) {
+        if let Some(e) = self.shards[shard(x, z)].lock().get_mut(&(x, z)) {
+            e.viewers += 1;
+        }
+    }
+
+    pub fn remove_viewer(&self, x: i32, z: i32) {
+        if let Some(e) = self.shards[shard(x, z)].lock().get_mut(&(x, z)) {
+            e.viewers = e.viewers.saturating_sub(1);
+        }
+    }
+
+    /// Encoded chunk packet body (cached). `build` runs without any lock held,
+    /// so it may itself read neighbouring blocks.
+    pub fn chunk_packet(&self, x: i32, z: i32, build: &dyn Fn(&Chunk) -> Vec<u8>) -> Option<Arc<Vec<u8>>> {
+        let (copy, ver) = {
+            let s = self.shards[shard(x, z)].lock();
+            let e = s.get(&(x, z))?;
+            if let Some(p) = &e.packet {
+                return Some(p.clone());
+            }
+            (e.chunk.clone(), e.version)
+        };
+        let p = Arc::new(build(&copy));
+        if let Some(e) = self.shards[shard(x, z)].lock().get_mut(&(x, z)) {
+            if e.version == ver {
+                e.packet = Some(p.clone());
+            }
+        }
+        Some(p)
+    }
+
+    pub fn get_block(&self, x: i32, y: i32, z: i32) -> Option<BlockState> {
+        let s = self.shards[shard(x >> 4, z >> 4)].lock();
+        let e = s.get(&(x >> 4, z >> 4))?;
+        Some(e.chunk.get((x & 15) as usize, y, (z & 15) as usize))
+    }
+
+    /// Change a block; returns the previous state (None when the chunk is not loaded
+    /// or y is out of range).
+    pub fn set_block(&self, x: i32, y: i32, z: i32, b: BlockState) -> Option<BlockState> {
+        if !(MIN_Y..MIN_Y + crate::world::chunk::HEIGHT).contains(&y) {
+            return None;
+        }
+        let mut s = self.shards[shard(x >> 4, z >> 4)].lock();
+        let e = s.get_mut(&(x >> 4, z >> 4))?;
+        let (lx, lz) = ((x & 15) as usize, (z & 15) as usize);
+        let old = e.chunk.get(lx, y, lz);
+        if old != b {
+            e.chunk.set(lx, y, lz, b);
+            e.chunk.update_height(lx, y, lz);
+            e.dirty = true;
+            e.version += 1;
+            e.packet = None;
+        }
+        Some(old)
+    }
+
+    pub fn surface_y(&self, x: i32, z: i32) -> Option<i32> {
+        let s = self.shards[shard(x >> 4, z >> 4)].lock();
+        let e = s.get(&(x >> 4, z >> 4))?;
+        Some(e.chunk.heightmap[((z & 15) * 16 + (x & 15)) as usize] as i32)
+    }
+
+    /// Write modified chunks into the world store, then drop chunks nobody views.
+    pub fn save(&self, store: &WorldStore, unload: bool) -> usize {
+        let mut saved = 0;
+        for sh in &self.shards {
+            let mut s = sh.lock();
+            for e in s.values_mut().filter(|e| e.dirty) {
+                match store.save_chunk(Dim::Overworld, Kind::Region, e.chunk.x, e.chunk.z, &e.chunk.to_nbt(now_ms())) {
+                    Ok(()) => {
+                        e.dirty = false;
+                        saved += 1;
+                    }
+                    Err(err) => tracing::error!("saving chunk {},{}: {err:#}", e.chunk.x, e.chunk.z),
+                }
+            }
+            if unload {
+                s.retain(|_, e| e.viewers > 0 || e.dirty);
+            }
+        }
+        saved
+    }
+}
+
+// ------------------------------------------------------------------ players
+
+#[derive(Clone, Copy, Debug)]
+pub struct Pose {
+    pub pos: [f64; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    pub on_ground: bool,
+}
+
+pub struct Player {
+    pub eid: i32,
+    pub uuid: uuid::Uuid,
+    pub name: String,
+    pub pose: Mutex<Pose>,
+    /// incremented on every movement, so viewers know when to resend
+    pub moved: AtomicU64,
+    pub gamemode: AtomicI32,
+    /// selected hotbar slot (0-8)
+    pub held: AtomicI32,
+    pub inv: Mutex<Inventory>,
+    /// outgoing, already-encoded packets
+    tx: mpsc::Sender<Arc<Vec<u8>>>,
+    /// (center chunk x, z, view distance) of this player's client
+    pub view: Mutex<(i32, i32, i32)>,
+}
+
+impl Player {
+    /// Queue a packet; a client that cannot keep up is disconnected instead of
+    /// letting its queue grow without bound.
+    pub fn send(&self, pkt: Arc<Vec<u8>>) {
+        if self.tx.try_send(pkt).is_err() {
+            tracing::debug!("{}: outgoing queue full or closed", self.name);
+        }
+    }
+
+    pub fn sees_chunk(&self, cx: i32, cz: i32) -> bool {
+        let (x, z, d) = *self.view.lock();
+        (cx - x).abs() <= d && (cz - z).abs() <= d
+    }
+}
+
+/// Item stack in the network `Slot` format (no components).
+pub fn write_slot(b: &mut Vec<u8>, s: Option<Stack>) {
+    match s {
+        Some(s) if s.count > 0 => {
+            b.vi(s.count as i32).vi(s.item).vi(0).vi(0);
+        }
+        _ => {
+            b.vi(0);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TickKind {
+    Fluid,
+    Gravity,
+}
+
+#[derive(Default)]
+struct Ticks {
+    queue: BTreeMap<u64, Vec<([i32; 3], TickKind)>>,
+    pending: HashSet<([i32; 3], TickKind)>,
+}
+
+/// Max scheduled block ticks run per game tick (the rest wait a tick).
+const TICK_BUDGET: usize = 65_536;
+
+pub fn is_gravity_block(name: &str) -> bool {
+    name.ends_with("_concrete_powder") || matches!(name, "sand" | "red_sand" | "gravel" | "suspicious_sand" | "suspicious_gravel" | "anvil" | "chipped_anvil" | "damaged_anvil" | "dragon_egg")
+}
+
+pub struct Game {
+    pub world: World,
+    pub data: GameData,
+    players: RwLock<HashMap<i32, Arc<Player>>>,
+    entities: Mutex<HashMap<i32, Entity>>,
+    ticks: Mutex<Ticks>,
+    now: AtomicU64,
+    next_eid: AtomicI32,
+    pub threshold: i32,
+}
+
+struct GW<'a>(&'a Game);
+
+impl FluidWorld for GW<'_> {
+    fn block(&self, p: [i32; 3]) -> Option<BlockState> {
+        self.0.world.get_block(p[0], p[1], p[2])
+    }
+    fn set(&mut self, p: [i32; 3], b: BlockState, drops: bool) {
+        self.0.change_block(p, b, drops, None);
+    }
+    fn schedule(&mut self, p: [i32; 3], delay: u32) {
+        self.0.schedule(p, TickKind::Fluid, delay);
+    }
+}
+
+impl Game {
+    pub fn new(compression_threshold: i32, data: GameData) -> Self {
+        Self {
+            world: World::new(),
+            data,
+            players: RwLock::new(HashMap::new()),
+            entities: Mutex::new(HashMap::new()),
+            ticks: Mutex::new(Ticks::default()),
+            now: AtomicU64::new(0),
+            next_eid: AtomicI32::new(1),
+            threshold: compression_threshold,
+        }
+    }
+
+    pub fn encode(&self, name: &str, body: &[u8]) -> Arc<Vec<u8>> {
+        Arc::new(crate::net::conn::encode(PacketIds::get().id("play", "clientbound", name), body, self.threshold))
+    }
+
+    pub fn players(&self) -> Vec<Arc<Player>> {
+        self.players.read().values().cloned().collect()
+    }
+
+    pub fn find(&self, name: &str) -> Option<Arc<Player>> {
+        self.players.read().values().find(|p| p.name.eq_ignore_ascii_case(name)).cloned()
+    }
+
+    pub fn count(&self) -> usize {
+        self.players.read().len()
+    }
+
+    fn next_eid(&self) -> i32 {
+        self.next_eid.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Register a player; returns None when the name/UUID is already online.
+    pub fn join(&self, uuid: uuid::Uuid, name: String, pose: Pose, gamemode: i32, view: i32, tx: mpsc::Sender<Arc<Vec<u8>>>) -> Option<Arc<Player>> {
+        let mut m = self.players.write();
+        if m.values().any(|p| p.uuid == uuid || p.name.eq_ignore_ascii_case(&name)) {
+            return None;
+        }
+        let eid = self.next_eid();
+        let cx = (pose.pos[0].floor() as i32) >> 4;
+        let cz = (pose.pos[2].floor() as i32) >> 4;
+        let p = Arc::new(Player {
+            eid,
+            uuid,
+            name,
+            pose: Mutex::new(pose),
+            moved: AtomicU64::new(0),
+            gamemode: AtomicI32::new(gamemode),
+            held: AtomicI32::new(0),
+            inv: Mutex::new(Inventory::default()),
+            tx,
+            view: Mutex::new((cx, cz, view)),
+        });
+        m.insert(eid, p.clone());
+        Some(p)
+    }
+
+    pub fn leave(&self, eid: i32) {
+        self.players.write().remove(&eid);
+    }
+
+    pub fn broadcast(&self, pkt: Arc<Vec<u8>>) {
+        for p in self.players.read().values() {
+            p.send(pkt.clone());
+        }
+    }
+
+    fn broadcast_chunk(&self, c: (i32, i32), pkt: &Arc<Vec<u8>>) {
+        for p in self.players.read().values() {
+            if p.sees_chunk(c.0, c.1) {
+                p.send(pkt.clone());
+            }
+        }
+    }
+
+    /// Send to every player whose view contains the block's chunk.
+    pub fn broadcast_block(&self, x: i32, y: i32, z: i32, b: BlockState) {
+        let mut body = Vec::new();
+        body.pos(x, y, z).vi(b.0 as i32);
+        self.broadcast_chunk((x >> 4, z >> 4), &self.encode("block_update", &body));
+    }
+
+    pub fn system_chat(&self, msg: &str) -> Arc<Vec<u8>> {
+        let mut body = crate::nbt::Tag::text(msg).to_network_bytes();
+        body.bool(false);
+        self.encode("system_chat", &body)
+    }
+
+    pub fn is_replaceable(&self, b: BlockState) -> bool {
+        b.is_air() || BlockRegistry::get().is_fluid(b) || self.data.block_in("replaceable", b.name())
+    }
+
+    // ------------------------------------------------------------ blocks
+
+    /// Change a block with everything vanilla does around it: broadcast,
+    /// optional loot drops of the old block, neighbour updates (fluids,
+    /// falling blocks, blocks that lose their support).
+    pub fn change_block(&self, p: [i32; 3], b: BlockState, drops: bool, tool: Option<i32>) -> Option<BlockState> {
+        let old = self.world.set_block(p[0], p[1], p[2], b)?;
+        if old == b {
+            return Some(old);
+        }
+        self.broadcast_block(p[0], p[1], p[2], b);
+        if drops {
+            self.drop_loot(p, old, tool);
+        }
+        self.neighbor_update(p, old);
+        Some(old)
+    }
+
+    pub fn schedule(&self, p: [i32; 3], kind: TickKind, delay: u32) {
+        let mut t = self.ticks.lock();
+        if t.pending.insert((p, kind)) {
+            let at = self.now.load(Ordering::Relaxed) + delay.max(1) as u64;
+            t.queue.entry(at).or_default().push((p, kind));
+        }
+    }
+
+    fn neighbor_update(&self, p: [i32; 3], old: BlockState) {
+        let reg = BlockRegistry::get();
+        for d in [[0, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]] {
+            let q = [p[0] + d[0], p[1] + d[1], p[2] + d[2]];
+            let Some(bq) = self.world.get_block(q[0], q[1], q[2]) else { continue };
+            if bq.is_air() {
+                continue;
+            }
+            if let Some(f) = fluid_state(bq).fluid() {
+                if fluid::lava_interaction(&mut GW(self), q) {
+                    self.schedule(q, TickKind::Fluid, fluid::tick_delay(f));
+                }
+                if reg.is_fluid(bq) {
+                    continue;
+                }
+            }
+            let name = bq.name();
+            if is_gravity_block(name) {
+                self.schedule(q, TickKind::Gravity, 2);
+            }
+            if d != [0, 0, 0] && !self.can_survive(q, bq) {
+                // lost its support (plants, torches, the other half of doors…)
+                let other_half = matches!(reg.property(bq, "half"), Some("upper" | "lower")) && old.name() == name;
+                self.change_block(q, blocks::AIR, !other_half, None);
+            }
+        }
+    }
+
+    /// Simplified `canSurvive`: things that stand on or hang from a block.
+    fn can_survive(&self, q: [i32; 3], b: BlockState) -> bool {
+        let reg = BlockRegistry::get();
+        let name = b.name();
+        let at = |dx: i32, dy: i32, dz: i32| self.world.get_block(q[0] + dx, q[1] + dy, q[2] + dz);
+        // two-block things: both halves must be present
+        if let Some(half) = reg.property(b, "half") {
+            if (name.ends_with("_door") || reg.property(b, "half").is_some() && !b.is_solid() && reg.property(b, "facing").is_none()) && matches!(half, "upper" | "lower") {
+                let other = if half == "upper" { at(0, -1, 0) } else { at(0, 1, 0) };
+                if other.is_some_and(|o| o.name() != name) {
+                    return false;
+                }
+            }
+        }
+        if name.ends_with("_bed") {
+            return true;
+        }
+        if name.contains("wall_torch") || name.ends_with("_wall_sign") {
+            let off = match reg.property(b, "facing") {
+                Some("north") => (0, 0, 1),
+                Some("south") => (0, 0, -1),
+                Some("east") => (-1, 0, 0),
+                Some("west") => (1, 0, 0),
+                _ => return true,
+            };
+            return at(off.0, off.1, off.2).is_none_or(|s| s.is_solid());
+        }
+        if b.is_solid() || reg.is_fluid(b) || reg.property(b, "waterlogged") == Some("true") {
+            return true;
+        }
+        let free_standing = matches!(name, "cobweb" | "vine" | "ladder" | "glow_lichen" | "light" | "structure_void" | "barrier" | "scaffolding" | "sculk_vein" | "resin_clump" | "tripwire" | "fire" | "soul_fire" | "bubble_column" | "moss_carpet" | "pale_moss_carpet" | "hanging_roots" | "spore_blossom" | "cave_vines" | "cave_vines_plant" | "weeping_vines" | "weeping_vines_plant" | "pale_hanging_moss")
+            || name.ends_with("_wall_banner")
+            || name.ends_with("_button")
+            || name.ends_with("lever")
+            || name.ends_with("_hanging_sign")
+            || name.ends_with("_pane")
+            || name.ends_with("_bars")
+            || name.ends_with("_chain")
+            || name == "chain";
+        if free_standing {
+            return true;
+        }
+        // stands on the block below
+        at(0, -1, 0).is_none_or(|s| s.is_solid() || s.name() == name || name == "sugar_cane" && s.name() == "sugar_cane")
+    }
+
+    /// Spawn the loot of a broken block.
+    pub fn drop_loot(&self, p: [i32; 3], state: BlockState, tool: Option<i32>) {
+        let drops = self.data.block_drops(state, tool, &mut rand::thread_rng());
+        let mut rng = rand::thread_rng();
+        for st in drops {
+            let pos = [p[0] as f64 + 0.5 + rng.gen_range(-0.25..0.25), p[1] as f64 + 0.5 - 0.125 + rng.gen_range(-0.25..0.25), p[2] as f64 + 0.5 + rng.gen_range(-0.25..0.25)];
+            let vel = [rng.gen_range(-0.1..0.1), 0.2, rng.gen_range(-0.1..0.1)];
+            self.spawn_item(pos, st, vel, 10);
+        }
+    }
+
+    // ------------------------------------------------------------ entities
+
+    fn spawn_packets(&self, e: &Entity) -> Vec<Arc<Vec<u8>>> {
+        let regs = Registries::get();
+        let (ty, data) = match &e.kind {
+            EKind::Item { .. } => (regs.id("minecraft:entity_type", "minecraft:item").unwrap_or(0), 0),
+            EKind::Falling { state } => (regs.id("minecraft:entity_type", "minecraft:falling_block").unwrap_or(0), state.0 as i32),
+        };
+        let mut b = Vec::new();
+        b.vi(e.eid).uuid(e.uuid).vi(ty).f64(e.pos[0]).f64(e.pos[1]).f64(e.pos[2]).u8(0).u8(0).u8(0).u8(0).vi(data);
+        let mut out = vec![self.encode("add_entity", &b)];
+        if let EKind::Item { stack, .. } = e.kind {
+            out.push(self.item_meta(e.eid, stack));
+        }
+        out
+    }
+
+    fn item_meta(&self, eid: i32, stack: Stack) -> Arc<Vec<u8>> {
+        let mut b = Vec::new();
+        b.vi(eid).u8(8).vi(7);
+        write_slot(&mut b, Some(stack));
+        b.u8(0xFF);
+        self.encode("set_entity_data", &b)
+    }
+
+    fn remove_packet(&self, eids: &[i32]) -> Arc<Vec<u8>> {
+        let mut b = Vec::new();
+        b.vi(eids.len() as i32);
+        for e in eids {
+            b.vi(*e);
+        }
+        self.encode("remove_entities", &b)
+    }
+
+    pub fn spawn_item(&self, pos: [f64; 3], stack: Stack, vel: [f64; 3], pickup_delay: u32) {
+        if stack.count == 0 || !Items::get().valid(stack.item) {
+            return;
+        }
+        let e = Entity { eid: self.next_eid(), uuid: uuid::Uuid::new_v4(), kind: EKind::Item { stack, pickup_delay }, pos, vel, on_ground: false, age: 0, synced: pos };
+        self.add_entity(e);
+    }
+
+    fn add_entity(&self, e: Entity) {
+        let pkts = self.spawn_packets(&e);
+        let c = e.chunk();
+        self.entities.lock().insert(e.eid, e);
+        for p in pkts {
+            self.broadcast_chunk(c, &p);
+        }
+    }
+
+    /// Spawn packets for all entities in a chunk (sent with the chunk).
+    pub fn entity_spawns_in(&self, c: (i32, i32)) -> Vec<Arc<Vec<u8>>> {
+        let list: Vec<Entity> = self.entities.lock().values().filter(|e| e.chunk() == c).cloned().collect();
+        list.iter().flat_map(|e| self.spawn_packets(e)).collect()
+    }
+
+    pub fn entities_in(&self, c: (i32, i32)) -> Vec<i32> {
+        self.entities.lock().values().filter(|e| e.chunk() == c).map(|e| e.eid).collect()
+    }
+
+    /// Full inventory to the client (join / resync).
+    pub fn send_inventory(&self, p: &Player) {
+        let mut inv = p.inv.lock();
+        inv.state_id = inv.state_id.wrapping_add(1) & 0x7FFF;
+        inv.dirty.clear();
+        let mut b = Vec::new();
+        b.vi(inv.current_window() as i32).vi(inv.state_id);
+        let items = inv.window_contents();
+        b.vi(items.len() as i32);
+        for s in items {
+            write_slot(&mut b, s);
+        }
+        write_slot(&mut b, inv.cursor);
+        p.send(self.encode("container_set_content", &b));
+    }
+
+    /// Send changed inventory slots.
+    pub fn flush_inventory(&self, p: &Player) {
+        let mut inv = p.inv.lock();
+        if inv.dirty.is_empty() {
+            return;
+        }
+        inv.state_id = inv.state_id.wrapping_add(1) & 0x7FFF;
+        let dirty = std::mem::take(&mut inv.dirty);
+        let mut seen = HashSet::new();
+        for (win, slot) in dirty {
+            if !seen.insert((win, slot)) {
+                continue;
+            }
+            let s = if win == 0 { inv.slots[slot as usize] } else { inv.table[slot as usize] };
+            let mut b = Vec::new();
+            b.vi(win as i32).vi(inv.state_id).i16(slot);
+            write_slot(&mut b, s);
+            p.send(self.encode("container_set_slot", &b));
+        }
+    }
+
+    fn cell(&self, x: i32, y: i32, z: i32) -> Cell {
+        match self.world.get_block(x, y, z) {
+            None => Cell::Unknown,
+            Some(b) if b.is_solid() => Cell::Solid,
+            Some(b) if fluid_state(b).fluid() == Some(fluid::Fluid::Water) => Cell::Water,
+            Some(_) => Cell::Open,
+        }
+    }
+
+    // ------------------------------------------------------------ tick
+
+    /// One game tick (runs on the tick thread).
+    pub fn tick(&self) {
+        let now = self.now.fetch_add(1, Ordering::Relaxed) + 1;
+        // scheduled block ticks
+        let due: Vec<([i32; 3], TickKind)> = {
+            let mut t = self.ticks.lock();
+            let mut due = Vec::new();
+            while let Some((&at, _)) = t.queue.first_key_value() {
+                if at > now || due.len() >= TICK_BUDGET {
+                    break;
+                }
+                let list = t.queue.remove(&at).unwrap_or_default();
+                due.extend(list);
+            }
+            if due.len() > TICK_BUDGET {
+                let rest = due.split_off(TICK_BUDGET);
+                t.queue.entry(now + 1).or_default().extend(rest);
+            }
+            for d in &due {
+                t.pending.remove(d);
+            }
+            due
+        };
+        for (p, kind) in due {
+            let Some(b) = self.world.get_block(p[0], p[1], p[2]) else { continue };
+            match kind {
+                TickKind::Fluid => {
+                    if let Some(f) = fluid_state(b).fluid() {
+                        Flow { w: &mut GW(self), fluid: f }.tick(p);
+                    }
+                }
+                TickKind::Gravity => {
+                    if is_gravity_block(b.name()) && p[1] > MIN_Y {
+                        let below = self.world.get_block(p[0], p[1] - 1, p[2]);
+                        if below.is_some_and(|x| self.is_replaceable(x) || x.name() == "fire") {
+                            self.change_block(p, blocks::AIR, false, None);
+                            let pos = [p[0] as f64 + 0.5, p[1] as f64, p[2] as f64 + 0.5];
+                            self.add_entity(Entity { eid: self.next_eid(), uuid: uuid::Uuid::new_v4(), kind: EKind::Falling { state: b }, pos, vel: [0.0; 3], on_ground: false, age: 0, synced: pos });
+                        }
+                    }
+                }
+            }
+        }
+        self.tick_entities();
+    }
+
+    fn tick_entities(&self) {
+        let players = self.players();
+        let mut sends: Vec<((i32, i32), Arc<Vec<u8>>)> = Vec::new();
+        let mut direct: Vec<(Arc<Player>, Arc<Vec<u8>>)> = Vec::new();
+        let mut removed: Vec<(i32, (i32, i32))> = Vec::new();
+        let mut landed: Vec<([i32; 3], BlockState)> = Vec::new();
+        let mut inv_changed: Vec<Arc<Player>> = Vec::new();
+        {
+            let mut ents = self.entities.lock();
+            for e in ents.values_mut() {
+                let old_chunk = e.chunk();
+                if self.world.get_block(e.pos[0].floor() as i32, e.pos[1].floor() as i32, e.pos[2].floor() as i32).is_none() {
+                    continue; // chunk unloaded: frozen
+                }
+                let below = self.world.get_block(e.pos[0].floor() as i32, (e.pos[1] - 0.5).floor() as i32, e.pos[2].floor() as i32).map(|b| b.name()).unwrap_or("stone");
+                let friction = match below {
+                    "ice" | "packed_ice" | "frosted_ice" => 0.98,
+                    "blue_ice" => 0.989,
+                    "slime_block" => 0.8,
+                    _ => 0.6,
+                };
+                let ground = entity::physics(e, &|x, y, z| self.cell(x, y, z), friction);
+                e.age += 1;
+                match &mut e.kind {
+                    EKind::Item { pickup_delay, .. } => {
+                        *pickup_delay = pickup_delay.saturating_sub(1);
+                        if e.age > 6000 || e.pos[1] < (MIN_Y - 64) as f64 {
+                            removed.push((e.eid, old_chunk));
+                            continue;
+                        }
+                    }
+                    EKind::Falling { state } => {
+                        if ground || e.age > 600 {
+                            landed.push(([e.pos[0].floor() as i32, e.pos[1].round() as i32, e.pos[2].floor() as i32], *state));
+                            removed.push((e.eid, old_chunk));
+                            continue;
+                        }
+                    }
+                }
+                let new_chunk = e.chunk();
+                let moved = (0..3).any(|i| (e.pos[i] - e.synced[i]).abs() > 1.0 / 4096.0);
+                if new_chunk != old_chunk {
+                    // viewers that lose / gain sight of it
+                    let spawn = self.spawn_packets(e);
+                    let rm = self.remove_packet(&[e.eid]);
+                    for p in &players {
+                        let (a, b) = (p.sees_chunk(old_chunk.0, old_chunk.1), p.sees_chunk(new_chunk.0, new_chunk.1));
+                        if a && !b {
+                            direct.push((p.clone(), rm.clone()));
+                        } else if !a && b {
+                            for s in &spawn {
+                                direct.push((p.clone(), s.clone()));
+                            }
+                        }
+                    }
+                }
+                if moved {
+                    e.synced = e.pos;
+                    let mut b = Vec::new();
+                    b.vi(e.eid).f64(e.pos[0]).f64(e.pos[1]).f64(e.pos[2]).f64(e.vel[0]).f64(e.vel[1]).f64(e.vel[2]).f32(0.0).f32(0.0).bool(e.on_ground);
+                    sends.push((new_chunk, self.encode("entity_position_sync", &b)));
+                }
+            }
+            // pickups
+            for e in ents.values_mut() {
+                let chunk = e.chunk();
+                let EKind::Item { stack, pickup_delay } = &mut e.kind else { continue };
+                if *pickup_delay > 0 || removed.iter().any(|r| r.0 == e.eid) {
+                    continue;
+                }
+                for p in &players {
+                    if p.gamemode.load(Ordering::Relaxed) == 3 {
+                        continue;
+                    }
+                    let q = p.pose.lock().pos;
+                    // player box (0.6 x 1.8) inflated by 1, 0.5, 1
+                    let hit = (e.pos[0] - q[0]).abs() < 0.3 + 1.0 + 0.125 && e.pos[1] + 0.25 > q[1] - 0.5 && e.pos[1] < q[1] + 1.8 + 0.5 && (e.pos[2] - q[2]).abs() < 0.3 + 1.0 + 0.125;
+                    if !hit {
+                        continue;
+                    }
+                    let held = p.held.load(Ordering::Relaxed) as i16;
+                    let left = p.inv.lock().add(*stack, held);
+                    let taken = stack.count - left;
+                    if taken == 0 {
+                        continue;
+                    }
+                    let mut b = Vec::new();
+                    b.vi(e.eid).vi(p.eid).vi(taken as i32);
+                    sends.push((chunk, self.encode("take_item_entity", &b)));
+                    inv_changed.push(p.clone());
+                    if left == 0 {
+                        removed.push((e.eid, chunk));
+                        break;
+                    }
+                    stack.count = left;
+                    sends.push((chunk, self.item_meta(e.eid, *stack)));
+                }
+            }
+            for (eid, _) in &removed {
+                ents.remove(eid);
+            }
+        }
+        for (c, pkt) in sends {
+            self.broadcast_chunk(c, &pkt);
+        }
+        for (p, pkt) in direct {
+            p.send(pkt);
+        }
+        for (eid, c) in removed {
+            self.broadcast_chunk(c, &self.remove_packet(&[eid]));
+        }
+        for p in inv_changed {
+            self.flush_inventory(&p);
+        }
+        for (p, state) in landed {
+            match self.world.get_block(p[0], p[1], p[2]) {
+                Some(cur) if self.is_replaceable(cur) => {
+                    let st = if state.name().ends_with("_concrete_powder") && fluid_state(cur).fluid() == Some(fluid::Fluid::Water) {
+                        BlockRegistry::get().by_name(&state.name().replace("_powder", "")).map(|b| BlockState(b.default)).unwrap_or(state)
+                    } else {
+                        state
+                    };
+                    self.change_block(p, st, false, None);
+                }
+                _ => {
+                    if let Some(item) = Items::get().id(state.name()) {
+                        self.spawn_item([p[0] as f64 + 0.5, p[1] as f64 + 0.5, p[2] as f64 + 0.5], Stack::new(item, 1), [0.0; 3], 10);
+                    }
+                }
+            }
+        }
+    }
+}
+
+const _: i32 = HEIGHT;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::blocks;
+
+    #[test]
+    fn set_block_invalidates_cache_and_marks_dirty() {
+        let w = World::new();
+        let g = Generator::new(1, false, 1);
+        let dir = std::env::temp_dir().join(format!("rime-game-test-{}", std::process::id()));
+        let store = WorldStore::open(&dir, crate::config::WorldFormat::Airworld, 3, true, 64).unwrap();
+        w.ensure_loaded(&[(0, 0)], &store, &g);
+        let p1 = w.chunk_packet(0, 0, &|c| vec![c.get(0, 100, 0).0 as u8]).unwrap();
+        assert_eq!(w.set_block(1, 100, 1, blocks::GLASS), Some(blocks::AIR));
+        let p2 = w.chunk_packet(0, 0, &|_| vec![9]).unwrap();
+        assert!(!Arc::ptr_eq(&p1, &p2));
+        assert_eq!(w.get_block(1, 100, 1), Some(blocks::GLASS));
+        assert_eq!(w.save(&store, true), 1);
+        assert_eq!(w.loaded(), 0);
+        w.ensure_loaded(&[(0, 0)], &store, &g);
+        assert_eq!(w.get_block(1, 100, 1), Some(blocks::GLASS));
+        assert_eq!(w.set_block(1, 9999, 1, blocks::GLASS), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

@@ -201,8 +201,9 @@ impl BlockRegistry {
 }
 
 impl BlockState {
+    /// Block name without the `minecraft:` namespace (e.g. `oak_log`).
     pub fn name(self) -> &'static str {
-        &BlockRegistry::get().block(self).name
+        BlockRegistry::get().block(self).name.trim_start_matches("minecraft:")
     }
     pub fn is_air(self) -> bool {
         BlockRegistry::get().is_air(self)

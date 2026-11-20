@@ -44,6 +44,7 @@ pub trait Out {
     fn vl(&mut self, v: i64) -> &mut Self;
     fn str(&mut self, s: &str) -> &mut Self;
     fn u8(&mut self, v: u8) -> &mut Self;
+    fn i16(&mut self, v: i16) -> &mut Self;
     fn i32(&mut self, v: i32) -> &mut Self;
     fn i64(&mut self, v: i64) -> &mut Self;
     fn f32(&mut self, v: f32) -> &mut Self;
@@ -76,6 +77,10 @@ impl Out for Vec<u8> {
     }
     fn u8(&mut self, v: u8) -> &mut Self {
         self.push(v);
+        self
+    }
+    fn i16(&mut self, v: i16) -> &mut Self {
+        self.extend_from_slice(&v.to_be_bytes());
         self
     }
     fn i32(&mut self, v: i32) -> &mut Self {

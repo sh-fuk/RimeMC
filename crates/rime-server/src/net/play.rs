@@ -16,7 +16,9 @@ use crate::anticheat::movement::{MoveContext, MovementChecker};
 use crate::anticheat::xray::{self, MiningStats};
 use crate::anticheat::{Check, Verdict, Violations};
 use crate::config::XrayMode;
-use crate::game::{Player, Pose};
+use crate::data::{Items, Stack};
+use crate::game::{fluid, Player, Pose};
+use rand::Rng;
 use crate::nbt::Tag;
 use crate::ops::CommandSender;
 use crate::registry::{blocks, BlockRegistry, BlockState, PacketIds, Registries};
@@ -271,8 +273,8 @@ struct Session {
     tracked: HashMap<i32, u64>,
     pending_tp: Option<i32>,
     next_tp: i32,
-    inv: HashMap<i16, i32>,
-    held: i16,
+    sneaking: bool,
+    next_window: u8,
     checker: MovementChecker,
     vl: Violations,
     mining: MiningStats,
@@ -310,8 +312,8 @@ impl Session {
             tracked: HashMap::new(),
             pending_tp: None,
             next_tp: 1,
-            inv: HashMap::new(),
-            held: 0,
+            sneaking: false,
+            next_window: 0,
             checker: MovementChecker::default(),
             vl: Violations::default(),
             mining: MiningStats::default(),
@@ -434,6 +436,7 @@ impl Session {
         let mut b = Vec::new();
         b.vi(0);
         self.send("set_held_slot", &b);
+        self.st.game.send_inventory(&self.me);
     }
 
     fn send_abilities(&self) {
@@ -491,6 +494,15 @@ impl Session {
         for c in gone {
             self.sent.remove(&c);
             self.st.game.world.remove_viewer(c.0, c.1);
+            let eids = self.st.game.entities_in(c);
+            if !eids.is_empty() {
+                let mut b = Vec::new();
+                b.vi(eids.len() as i32);
+                for e in eids {
+                    b.vi(e);
+                }
+                self.send("remove_entities", &b);
+            }
             let mut b = Vec::new();
             b.i32(c.1).i32(c.0);
             self.send("forget_level_chunk", &b);
@@ -557,6 +569,9 @@ impl Session {
                 world.add_viewer(c.0, c.1);
                 self.sent.insert(c);
                 count += 1;
+                for e in self.st.game.entity_spawns_in(c) {
+                    self.me.send(e);
+                }
             }
         }
         let mut b = Vec::new();
@@ -730,15 +745,42 @@ impl Session {
         } else if pid == sb("set_carried_item") {
             let s = r.i16()?;
             if (0..9).contains(&s) {
-                self.held = s;
+                self.me.held.store(s as i32, Ordering::Relaxed);
             }
         } else if pid == sb("set_creative_mode_slot") {
             let slot = r.i16()?;
             let count = r.varint()?;
             let item = if count > 0 { r.varint()? } else { 0 };
-            if self.gamemode() == 1 && (0..46).contains(&slot) {
-                if count > 0 { self.inv.insert(slot, item) } else { self.inv.remove(&slot) };
+            if self.gamemode() == 1 {
+                let st = (count > 0 && Items::get().valid(item)).then(|| Stack::new(item, count.clamp(1, 99) as u8));
+                if (1..46).contains(&slot) {
+                    self.me.inv.lock().set(slot as usize, st);
+                    self.me.inv.lock().dirty.clear();
+                } else if slot == -1 {
+                    if let Some(st) = st {
+                        self.throw(st, true);
+                    }
+                }
             }
+        } else if pid == sb("use_item") {
+            let hand = r.varint()?;
+            let seq = r.varint()?;
+            let (yaw, pitch) = (r.f32()?, r.f32()?);
+            self.ack(seq);
+            if yaw.is_finite() && pitch.is_finite() {
+                self.use_item(hand, yaw, pitch);
+            }
+        } else if pid == sb("container_click") {
+            return Ok(self.on_click(&mut r));
+        } else if pid == sb("container_close") {
+            let held = self.me.held.load(Ordering::Relaxed) as i16;
+            let thrown = self.me.inv.lock().close(&self.st.game.data, held);
+            for t in thrown {
+                self.throw(t, false);
+            }
+            self.st.game.send_inventory(&self.me);
+        } else if pid == sb("player_input") {
+            self.sneaking = r.u8()? & 0x20 != 0;
         } else if pid == sb("swing") {
             let hand = r.varint()?;
             let mut b = Vec::new();
@@ -1005,6 +1047,31 @@ impl Session {
 
     fn on_dig(&mut self, status: i32, pos: (i32, i32, i32), seq: i32) -> Flow {
         let gm = self.gamemode();
+        match status {
+            3 | 4 => {
+                // drop the held stack (3) or one item (4)
+                self.ack(seq);
+                let held = 36 + self.me.held.load(Ordering::Relaxed) as usize;
+                let taken = {
+                    let mut inv = self.me.inv.lock();
+                    inv.held(held as i16 - 36).map(|s| {
+                        let n = if status == 3 { s.count } else { 1 };
+                        inv.consume(held, n);
+                        Stack::new(s.item, n)
+                    })
+                };
+                if let Some(t) = taken {
+                    self.throw(t, false);
+                    self.st.game.flush_inventory(&self.me);
+                }
+                return Flow::Continue;
+            }
+            5 | 6 => {
+                self.ack(seq);
+                return Flow::Continue;
+            }
+            _ => {}
+        }
         let st = self.st.clone();
         let w = &st.game.world;
         let Some(cur) = w.get_block(pos.0, pos.1, pos.2) else {
@@ -1024,25 +1091,193 @@ impl Session {
             2 => gm != 2 && gm != 3,
             _ => false,
         };
-        if breaks && (gm == 2 || gm == 3 || cur == blocks::BEDROCK && gm != 1 || !self.within_reach(pos)) {
+        let unbreakable = matches!(cur.name(), "bedrock" | "barrier" | "end_portal_frame" | "end_portal" | "end_gateway" | "command_block" | "structure_block" | "jigsaw");
+        if breaks && (gm == 2 || gm == 3 || unbreakable && gm != 1 || !self.within_reach(pos) || BlockRegistry::get().is_fluid(cur)) {
             self.ack(seq);
             self.resync(pos);
             return Flow::Continue;
         }
         if breaks && !cur.is_air() {
+            let tool = self.me.inv.lock().held(self.me.held.load(Ordering::Relaxed) as i16).map(|s| s.item);
             if gm == 0 {
                 if let Some(f) = self.mining.on_break(cur) {
                     let _ = self.apply_flag(f.check, f.amount, f.detail);
                 }
             }
-            w.set_block(pos.0, pos.1, pos.2, blocks::AIR);
+            // a waterlogged block leaves its water behind
+            let after = if BlockRegistry::get().property(cur, "waterlogged") == Some("true") { blocks::WATER } else { blocks::AIR };
+            st.game.change_block([pos.0, pos.1, pos.2], after, gm == 0, tool);
             self.ack(seq);
-            self.st.game.broadcast_block(pos.0, pos.1, pos.2, blocks::AIR);
             self.after_change(pos);
         } else {
             self.ack(seq);
         }
         Flow::Continue
+    }
+
+    /// Throw an item from the player's eyes in the look direction.
+    fn throw(&self, st: Stack, random: bool) {
+        let pose = *self.me.pose.lock();
+        let (yaw, pitch) = (pose.yaw.to_radians() as f64, pose.pitch.to_radians() as f64);
+        let mut rng = rand::thread_rng();
+        let mut vel = [-yaw.sin() * pitch.cos() * 0.3, -pitch.sin() * 0.3 + 0.1, yaw.cos() * pitch.cos() * 0.3];
+        if random {
+            vel = [rng.gen_range(-0.1..0.1), 0.2, rng.gen_range(-0.1..0.1)];
+        } else {
+            let a = rng.gen_range(0.0..std::f64::consts::TAU);
+            let f = 0.02 * rng.gen_range(0.0..1.0);
+            vel[0] += a.cos() * f;
+            vel[1] += (rng.gen_range(0.0..1.0) - rng.gen_range(0.0..1.0)) * 0.1;
+            vel[2] += a.sin() * f;
+        }
+        self.st.game.spawn_item([pose.pos[0], pose.pos[1] + 1.62 - 0.3, pose.pos[2]], st, vel, 40);
+    }
+
+    fn on_click(&mut self, r: &mut Reader) -> Flow {
+        let parsed = (|| -> Result<_, super::codec::CodecError> {
+            let window = r.varint()?;
+            let _state = r.varint()?;
+            let slot = r.i16()?;
+            let button = r.i8()?;
+            let mode = r.varint()?;
+            let n = r.varint()?;
+            if !(0..=128).contains(&n) {
+                return Err(super::codec::CodecError::TooLarge(n as usize));
+            }
+            let mut predicted = Vec::new();
+            let hashed = |r: &mut Reader| -> Result<Option<(i32, i32)>, super::codec::CodecError> {
+                if !r.bool()? {
+                    return Ok(None);
+                }
+                let item = r.varint()?;
+                let count = r.varint()?;
+                let comps = r.varint()?;
+                if !(0..=256).contains(&comps) {
+                    return Err(super::codec::CodecError::TooLarge(comps as usize));
+                }
+                for _ in 0..comps {
+                    r.varint()?;
+                    r.bytes(4)?;
+                }
+                let rem = r.varint()?;
+                if !(0..=256).contains(&rem) {
+                    return Err(super::codec::CodecError::TooLarge(rem as usize));
+                }
+                for _ in 0..rem {
+                    r.varint()?;
+                }
+                Ok(Some((item, count)))
+            };
+            for _ in 0..n {
+                let loc = r.i16()?;
+                predicted.push((loc, hashed(r)?));
+            }
+            let cursor = hashed(r)?;
+            Ok((window, slot, button, mode, predicted, cursor))
+        })();
+        let Ok((window, slot, button, mode, predicted, cursor)) = parsed else {
+            return Flow::Disconnect("Invalid container click".into());
+        };
+        let creative = self.gamemode() == 1;
+        let (outcome, matches) = {
+            let mut inv = self.me.inv.lock();
+            if window != inv.current_window() as i32 {
+                drop(inv);
+                self.st.game.send_inventory(&self.me);
+                return Flow::Continue;
+            }
+            let out = inv.click(&self.st.game.data, slot, button, mode, creative);
+            let contents = inv.window_contents();
+            let as_pair = |s: Option<Stack>| s.map(|s| (s.item, s.count as i32));
+            let ok = predicted.iter().all(|(loc, pred)| contents.get(*loc as usize).is_some_and(|s| as_pair(*s) == *pred)) && as_pair(inv.cursor) == cursor;
+            (out, ok)
+        };
+        for t in outcome.thrown {
+            self.throw(t, false);
+        }
+        if matches {
+            self.st.game.flush_inventory(&self.me);
+        } else {
+            self.st.game.send_inventory(&self.me);
+        }
+        Flow::Continue
+    }
+
+    /// Ray from the eyes; returns the last open cell and the first hit cell.
+    fn raycast(&self, yaw: f32, pitch: f32, stop: &dyn Fn(BlockState) -> bool) -> Option<((i32, i32, i32), (i32, i32, i32))> {
+        let pos = self.me.pose.lock().pos;
+        let (y, p) = (yaw.to_radians() as f64, pitch.to_radians() as f64);
+        let dir = [-y.sin() * p.cos(), -p.sin(), y.cos() * p.cos()];
+        let eye = [pos[0], pos[1] + 1.62, pos[2]];
+        let reach = if self.gamemode() == 1 { 5.0 } else { 4.5 };
+        let mut prev = (eye[0].floor() as i32, eye[1].floor() as i32, eye[2].floor() as i32);
+        let mut t = 0.0;
+        while t <= reach {
+            let c = ((eye[0] + dir[0] * t).floor() as i32, (eye[1] + dir[1] * t).floor() as i32, (eye[2] + dir[2] * t).floor() as i32);
+            if c != prev {
+                let b = self.st.game.world.get_block(c.0, c.1, c.2)?;
+                if stop(b) {
+                    return Some((prev, c));
+                }
+                prev = c;
+            }
+            t += 0.02;
+        }
+        None
+    }
+
+    fn use_item(&mut self, hand: i32, yaw: f32, pitch: f32) {
+        let slot = if hand == 1 { 45 } else { 36 + self.me.held.load(Ordering::Relaxed) as usize };
+        let Some(held) = self.me.inv.lock().slots[slot] else { return };
+        let items = Items::get();
+        let name = items.name(held.item).to_string();
+        let gm = self.gamemode();
+        let game = &self.st.game;
+        match name.as_str() {
+            "bucket" => {
+                let hit = self.raycast(yaw, pitch, &|b| fluid::fluid_state(b).is_source() || b.is_solid());
+                if let Some((_, c)) = hit {
+                    let b = game.world.get_block(c.0, c.1, c.2).unwrap_or(blocks::AIR);
+                    let filled = match b.name() {
+                        "water" if fluid::fluid_state(b).is_source() => "water_bucket",
+                        "lava" if fluid::fluid_state(b).is_source() => "lava_bucket",
+                        _ => return,
+                    };
+                    game.change_block([c.0, c.1, c.2], blocks::AIR, false, None);
+                    if gm != 1 {
+                        let mut inv = self.me.inv.lock();
+                        inv.consume(slot, 1);
+                        let full = Stack::new(items.id(filled).unwrap_or(0), 1);
+                        if inv.slots[slot].is_none() {
+                            inv.set(slot, Some(full));
+                        } else if inv.add(full, slot as i16 - 36) > 0 {
+                            drop(inv);
+                            self.throw(full, false);
+                        }
+                    }
+                }
+            }
+            "water_bucket" | "lava_bucket" => {
+                let fluid_block = if name == "water_bucket" { blocks::WATER } else { blocks::LAVA };
+                let hit = self.raycast(yaw, pitch, &|b| !game.is_replaceable(b) || fluid::fluid_state(b).is_source());
+                if let Some((open, c)) = hit {
+                    let target_block = game.world.get_block(c.0, c.1, c.2).unwrap_or(blocks::AIR);
+                    // clicking a replaceable block (grass, flowing water…) fills it; else the cell in front
+                    let target = if game.is_replaceable(target_block) && !fluid::fluid_state(target_block).is_source() { c } else { open };
+                    let cur = game.world.get_block(target.0, target.1, target.2).unwrap_or(blocks::STONE);
+                    if !game.is_replaceable(cur) || !self.within_reach(target) {
+                        return;
+                    }
+                    game.change_block([target.0, target.1, target.2], fluid_block, !cur.is_air() && !BlockRegistry::get().is_fluid(cur), None);
+                    game.schedule([target.0, target.1, target.2], crate::game::TickKind::Fluid, fluid::tick_delay(if name == "water_bucket" { fluid::Fluid::Water } else { fluid::Fluid::Lava }));
+                    if gm != 1 {
+                        self.me.inv.lock().set(slot, Some(Stack::new(items.id("bucket").unwrap_or(0), 1)));
+                    }
+                }
+            }
+            _ => {}
+        }
+        game.flush_inventory(&self.me);
     }
 
     /// With anti-xray, neighbours of a changed block may now be exposed: send their real state.
@@ -1058,6 +1293,26 @@ impl Session {
         }
     }
 
+    fn open_crafting(&mut self) {
+        self.next_window = self.next_window % 100 + 1;
+        let id = self.next_window;
+        {
+            let held = self.me.held.load(Ordering::Relaxed) as i16;
+            let mut inv = self.me.inv.lock();
+            let thrown = inv.close(&self.st.game.data, held);
+            inv.window = crate::game::inventory::Window::Crafting(id);
+            drop(inv);
+            for t in thrown {
+                self.throw(t, false);
+            }
+        }
+        let menu = Registries::get().id("minecraft:menu", "minecraft:crafting").unwrap_or(12);
+        let mut b = Vec::new();
+        b.vi(id as i32).vi(menu).raw(&text_nbt("Crafting"));
+        self.send("open_screen", &b);
+        self.st.game.send_inventory(&self.me);
+    }
+
     fn on_place(&mut self, hand: i32, pos: (i32, i32, i32), face: i32, cursor: (f32, f32, f32), seq: i32) -> Flow {
         let gm = self.gamemode();
         let off = match face {
@@ -1069,25 +1324,36 @@ impl Session {
             5 => (1, 0, 0),
             _ => return Flow::Disconnect("Invalid block face".into()),
         };
-        let slot = if hand == 1 { 45 } else { 36 + self.held };
-        let item = if gm == 1 { self.inv.get(&slot).copied() } else { None };
+        let slot = if hand == 1 { 45 } else { 36 + self.me.held.load(Ordering::Relaxed) as usize };
         let reg = BlockRegistry::get();
-        let w = &self.st.game.world;
+        let st = self.st.clone();
+        let game = &st.game;
+        let w = &game.world;
+        let clicked = w.get_block(pos.0, pos.1, pos.2).unwrap_or(blocks::AIR);
+        // interactive blocks (unless sneaking)
+        if clicked.name() == "crafting_table" && !self.sneaking && gm != 3 && self.within_reach(pos) {
+            self.ack(seq);
+            self.open_crafting();
+            return Flow::Continue;
+        }
+        if gm == 2 || gm == 3 {
+            self.ack(seq);
+            return Flow::Continue;
+        }
+        let item = self.me.inv.lock().slots[slot];
         let Some(item) = item else {
             self.ack(seq);
             return Flow::Continue;
         };
-        let item_name = Registries::get().entries("minecraft:item").and_then(|e| e.get(item as usize)).cloned().unwrap_or_default();
-        let Some(info) = reg.by_name(item_name.trim_start_matches("minecraft:")) else {
+        let Some(mut state) = Items::get().block_for(item.item) else {
             self.ack(seq);
             return Flow::Continue;
         };
-        let mut state = BlockState(info.default);
+        let info = reg.block(state);
         // replaceable target (grass, water, …) is replaced in place
-        let clicked = w.get_block(pos.0, pos.1, pos.2).unwrap_or(blocks::AIR);
-        let target = if is_replaceable(clicked) { pos } else { (pos.0 + off.0, pos.1 + off.1, pos.2 + off.2) };
+        let target = if game.is_replaceable(clicked) && !fluid::fluid_state(clicked).is_source() { pos } else { (pos.0 + off.0, pos.1 + off.1, pos.2 + off.2) };
         let existing = w.get_block(target.0, target.1, target.2);
-        if !existing.is_some_and(is_replaceable) || !self.within_reach(target) || !(MIN_Y..MIN_Y + crate::world::chunk::HEIGHT).contains(&target.1) {
+        if !existing.is_some_and(|b| game.is_replaceable(b)) || !self.within_reach(target) || !(MIN_Y..MIN_Y + crate::world::chunk::HEIGHT).contains(&target.1) {
             self.ack(seq);
             self.resync(target);
             return Flow::Continue;
@@ -1107,7 +1373,18 @@ impl Session {
         }) {
             state = reg.with(state, "axis", axis).unwrap_or(state);
         }
-        if reg.property(state, "facing").is_some() {
+        // torches / signs on a wall
+        if face >= 2 {
+            let wall = state.name().replace("torch", "wall_torch").replace("_sign", "_wall_sign");
+            if wall != state.name() {
+                if let Some(wb) = reg.by_name(&wall) {
+                    let facing = ["north", "south", "west", "east"][(face - 2) as usize];
+                    state = reg.with(BlockState(wb.default), "facing", facing).unwrap_or(BlockState(wb.default));
+                }
+            }
+        }
+        let wall_mounted = state.name().contains("wall_");
+        if reg.property(state, "facing").is_some() && !wall_mounted {
             // stairs, furnaces, chests… face the player; others keep their default
             state = reg.with(state, "facing", opposite(horiz)).or_else(|| reg.with(state, "facing", horiz)).unwrap_or(state);
         }
@@ -1117,7 +1394,7 @@ impl Session {
         if reg.property(state, "type").is_some() && info.name.ends_with("_slab") && (face == 0 || (face != 1 && cursor.1 > 0.5)) {
             state = reg.with(state, "type", "top").unwrap_or(state);
         }
-        if reg.property(state, "waterlogged").is_some() && existing.is_some_and(|b| b.name() == "water") {
+        if reg.property(state, "waterlogged").is_some() && existing.is_some_and(|b| fluid::fluid_state(b).is_source()) {
             state = reg.with(state, "waterlogged", "true").unwrap_or(state);
         }
         // don't place solid blocks inside players
@@ -1136,15 +1413,55 @@ impl Session {
                 }
             }
         }
-        w.set_block(target.0, target.1, target.2, state);
+        // two-block things: doors, tall plants (upper half), beds (head)
+        let mut extra: Option<((i32, i32, i32), BlockState)> = None;
+        if reg.property(state, "half") == Some("lower") {
+            let up = (target.0, target.1 + 1, target.2);
+            match (w.get_block(up.0, up.1, up.2), reg.with(state, "half", "upper")) {
+                (Some(b), Some(upper)) if game.is_replaceable(b) => extra = Some((up, upper)),
+                _ => {
+                    self.ack(seq);
+                    self.resync(target);
+                    return Flow::Continue;
+                }
+            }
+        }
+        if state.name().ends_with("_bed") {
+            let d = match horiz {
+                "south" => (0, 1),
+                "north" => (0, -1),
+                "east" => (1, 0),
+                _ => (-1, 0),
+            };
+            let foot = reg.with(state, "facing", horiz).unwrap_or(state);
+            state = foot;
+            let head_pos = (target.0 + d.0, target.1, target.2 + d.1);
+            match (w.get_block(head_pos.0, head_pos.1, head_pos.2), reg.with(foot, "part", "head")) {
+                (Some(b), Some(head)) if game.is_replaceable(b) => extra = Some((head_pos, head)),
+                _ => {
+                    self.ack(seq);
+                    self.resync(target);
+                    return Flow::Continue;
+                }
+            }
+        }
+        if !game.data.block_in("replaceable", info.name.as_str()) {
+            let _ = info;
+        }
+        game.change_block([target.0, target.1, target.2], state, false, None);
+        if let Some((p, b)) = extra {
+            game.change_block([p.0, p.1, p.2], b, false, None);
+        }
+        if fluid::fluid_state(state).fluid().is_some() {
+            game.schedule([target.0, target.1, target.2], crate::game::TickKind::Fluid, 5);
+        }
+        if gm != 1 {
+            self.me.inv.lock().consume(slot, 1);
+            game.flush_inventory(&self.me);
+        }
         self.ack(seq);
-        self.st.game.broadcast_block(target.0, target.1, target.2, state);
         Flow::Continue
     }
-}
-
-fn is_replaceable(b: BlockState) -> bool {
-    b.is_air() || matches!(b.name(), "water" | "lava" | "short_grass" | "tall_grass" | "fern" | "large_fern" | "dead_bush" | "snow" | "vine" | "seagrass" | "tall_seagrass" | "fire" | "soul_fire" | "structure_void" | "light" | "short_dry_grass" | "tall_dry_grass" | "bush" | "glow_lichen" | "hanging_roots" | "crimson_roots" | "warped_roots" | "nether_sprouts")
 }
 
 pub fn spawn_block(p: [f64; 3]) -> (i32, i32, i32) {

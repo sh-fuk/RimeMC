@@ -1,0 +1,149 @@
+# RimeMC configuration. Delete a key to get its default back.
+
+[server]
+bind = "0.0.0.0:25565"
+motd = "§bRimeMC§r - fast by design"
+max_players = 100
+view_distance = 10
+simulation_distance = 8
+worker_threads = 0
+max_connections_per_ip = 5
+connection_rate_per_ip = 5
+compression_threshold = 256
+default_gamemode = "survival"
+
+[world]
+name = "world"
+format = "airworld"
+seed = 0
+compression_level = 6
+
+[gpu]
+enabled = true
+min_batch = 8
+
+[pregen]
+enabled = true
+candidates = 48
+lookahead_seconds = 4.0
+max_queue = 4096
+threads = 0
+
+[ram_world]
+enabled = true
+max_memory_mb = 2048
+save_interval_seconds = 30
+
+[level_tick]
+enabled = true
+crowded_threshold = 24
+step = 16
+max_interval = 4
+
+[player_cost]
+enabled = true
+cell_mspt_budget = 25.0
+min_view_distance = 6
+throttled_chunk_sends_per_tick = 4
+recovery_seconds = 5.0
+
+[fleet]
+mode = "standalone"
+secret = ""
+router_address = "127.0.0.1:25600"
+node_id = 1
+cell_shift = 5
+imbalance_threshold = 0.2
+heartbeat_timeout_ms = 3000
+rebalance_interval_ms = 1000
+
+[anticheat]
+enabled = true
+notify_ops = true
+ban_minutes = 60
+xray = "hide"
+entity_hider = true
+
+[anticheat.fly]
+enabled = true
+threshold = 5.0
+action = "setback"
+kick_at = 50.0
+ban_at = 0.0
+
+[anticheat.speed]
+enabled = true
+threshold = 5.0
+action = "setback"
+kick_at = 50.0
+ban_at = 0.0
+
+[anticheat.nofall]
+enabled = true
+threshold = 3.0
+action = "setback"
+kick_at = 30.0
+ban_at = 0.0
+
+[anticheat.timer]
+enabled = true
+threshold = 10.0
+action = "setback"
+kick_at = 60.0
+ban_at = 0.0
+
+[anticheat.reach]
+enabled = true
+threshold = 3.0
+action = "setback"
+kick_at = 20.0
+ban_at = 0.0
+
+[anticheat.killaura]
+enabled = true
+threshold = 5.0
+action = "setback"
+kick_at = 25.0
+ban_at = 0.0
+
+[anticheat.autoclicker]
+enabled = true
+threshold = 10.0
+action = "setback"
+kick_at = 40.0
+ban_at = 0.0
+
+[anticheat.fastbreak]
+enabled = true
+threshold = 3.0
+action = "setback"
+kick_at = 20.0
+ban_at = 0.0
+
+[anticheat.xray_detection]
+enabled = true
+threshold = 1.0
+action = "alert"
+kick_at = 0.0
+ban_at = 0.0
+
+[bedrock]
+enabled = true
+bind = "0.0.0.0:19132"
+motd1 = "RimeMC"
+motd2 = "Cross-play enabled"
+auth_type = "online"
+username_prefix = "."
+replace_spaces = true
+show_cooldown = true
+show_coordinates = true
+above_bedrock_nether_building = false
+allow_custom_skulls = true
+max_visible_custom_skulls = 128
+add_non_bedrock_items = true
+xbox_achievements_enabled = false
+forward_player_ping = false
+skins = true
+mtu = 1400
+protocol_version = 766
+game_version = "1.21.50"
