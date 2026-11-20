@@ -16,12 +16,12 @@ use crate::worldgen::random::{Rng, WgRandom};
 // ---------------------------------------------------------------- helpers
 
 /// `Mth.randomBetweenInclusive`
-pub fn between(r: &mut impl Rng, min: i32, max: i32) -> i32 {
+pub fn between<R: Rng + ?Sized>(r: &mut R, min: i32, max: i32) -> i32 {
     r.next_int_bound(max - min + 1) + min
 }
 
 /// `Mth.nextInt(random, a, b)`
-pub fn mth_next_int(r: &mut impl Rng, a: i32, b: i32) -> i32 {
+pub fn mth_next_int<R: Rng + ?Sized>(r: &mut R, a: i32, b: i32) -> i32 {
     if a >= b {
         a
     } else {
@@ -110,7 +110,7 @@ impl IntP {
         })
     }
 
-    pub fn sample(&self, r: &mut WgRandom) -> i32 {
+    pub fn sample<R: Rng + ?Sized>(&self, r: &mut R) -> i32 {
         match self {
             IntP::Const(c) => *c,
             IntP::Uniform(a, b) => between(r, *a, *b),
@@ -201,7 +201,7 @@ impl HeightP {
         })
     }
 
-    pub fn sample(&self, r: &mut WgRandom) -> i32 {
+    pub fn sample<R: Rng + ?Sized>(&self, r: &mut R) -> i32 {
         match self {
             HeightP::Const(c) => *c,
             HeightP::Uniform(a, b) => {

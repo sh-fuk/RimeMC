@@ -48,7 +48,7 @@ impl Hm {
             _ => Hm::NoLeaves,
         }
     }
-    fn test(self, s: BlockState) -> bool {
+    pub fn test(self, s: BlockState) -> bool {
         match self {
             Hm::NotAir => !vstate::air(s),
             Hm::Motion => vstate::blocks_motion(s),
@@ -314,7 +314,16 @@ pub struct Builder<'l> {
     pub missing: BTreeMap<String, usize>,
 }
 
-impl Builder<'_> {
+impl<'l> Builder<'l> {
+    pub fn new(load: &'l Loader<'l>) -> Self {
+        Builder { load, tags: HashMap::new(), configured: HashMap::new(), placed: HashMap::new(), missing: BTreeMap::new() }
+    }
+
+    /// Reads a data pack file (`worldgen/...`, `tags/...`, `structure/...`).
+    pub fn load(&self, rel: &str) -> Result<Value> {
+        anyhow::Context::with_context((self.load)(rel), || format!("loading {rel}"))
+    }
+
     pub fn tag(&mut self, tag: &str) -> Result<BlockSet> {
         let key = tag.trim_start_matches('#').trim_start_matches("minecraft:").to_string();
         if let Some(t) = self.tags.get(&key) {
@@ -488,8 +497,9 @@ impl Lib {
         self.info_noise.value(x, z)
     }
 
-    /// `applyBiomeDecoration` for `lv.cx, lv.cz`.
-    pub fn decorate(&self, lv: &mut Region, seed: i64) {
+    /// `applyBiomeDecoration` for `lv.cx, lv.cz`. `structures` places the
+    /// structure pieces of a step before its features.
+    pub fn decorate(&self, lv: &mut Region, seed: i64, structures: Option<&(dyn Fn(&mut Region, &mut WgRandom, i64, usize) + Sync)>) {
         let (x0, z0) = (lv.cx * 16, lv.cz * 16);
         let mut r = WgRandom::new(0);
         let dec = r.set_decoration_seed(seed, x0, z0);
@@ -502,6 +512,9 @@ impl Lib {
             }
         }
         for step in 0..self.steps.len() {
+            if let Some(f) = structures {
+                f(lv, &mut r, dec, step);
+            }
             let mut list: Vec<usize> = Vec::new();
             for (b, _) in present.iter().enumerate().filter(|x| *x.1) {
                 if let Some(s) = self.biome_steps.get(b).and_then(|v| v.get(step)) {

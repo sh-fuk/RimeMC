@@ -523,7 +523,12 @@ fn areas_match_vanilla() {
     let reg = crate::registry::BlockRegistry::get();
     let mut grand = 0usize;
     let only_chunk: Option<(i32, i32)> = std::env::var("RIME_CHUNK").ok().and_then(|v| v.split_once(',').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))));
-    for (ai, &(ox, oz)) in AREAS.iter().enumerate() {
+    // RIME_AREA_LIST="cx,cz;..": other area centres (chunk coordinates)
+    let list: Vec<(i32, i32)> = match std::env::var("RIME_AREA_LIST") {
+        Ok(v) => v.split(';').filter_map(|c| c.split_once(',').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))).collect(),
+        Err(_) => AREAS.to_vec(),
+    };
+    for (ai, &(ox, oz)) in list.iter().enumerate() {
         if pick.as_ref().is_some_and(|p| !p.contains(&ai)) {
             continue;
         }
@@ -671,6 +676,12 @@ fn areas_match_vanilla() {
                 for z in 0..16 {
                     for x in 0..16 {
                         let (s, v) = (o.get(x, y, z), a.get(x, y, z));
+                        // RIME_GREP=block: every position of that block in ours or vanilla
+                        if let Ok(g) = std::env::var("RIME_GREP") {
+                            if show_here(cx, cz) && (s.name().contains(g.as_str()) || v.name().contains(g.as_str())) {
+                                eprintln!("  grep {},{y},{}: ours {} vanilla {}", cx * 16 + x as i32, cz * 16 + z as i32, s.name(), v.name());
+                            }
+                        }
                         if b.as_ref().is_some_and(|b| b.0.get(x, y, z) != v) {
                             noisy += 1;
                             continue;
@@ -749,4 +760,102 @@ fn areas_match_vanilla() {
         grand += blocks + sky + blk;
     }
     eprintln!("total {grand}");
+}
+
+/// Debug aid: RIME_STARTS=r lists structure starts within r chunks of 0,0
+/// (seed 12345, or RIME_SEED).
+#[test]
+fn list_structure_starts() {
+    let (Some(dir), Ok(r)) = (data_dir(), std::env::var("RIME_STARTS")) else { return };
+    let r: i32 = r.parse().unwrap();
+    let seed = std::env::var("RIME_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(12345);
+    let g = super::VanillaGenerator::new(&loader(dir), seed).unwrap();
+    for (cx, cz, name, n, bb) in g.structure_starts(-r, -r, r, r) {
+        eprintln!("{name} at chunk {cx},{cz}: {n} pieces, box {bb:?}");
+    }
+}
+
+/// Vanilla structure starts saved in a region directory (RIME_VREF_S):
+/// chunk -> (structure id, piece boxes, piece element locations).
+pub fn vanilla_starts(dir: &str, cx: i32, cz: i32) -> Option<Vec<(String, Vec<super::structure::Bb>, Vec<String>)>> {
+    use crate::nbt::Tag;
+    let (rx, rz) = (cx >> 5, cz >> 5);
+    let (chunks, _) = airworld::mca::read_mca(&PathBuf::from(dir).join(format!("r.{rx}.{rz}.mca")), rx, rz).ok()?;
+    let idx = ((cz & 31) * 32 + (cx & 31)) as usize;
+    let c = chunks.into_iter().find(|c| c.index == idx)?;
+    let (_, root) = Tag::from_root_bytes(&c.raw).ok()?;
+    let mut out = Vec::new();
+    let Some(Tag::Compound(starts)) = root.get("structures").and_then(|s| s.get("starts")) else { return Some(out) };
+    for (id, s) in starts {
+        if s.get("id").and_then(|t| t.as_str()) == Some("INVALID") {
+            continue;
+        }
+        let mut boxes = Vec::new();
+        let mut names = Vec::new();
+        if let Some(Tag::List(ch)) = s.get("Children") {
+            for p in ch {
+                if let Some(Tag::IntArray(b)) = p.get("BB") {
+                    boxes.push(([b[0], b[1], b[2]], [b[3], b[4], b[5]]));
+                }
+                let loc = p.get("pool_element").map(|e| format!("{}", e.to_json())).unwrap_or_default();
+                names.push(loc);
+            }
+        }
+        out.push((id.clone(), boxes, names));
+    }
+    Some(out)
+}
+
+/// RIME_VREF_S=<vanilla region dir> RIME_SCHUNKS="cx,cz;..": compares the
+/// structure starts of those chunks with vanilla's.
+#[test]
+fn starts_match_vanilla() {
+    let (Some(dir), Ok(vd), Ok(list)) = (data_dir(), std::env::var("RIME_VREF_S"), std::env::var("RIME_SCHUNKS")) else { return };
+    let g = super::VanillaGenerator::new(&loader(dir), 12345).unwrap();
+    let mut bad = 0;
+    for c in list.split(';') {
+        let (a, b) = c.split_once(',').unwrap();
+        let (cx, cz): (i32, i32) = (a.parse().unwrap(), b.parse().unwrap());
+        let v = vanilla_starts(&vd, cx, cz).unwrap_or_default();
+        let ours = g.structure_pieces(cx, cz);
+        eprintln!("chunk {cx},{cz}: vanilla {:?} / ours {:?}", v.iter().map(|s| (&s.0, s.1.len())).collect::<Vec<_>>(), ours.iter().map(|s| (&s.0, s.1.len())).collect::<Vec<_>>());
+        for (name, boxes, names) in &v {
+            let Some(o) = ours.iter().find(|o| name.ends_with(&o.0)) else { bad += 1; continue };
+            // vanilla recomputes piece boxes from the template when a start is
+            // loaded, so saved boxes lack the jigsaw "expansion hack" height
+            let same = |a: &super::structure::Bb, b: &super::structure::Bb| a.0 == b.0 && a.1[0] == b.1[0] && a.1[2] == b.1[2] && a.1[1] >= b.1[1];
+            for (i, b) in boxes.iter().enumerate() {
+                if !o.1.get(i).is_some_and(|x| same(x, b)) {
+                    eprintln!("  piece {i}: vanilla {b:?} {} / ours {:?} {}", names[i], o.1.get(i), o.2.get(i).cloned().unwrap_or_default());
+                    bad += 1;
+                    break;
+                }
+            }
+            if boxes.len() != o.1.len() {
+                bad += 1;
+            }
+        }
+        if ours.len() != v.len() {
+            bad += 1;
+        }
+    }
+    assert_eq!(bad, 0);
+}
+
+/// RIME_VREF_S=<vanilla region dir> RIME_SRANGE="x0,z0,x1,z1": lists every
+/// vanilla structure start in that chunk range, next to ours.
+#[test]
+fn list_vanilla_starts() {
+    let (Some(dir), Ok(vd), Ok(r)) = (data_dir(), std::env::var("RIME_VREF_S"), std::env::var("RIME_SRANGE")) else { return };
+    let v: Vec<i32> = r.split(',').map(|x| x.parse().unwrap()).collect();
+    let g = super::VanillaGenerator::new(&loader(dir), 12345).unwrap();
+    for cx in v[0]..=v[2] {
+        for cz in v[1]..=v[3] {
+            let s = vanilla_starts(&vd, cx, cz).unwrap_or_default();
+            let o = g.structure_pieces(cx, cz);
+            if !s.is_empty() || !o.is_empty() {
+                eprintln!("chunk {cx},{cz}: vanilla {:?} / ours {:?}", s.iter().map(|s| (&s.0, s.1.len())).collect::<Vec<_>>(), o.iter().map(|s| (&s.0, s.1.len())).collect::<Vec<_>>());
+            }
+        }
+    }
 }

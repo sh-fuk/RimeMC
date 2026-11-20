@@ -105,7 +105,12 @@ impl VanillaGenerator {
                     outside: &outside,
                 })
                 .collect();
-            regions.par_iter_mut().for_each(|r| lib.decorate(r, self.seed));
+            let place = |lv: &mut Region, r: &mut super::random::WgRandom, dec: i64, step: usize| {
+                if let Some(s) = &self.structures {
+                    s.place_step(self, lv, r, dec, step);
+                }
+            };
+            regions.par_iter_mut().for_each(|r| lib.decorate(r, self.seed, Some(&place)));
             for r in regions {
                 for (n, p) in around((r.cx, r.cz)).zip(r.chunks) {
                     st.protos.insert(n, p);

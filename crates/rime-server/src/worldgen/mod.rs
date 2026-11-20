@@ -14,6 +14,7 @@ pub mod feature;
 pub mod noise;
 pub mod random;
 pub mod spawn;
+pub mod structure;
 pub mod surface;
 
 #[cfg(test)]
@@ -42,7 +43,29 @@ pub struct VanillaGenerator {
     biome_cache: BiomeCache,
     carvers: Vec<carver::Carver>,
     features: Option<feature::Lib>,
+    structures: Option<structure::Structures>,
     pipeline: parking_lot::Mutex<decorate::PipeState>,
+}
+
+/// Structure registry (sorted by id, like a data pack registry).
+const STRUCTURES: [&str; 34] = [
+    "ancient_city", "bastion_remnant", "buried_treasure", "desert_pyramid", "end_city", "fortress", "igloo", "jungle_pyramid", "mansion", "mineshaft", "mineshaft_mesa", "monument",
+    "nether_fossil", "ocean_ruin_cold", "ocean_ruin_warm", "pillager_outpost", "ruined_portal", "ruined_portal_desert", "ruined_portal_jungle", "ruined_portal_mountain",
+    "ruined_portal_nether", "ruined_portal_ocean", "ruined_portal_swamp", "shipwreck", "shipwreck_beached", "stronghold", "swamp_hut", "trail_ruins", "trial_chambers",
+    "village_desert", "village_plains", "village_savanna", "village_snowy", "village_taiga",
+];
+const STRUCTURE_SETS: [&str; 20] = [
+    "ancient_cities", "buried_treasures", "desert_pyramids", "end_cities", "igloos", "jungle_temples", "mineshafts", "nether_complexes", "nether_fossils", "ocean_monuments",
+    "ocean_ruins", "pillager_outposts", "ruined_portals", "shipwrecks", "strongholds", "swamp_huts", "trail_ruins", "trial_chambers", "villages", "woodland_mansions",
+];
+
+impl structure::Ctx for VanillaGenerator {
+    fn base_height(&self, x: i32, z: i32, hm: feature::Hm) -> i32 {
+        chunk::base_height(&self.router, &self.settings, self.aquifer_random, self.ore_random, x, z, &|s| hm.test(s))
+    }
+    fn noise_biome(&self, qx: i32, qy: i32, qz: i32) -> u8 {
+        self.noise_biome_uncached(qx, qy, qz)
+    }
 }
 
 /// A generated chunk: blocks `((y - MIN_Y) * 16 + z) * 16 + x`, biome ids per
@@ -91,6 +114,13 @@ impl VanillaGenerator {
             }
         }
         let (lib, missing) = feature::Lib::new(load, &possible, surface::BiomeTemps::new(), surface.climates.clone(), settings.sea_level)?;
+        let possible_ids: Vec<u8> = possible.iter().filter_map(|b| names.id(b)).collect();
+        let mut sb = feature::Builder::new(load);
+        let (structures, unported) = structure::Structures::new(&mut sb, seed, &STRUCTURES.map(String::from), &STRUCTURE_SETS.map(String::from), &possible_ids)?;
+        if !unported.is_empty() {
+            if cfg!(test) { eprintln!("structures not ported: {}", unported.join(", ")); }
+            tracing::info!("structure types not ported yet (skipped): {}", unported.join(", "));
+        }
         if !missing.is_empty() {
             let list: Vec<String> = missing.iter().map(|(k, v)| format!("{k} x{v}")).collect();
             if cfg!(test) { eprintln!("missing feature types: {}", list.join(", ")); }
@@ -108,8 +138,28 @@ impl VanillaGenerator {
             biome_cache: BiomeCache::default(),
             carvers,
             features: Some(lib),
+            structures: if std::env::var("RIME_NOSTRUCT").is_ok() { None } else { Some(structures) },
             pipeline: Default::default(),
         })
+    }
+
+    /// Structure starts in a chunk range: (cx, cz, structure, pieces, box).
+    pub fn structure_starts(&self, x0: i32, z0: i32, x1: i32, z1: i32) -> Vec<(i32, i32, String, usize, structure::Bb)> {
+        let Some(s) = &self.structures else { return Vec::new() };
+        let mut out = Vec::new();
+        for cx in x0..=x1 {
+            for cz in z0..=z1 {
+                for (name, n, bb) in s.starts_info(self, cx, cz) {
+                    out.push((cx, cz, name, n, bb));
+                }
+            }
+        }
+        out
+    }
+
+    /// Starts in a chunk with their piece boxes and templates.
+    pub fn structure_pieces(&self, cx: i32, cz: i32) -> Vec<(String, Vec<structure::Bb>, Vec<String>)> {
+        self.structures.as_ref().map(|s| s.pieces_info(self, cx, cz)).unwrap_or_default()
     }
 
     /// `BiomeSource.getNoiseBiome` for any quart position (network id).
@@ -133,7 +183,9 @@ impl VanillaGenerator {
     pub fn generate(&self, cx: i32, cz: i32) -> Generated {
         let nc = NoiseChunk::new(&self.router.graph, cx, cz);
         let mut marks = Vec::new();
-        let mut blocks = chunk::fill_with(&nc, &self.router, &self.settings, self.aquifer_random, self.ore_random, &mut marks);
+        let beard = self.structures.as_ref().and_then(|s| s.beardifier(self, cx, cz));
+        let beard_fn = beard.as_ref().map(|b| move |x: i32, y: i32, z: i32| b.compute(x, y, z));
+        let mut blocks = chunk::fill_with(&nc, &self.router, &self.settings, self.aquifer_random, self.ore_random, &mut marks, beard_fn.as_ref().map(|f| f as &dyn Fn(i32, i32, i32) -> f64));
         let raw = match self.biome_cache.get(cx, cz) {
             Some(b) => b,
             None => {

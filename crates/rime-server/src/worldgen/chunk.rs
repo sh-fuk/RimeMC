@@ -40,6 +40,8 @@ pub struct NoiseChunk<'a> {
     pub g: &'a Graph,
     pub min_x: i32,
     pub min_z: i32,
+    /// cells per side (4 for a chunk, 1 for a single column)
+    cells: usize,
     first_qx: i32,
     first_qz: i32,
     /// flat_cache values, 5x5 quarts per slot (NaN = not computed yet)
@@ -75,27 +77,37 @@ impl Cache for AtPoint<'_, '_> {
 
 impl<'a> NoiseChunk<'a> {
     pub fn new(g: &'a Graph, cx: i32, cz: i32) -> Self {
-        let min_x = cx * 16;
-        let min_z = cz * 16;
+        Self::with_cells(g, cx * 16, cz * 16, 4)
+    }
+
+    /// `NoiseChunk.forColumn` (as used by `iterateNoiseColumn`): one cell
+    /// starting at the cell that holds block (x, z).
+    pub fn column(g: &'a Graph, x: i32, z: i32) -> Self {
+        Self::with_cells(g, x.div_euclid(CELL_W) * CELL_W, z.div_euclid(CELL_W) * CELL_W, 1)
+    }
+
+    fn with_cells(g: &'a Graph, min_x: i32, min_z: i32, cells: usize) -> Self {
+        let n = cells + 1;
         let mut nc = NoiseChunk {
             g,
             min_x,
             min_z,
+            cells,
             first_qx: min_x >> 2,
             first_qz: min_z >> 2,
-            flat: g.flat_caches.iter().map(|_| (0..25).map(|_| Cell::new(f64::NAN)).collect()).collect(),
+            flat: g.flat_caches.iter().map(|_| (0..n * n).map(|_| Cell::new(f64::NAN)).collect()).collect(),
             corners: Vec::new(),
             psl_cache: RefCell::new(HashMap::new()),
         };
         let mut corners = Vec::with_capacity(g.interpolated.len());
         for &id in &g.interpolated {
             let Node::Marker(_, arg) = g.nodes[id as usize] else { unreachable!() };
-            let mut v = vec![0.0; 25 * CORNERS_Y];
-            for cx in 0..5 {
-                for cz in 0..5 {
+            let mut v = vec![0.0; n * n * CORNERS_Y];
+            for cx in 0..n {
+                for cz in 0..n {
                     for cy in 0..CORNERS_Y {
                         let (x, y, z) = (min_x + cx as i32 * CELL_W, MIN_Y + cy as i32 * CELL_H, min_z + cz as i32 * CELL_W);
-                        v[(cx * 5 + cz) * CORNERS_Y + cy] = g.eval(arg, x, y, z, &AtPoint(&nc));
+                        v[(cx * n + cz) * CORNERS_Y + cy] = g.eval(arg, x, y, z, &AtPoint(&nc));
                     }
                 }
             }
@@ -106,12 +118,13 @@ impl<'a> NoiseChunk<'a> {
     }
 
     fn flat_value(&self, g: &Graph, slot: u32, x: i32, z: i32) -> Option<f64> {
+        let n = self.cells as i32 + 1;
         let i = (x >> 2) - self.first_qx;
         let j = (z >> 2) - self.first_qz;
-        if !(0..5).contains(&i) || !(0..5).contains(&j) {
+        if !(0..n).contains(&i) || !(0..n).contains(&j) {
             return None;
         }
-        let c = &self.flat[slot as usize][(i * 5 + j) as usize];
+        let c = &self.flat[slot as usize][(i * n + j) as usize];
         let v = c.get();
         if !v.is_nan() {
             return Some(v);
@@ -125,7 +138,8 @@ impl<'a> NoiseChunk<'a> {
     /// Vanilla interpolation order: y, then x, then z.
     fn interpolate(&self, slot: u32, x: i32, y: i32, z: i32) -> Option<f64> {
         let (lx, ly, lz) = (x - self.min_x, y - MIN_Y, z - self.min_z);
-        if !(0..16).contains(&lx) || !(0..16).contains(&lz) || !(0..HEIGHT).contains(&ly) {
+        let w = self.cells as i32 * CELL_W;
+        if !(0..w).contains(&lx) || !(0..w).contains(&lz) || !(0..HEIGHT).contains(&ly) {
             return None;
         }
         let (cx, cy, cz) = ((lx / CELL_W) as usize, (ly / CELL_H) as usize, (lz / CELL_W) as usize);
@@ -133,7 +147,8 @@ impl<'a> NoiseChunk<'a> {
         let fy = (ly % CELL_H) as f64 / CELL_H as f64;
         let fz = (lz % CELL_W) as f64 / CELL_W as f64;
         let v = &self.corners[slot as usize];
-        let at = |dx: usize, dy: usize, dz: usize| v[((cx + dx) * 5 + cz + dz) * CORNERS_Y + cy + dy];
+        let n = self.cells + 1;
+        let at = |dx: usize, dy: usize, dz: usize| v[((cx + dx) * n + cz + dz) * CORNERS_Y + cy + dy];
         let xz00 = lerp(fy, at(0, 0, 0), at(0, 1, 0));
         let xz10 = lerp(fy, at(1, 0, 0), at(1, 1, 0));
         let xz01 = lerp(fy, at(0, 0, 1), at(0, 1, 1));
@@ -245,14 +260,16 @@ pub struct Aquifer<'n, 'a> {
 
 impl<'n, 'a> Aquifer<'n, 'a> {
     pub fn new(nc: &'n NoiseChunk<'a>, router: &'n Router, random: XoroshiroFactory, picker: &'n FluidPicker, min_y: i32, height: i32) -> Self {
-        let min_gx = grid_x(nc.min_x - 5);
-        let max_gx = grid_x(nc.min_x + 15 - 5) + 1;
+        // the aquifer covers the chunk that holds the noise chunk's first block
+        let (cmx, cmz) = (nc.min_x.div_euclid(16) * 16, nc.min_z.div_euclid(16) * 16);
+        let min_gx = grid_x(cmx - 5);
+        let max_gx = grid_x(cmx + 15 - 5) + 1;
         let size_x = max_gx - min_gx + 1;
         let min_gy = grid_y(min_y + 1) - 1;
         let max_gy = grid_y(min_y + height + 1) + 1;
         let size_y = max_gy - min_gy + 1;
-        let min_gz = grid_x(nc.min_z - 5);
-        let max_gz = grid_x(nc.min_z + 15 - 5) + 1;
+        let min_gz = grid_x(cmz - 5);
+        let max_gz = grid_x(cmz + 15 - 5) + 1;
         let size_z = max_gz - min_gz + 1;
         let n = (size_x * size_y * size_z) as usize;
         let surface = nc.max_preliminary_surface_level(router, from_grid_x(min_gx, 0), from_grid_x(min_gz, 0), from_grid_x(max_gx, 9), from_grid_x(max_gz, 9)) + 8;
@@ -550,12 +567,13 @@ pub struct Settings {
 /// Terrain of one chunk: blocks indexed `((y - MIN_Y) * 16 + z) * 16 + x`.
 pub fn fill(router: &Router, settings: &Settings, aquifer_random: XoroshiroFactory, ore_random: XoroshiroFactory, cx: i32, cz: i32) -> Vec<BlockState> {
     let nc = NoiseChunk::new(&router.graph, cx, cz);
-    fill_with(&nc, router, settings, aquifer_random, ore_random, &mut Vec::new())
+    fill_with(&nc, router, settings, aquifer_random, ore_random, &mut Vec::new(), None)
 }
 
 /// `marks` receives the fluid blocks the aquifer wants updated once the
 /// chunk is loaded (`markPosForPostprocessing`, world coordinates).
-pub fn fill_with(nc: &NoiseChunk, router: &Router, settings: &Settings, aquifer_random: XoroshiroFactory, ore_random: XoroshiroFactory, marks: &mut Vec<[i32; 3]>) -> Vec<BlockState> {
+/// `beard`: the chunk's `Beardifier`, added to the final density.
+pub fn fill_with(nc: &NoiseChunk, router: &Router, settings: &Settings, aquifer_random: XoroshiroFactory, ore_random: XoroshiroFactory, marks: &mut Vec<[i32; 3]>, beard: Option<&dyn Fn(i32, i32, i32) -> f64>) -> Vec<BlockState> {
     let picker = FluidPicker::overworld(settings.sea_level, settings.default_fluid);
     let mut aq = Aquifer::new(nc, router, aquifer_random, &picker, MIN_Y, HEIGHT);
     let fd = router.ids[r::FINAL_DENSITY];
@@ -564,7 +582,10 @@ pub fn fill_with(nc: &NoiseChunk, router: &Router, settings: &Settings, aquifer_
         for z in 0..16 {
             for x in 0..16 {
                 let (bx, bz) = (nc.min_x + x, nc.min_z + z);
-                let density = nc.in_chunk(fd, bx, y, bz);
+                let mut density = nc.in_chunk(fd, bx, y, bz);
+                if let Some(b) = beard {
+                    density += b(bx, y, bz);
+                }
                 let state = if settings.aquifers {
                     let s = aq.compute_substance(bx, y, bz, density);
                     if aq.schedule && s.is_some_and(crate::registry::vstate::has_fluid) {
@@ -587,4 +608,34 @@ pub fn fill_with(nc: &NoiseChunk, router: &Router, settings: &Settings, aquifer_
         }
     }
     out
+}
+
+/// `NoiseBasedChunkGenerator.iterateNoiseColumn` / `getBaseHeight`: the
+/// y above the highest block of the raw noise column at (x, z) that
+/// matches `stop` (MIN_Y if none). Beardifier off, no surface or carvers.
+pub fn base_height(router: &Router, settings: &Settings, aquifer_random: XoroshiroFactory, ore_random: XoroshiroFactory, x: i32, z: i32, stop: &dyn Fn(BlockState) -> bool) -> i32 {
+    let nc = NoiseChunk::column(&router.graph, x, z);
+    let picker = FluidPicker::overworld(settings.sea_level, settings.default_fluid);
+    let mut aq = Aquifer::new(&nc, router, aquifer_random, &picker, MIN_Y, HEIGHT);
+    let fd = router.ids[r::FINAL_DENSITY];
+    for y in (MIN_Y..MIN_Y + HEIGHT).rev() {
+        let density = nc.in_chunk(fd, x, y, z);
+        let state = if settings.aquifers {
+            aq.compute_substance(x, y, z, density)
+        } else if density > 0.0 {
+            None
+        } else {
+            Some(picker.compute(x, y, z).at(y))
+        };
+        let state = match state {
+            Some(s) => Some(s),
+            None if settings.ore_veins => ore_vein(&nc, router, &ore_random, x, y, z),
+            None => None,
+        }
+        .unwrap_or(settings.default_block);
+        if stop(state) {
+            return y + 1;
+        }
+    }
+    MIN_Y
 }

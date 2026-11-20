@@ -37,6 +37,9 @@ pub trait Rng {
     fn next_double(&mut self) -> f64;
     fn next_float(&mut self) -> f32;
     fn next_bool(&mut self) -> bool;
+    fn next_gaussian(&mut self) -> f64 {
+        unimplemented!("gaussian on this random source")
+    }
     fn consume(&mut self, n: usize) {
         for _ in 0..n {
             self.next_int();
@@ -182,6 +185,9 @@ impl Legacy {
 }
 
 impl Rng for Legacy {
+    fn next_gaussian(&mut self) -> f64 {
+        Legacy::next_gaussian(self)
+    }
     fn next_long(&mut self) -> i64 {
         let a = self.next(32) as i64;
         let b = self.next(32) as i64;
@@ -298,6 +304,9 @@ impl WgRandom {
 }
 
 impl Rng for WgRandom {
+    fn next_gaussian(&mut self) -> f64 {
+        WgRandom::next_gaussian(self)
+    }
     fn next_long(&mut self) -> i64 {
         let a = self.next(32) as i64;
         let b = self.next(32) as i64;
