@@ -242,7 +242,7 @@ impl Game {
     // ------------------------------------------------------------ events
 
     fn damage_event_packet(&self, eid: i32, ty: &str, causing: Option<i32>, direct: Option<i32>, pos: Option<[f64; 3]>) -> Arc<Vec<u8>> {
-        let id = Registries::get().id("minecraft:damage_type", ty).unwrap_or(0);
+        let id = crate::net::config_data::dynamic_id("minecraft:damage_type", ty).unwrap_or(0);
         let mut b = Vec::new();
         b.vi(eid).vi(id).vi(causing.map(|c| c + 1).unwrap_or(0)).vi(direct.map(|c| c + 1).unwrap_or(0));
         match pos {

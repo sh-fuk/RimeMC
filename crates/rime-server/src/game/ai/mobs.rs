@@ -1308,9 +1308,11 @@ pub fn finalize_spawn(m: &mut Mob, rng: &mut impl Rng, difficulty: i32, biome: &
         "skeleton" | "stray" | "bogged" | "parched" => {
             populate_armor(m, rng, special_mult, difficulty);
             m.eq[MAINHAND] = st("bow");
+            reassess_weapon(m, difficulty);
         }
         "wither_skeleton" => {
             m.eq[MAINHAND] = st("stone_sword");
+            reassess_weapon(m, difficulty);
         }
         "piglin" => {
             m.baby = rng.r#gen::<f32>() < 0.2;

@@ -407,19 +407,54 @@ impl Game {
                         (e.vel[0].atan2(e.vel[2]).to_degrees() as f32, e.vel[1].atan2(h).to_degrees() as f32)
                     }
                 };
-                let moved = (0..3).any(|i| (e.pos[i] - e.synced[i]).abs() > 1.0 / 4096.0);
-                let turned = match &e.kind {
-                    EKind::Mob(m) => (m.rot_sent.0 - yaw).abs() > 1.0 || (m.rot_sent.1 - pitch).abs() > 1.0,
-                    _ => false,
-                };
-                if moved || turned {
-                    e.synced = e.pos;
-                    if let EKind::Mob(m) = &mut e.kind {
-                        m.rot_sent = (yaw, pitch);
+                if let EKind::Mob(m) = &mut e.kind {
+                    // ServerEntity.sendChanges: every 3 ticks, relative moves in 1/4096
+                    // blocks, a full sync when the delta overflows, after 400 ticks, or
+                    // when the mob changed chunks (new viewers saw its exact spot)
+                    let tc = m.tick_count;
+                    if tc % 3 == 0 || new_chunk != old_chunk || m.death > 0 {
+                        let q = |v: f64| (v * 4096.0).round() as i64;
+                        let d: Vec<i64> = (0..3).map(|i| q(e.pos[i]) - q(e.synced[i])).collect();
+                        let moved = d.iter().any(|v| *v != 0);
+                        let rb = (mob::angle_byte(yaw), mob::angle_byte(pitch));
+                        let turned = rb != (mob::angle_byte(m.rot_sent.0), mob::angle_byte(m.rot_sent.1));
+                        let overflow = d.iter().any(|v| v.abs() > 32767);
+                        let force = overflow || new_chunk != old_chunk || (tc % 400 == 0 && moved);
+                        let mut b = Vec::new();
+                        if force {
+                            e.synced = e.pos;
+                            m.rot_sent = (yaw, pitch);
+                            b.vi(e.eid).f64(e.pos[0]).f64(e.pos[1]).f64(e.pos[2]).f64(e.vel[0]).f64(e.vel[1]).f64(e.vel[2]).f32(yaw).f32(pitch).bool(e.on_ground);
+                            sends.push((new_chunk, self.encode("entity_position_sync", &b)));
+                        } else if moved || turned {
+                            for i in 0..3 {
+                                e.synced[i] += d[i] as f64 / 4096.0;
+                            }
+                            b.vi(e.eid);
+                            if moved {
+                                b.i16(d[0] as i16).i16(d[1] as i16).i16(d[2] as i16);
+                            }
+                            if turned {
+                                m.rot_sent = (yaw, pitch);
+                                b.u8(rb.0).u8(rb.1);
+                            }
+                            b.bool(e.on_ground);
+                            let name = match (moved, turned) {
+                                (true, true) => "move_entity_pos_rot",
+                                (true, false) => "move_entity_pos",
+                                _ => "move_entity_rot",
+                            };
+                            sends.push((new_chunk, self.encode(name, &b)));
+                        }
                     }
-                    let mut b = Vec::new();
-                    b.vi(e.eid).f64(e.pos[0]).f64(e.pos[1]).f64(e.pos[2]).f64(e.vel[0]).f64(e.vel[1]).f64(e.vel[2]).f32(yaw).f32(pitch).bool(e.on_ground);
-                    sends.push((new_chunk, self.encode("entity_position_sync", &b)));
+                } else {
+                    let moved = (0..3).any(|i| (e.pos[i] - e.synced[i]).abs() > 1.0 / 4096.0);
+                    if moved {
+                        e.synced = e.pos;
+                        let mut b = Vec::new();
+                        b.vi(e.eid).f64(e.pos[0]).f64(e.pos[1]).f64(e.pos[2]).f64(e.vel[0]).f64(e.vel[1]).f64(e.vel[2]).f32(yaw).f32(pitch).bool(e.on_ground);
+                        sends.push((new_chunk, self.encode("entity_position_sync", &b)));
+                    }
                 }
                 if let EKind::Mob(m) = &mut e.kind {
                     if (m.mo.head_yaw - m.head_yaw_sent).abs() > 1.0 {
@@ -479,10 +514,11 @@ impl Game {
         }
         if !m.persistent && nearest.is_finite() {
             let removes = removes_when_far(m);
-            if nearest > 128.0 * 128.0 && removes {
+            let far = despawn_distance(m.ty.category());
+            if nearest > far * far && removes {
                 return true;
             }
-            let no_despawn = if matches!(m.ty.category(), "water_ambient") { 32.0 } else { 32.0 };
+            let no_despawn = 32.0;
             if m.no_action > 600 && rand::thread_rng().gen_range(0..800) == 0 && nearest > no_despawn * no_despawn && removes {
                 return true;
             }
@@ -1461,7 +1497,7 @@ impl Game {
                 }
                 if spawner.is_none() {
                     let Some(biome) = self.world.biome(x, y, z) else { break };
-                    let Some(list) = self.data.spawners.get(&biome).and_then(|c| c.get(cat)) else { break };
+                    let Some(list) = self.data.spawners.get(biome.trim_start_matches("minecraft:")).and_then(|c| c.get(cat)) else { break };
                     let total: u32 = list.iter().map(|e| e.1).sum();
                     if total == 0 {
                         break;
@@ -1481,7 +1517,8 @@ impl Game {
                     spawner = Some((ty, size));
                 }
                 let (ty, group) = spawner.unwrap();
-                if near > 128.0 * 128.0 {
+                let far = despawn_distance(ty.category());
+                if near > far * far {
                     continue;
                 }
                 if !self.valid_spawn(ty, p, env, rng) {
@@ -1735,6 +1772,11 @@ fn removes_when_far(m: &Mob) -> bool {
         _ if m.ty.is_animal() => false,
         _ => true,
     }
+}
+
+/// `MobCategory.getDespawnDistance`
+fn despawn_distance(cat: &str) -> f64 {
+    if cat == "water_ambient" { 64.0 } else { 128.0 }
 }
 
 /// `Mob.getMaxSpawnClusterSize`

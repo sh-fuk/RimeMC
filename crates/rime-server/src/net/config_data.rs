@@ -59,6 +59,15 @@ const TAG_REGISTRIES: [&str; 15] = [
     "point_of_interest_type",
 ];
 
+static DYNAMIC_IDS: std::sync::OnceLock<HashMap<String, HashMap<String, i32>>> = std::sync::OnceLock::new();
+
+/// Network id of an entry of a data-driven registry (`damage_type`...), in the
+/// order the configuration phase sent it.
+pub fn dynamic_id(registry: &str, name: &str) -> Option<i32> {
+    let m = DYNAMIC_IDS.get()?.get(registry)?;
+    m.get(name).copied().or_else(|| if name.contains(':') { None } else { m.get(&format!("minecraft:{name}")).copied() })
+}
+
 pub struct ConfigData {
     /// (registry id, entries (key, network NBT of the value))
     pub registries: Vec<(String, Vec<(String, Vec<u8>)>)>,
@@ -83,6 +92,8 @@ impl ConfigData {
             dynamic_ids.insert(format!("minecraft:{reg}"), ids);
             registries.push((format!("minecraft:{reg}"), out));
         }
+
+        let _ = DYNAMIC_IDS.set(dynamic_ids.clone());
 
         // ---- tags
         let regs = Registries::get();

@@ -119,7 +119,7 @@ pub fn light_data(b: &mut Vec<u8>, light: &crate::world::light::ChunkLight) {
 
 /// The `commands` tree: a few literals, each taking an optional greedy string.
 fn commands_body() -> Vec<u8> {
-    let mut names: Vec<String> = ["rime", "stop", "op", "deop", "gamemode", "tp", "list", "help", "spawn", "summon", "time", "kill"].map(String::from).to_vec();
+    let mut names: Vec<String> = ["rime", "stop", "op", "deop", "gamemode", "tp", "list", "help", "spawn", "summon", "time", "kill", "give"].map(String::from).to_vec();
     if crate::plugins::active() {
         for c in crate::plugins::command_names() {
             if !names.contains(&c) && !c.is_empty() && c.chars().all(|ch| ch.is_ascii_graphic()) {
@@ -1608,6 +1608,50 @@ impl Session {
                     }
                     None => self.msg("§cUsage: /tp <player> | /tp <x> <y> <z>"),
                 }
+            }
+            "give" => {
+                if !self.st.ops.is_op(&sender) {
+                    self.msg("§cYou do not have permission (operator only).");
+                    return Flow::Continue;
+                }
+                let args: Vec<&str> = words.collect();
+                let (who, item, count) = match args.as_slice() {
+                    [w, i] => (*w, *i, 1u32),
+                    [w, i, n] => (*w, *i, n.parse::<u32>().unwrap_or(0)),
+                    _ => {
+                        self.msg("§cUsage: /give <player> <item> [count]");
+                        return Flow::Continue;
+                    }
+                };
+                let target = if who == "@s" || who == "@p" { Some(self.me.clone()) } else { self.st.game.find(who) };
+                let Some(target) = target else {
+                    self.msg("§cNo player was found");
+                    return Flow::Continue;
+                };
+                let items = Items::get();
+                let Some(id) = items.id(item) else {
+                    self.msg(&format!("§cUnknown item '{item}'"));
+                    return Flow::Continue;
+                };
+                if count == 0 || count > 6400 {
+                    self.msg("§cCount must be between 1 and 6400");
+                    return Flow::Continue;
+                }
+                let max = items.max_stack(id) as u32;
+                let mut left = count;
+                let held = target.held.load(Ordering::Relaxed) as i16;
+                while left > 0 {
+                    let n = left.min(max);
+                    left -= n;
+                    let st = Stack::new(id, n as u8);
+                    let rest = target.inv.lock().add(st, held);
+                    if rest > 0 {
+                        let pos = target.pose.lock().pos;
+                        self.st.game.spawn_item(pos, Stack::new(id, rest), [0.0; 3], 0);
+                    }
+                }
+                self.st.game.flush_inventory(&target);
+                self.msg(&format!("Gave {count} [{}] to {}", item.trim_start_matches("minecraft:"), target.name));
             }
             "summon" => {
                 if !self.st.ops.is_op(&sender) {
