@@ -318,6 +318,12 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
                 tasks.push(tokio::spawn(log_err("fleet node", fleet_net::run_node(state.clone()))));
             }
             mode => {
+                if state.cfg.server.online_mode {
+                    // the RSA key takes a moment: make it before the first login
+                    std::thread::spawn(|| {
+                        net::crypt::server_key();
+                    });
+                }
                 tasks.push(tokio::spawn(log_err("java listener", net::java::listen(state.clone()))));
                 if state.cfg.bedrock.enabled {
                     tasks.push(tokio::spawn(log_err("bedrock listener", net::bedrock::listen(state.clone()))));

@@ -11,6 +11,9 @@ max_connections_per_ip = 5
 connection_rate_per_ip = 5
 compression_threshold = 256
 default_gamemode = "survival"
+# Verify accounts with Mojang and encrypt connections (vanilla online-mode).
+# false = offline mode (cracked clients can join with any name).
+online_mode = true
 
 [world]
 name = "world"

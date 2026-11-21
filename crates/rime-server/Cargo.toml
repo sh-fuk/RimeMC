@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aes = "0.8"
 airworld = { version = "0.1.0", path = "../airworld" }
 anyhow = "1.0.104"
 bytemuck = { version = "1.25.2", features = ["derive"], optional = true }
+cfb8 = "0.8"
 clap = { version = "4.6.9", features = ["derive"] }
 flate2 = "1.1.11"
 hex = "0.4.3"
@@ -16,6 +18,7 @@ pollster = { version = "1.0.3", optional = true }
 rand = "0.8"
 rayon = "1.12.0"
 rime-fleet = { version = "0.1.0", path = "../rime-fleet" }
+rsa = "0.9"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha1 = "0.11.0"

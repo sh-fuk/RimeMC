@@ -10,7 +10,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
-use super::codec::{frame, read_packet, write_string, Reader};
+use super::codec::{frame, read_packet, write_string, Out, Reader};
+use super::crypt::{self, CryptStream, Profile};
 use crate::ServerState;
 
 pub use crate::registry::PROTOCOL_VERSION;
@@ -143,35 +144,78 @@ pub fn offline_uuid(name: &str) -> uuid::Uuid {
     uuid::Uuid::from_bytes(h)
 }
 
-async fn login(mut sock: TcpStream, state: Arc<ServerState>, protocol: i32) -> anyhow::Result<()> {
+async fn login(sock: TcpStream, state: Arc<ServerState>, protocol: i32) -> anyhow::Result<()> {
+    let mut sock = CryptStream::new(sock);
     let pkt = timeout(Duration::from_secs(10), read_packet(&mut sock, 256)).await??;
     let mut r = Reader::new(&pkt);
     anyhow::ensure!(r.varint()? == 0x00, "expected login start");
     let name = r.string(16)?.to_owned();
-    let _client_uuid = r.uuid()?; // ignored in offline mode (derived from the name like vanilla)
+    let _client_uuid = r.uuid()?; // the server decides the UUID, like vanilla
     let disconnect = |msg: String| {
         let mut out = Vec::new();
         write_string(&mut out, &json_text(&msg));
         frame(0x00, &out)
     };
+    let reject = async |sock: &mut CryptStream<TcpStream>, msg: String| -> anyhow::Result<()> {
+        sock.write_all(&disconnect(msg)).await?;
+        sock.flush().await?;
+        Ok(())
+    };
     if !valid_username(&name) {
-        sock.write_all(&disconnect("Invalid username".into())).await?;
-        return Ok(());
+        return reject(&mut sock, "Invalid username".into()).await;
     }
     if protocol != PROTOCOL_VERSION {
-        sock.write_all(&disconnect(format!("Please use Minecraft {}", VERSION_NAME.trim_start_matches("RimeMC ")))).await?;
-        return Ok(());
+        return reject(&mut sock, format!("Please use Minecraft {}", VERSION_NAME.trim_start_matches("RimeMC "))).await;
     }
     if state.online_players() >= state.cfg.server.max_players {
-        sock.write_all(&disconnect("The server is full!".into())).await?;
-        return Ok(());
+        return reject(&mut sock, "The server is full!".into()).await;
     }
-    if let Some(left) = state.banned_for(&name) {
-        sock.write_all(&disconnect(format!("You are temporarily banned ({} min left)", left.div_ceil(60)))).await?;
-        return Ok(());
+    let profile = if state.cfg.server.online_mode {
+        match timeout(Duration::from_secs(30), authenticate(&mut sock, &name)).await {
+            Ok(Ok(Some(p))) => p,
+            Ok(Ok(None)) => return reject(&mut sock, "Failed to verify username!".into()).await,
+            Ok(Err(e)) => {
+                tracing::info!("{name}: authentication failed: {e:#}");
+                return reject(&mut sock, "Authentication servers are down. Please try again later, sorry!".into()).await;
+            }
+            Err(_) => return reject(&mut sock, "Took too long to log in".into()).await,
+        }
+    } else {
+        // offline mode: same UUID derivation as vanilla
+        Profile { uuid: offline_uuid(&name), name: name.clone(), properties: Vec::new() }
+    };
+    if let Some(left) = state.banned_for(&profile.name) {
+        return reject(&mut sock, format!("You are temporarily banned ({} min left)", left.div_ceil(60))).await;
     }
-    // offline mode: same UUID derivation as vanilla
-    super::play::run(sock, state, name.clone(), offline_uuid(&name)).await
+    super::play::run(sock, state, profile).await
+}
+
+/// Encryption request / response and the session server check.
+async fn authenticate(sock: &mut CryptStream<TcpStream>, name: &str) -> anyhow::Result<Option<Profile>> {
+    let key = tokio::task::spawn_blocking(crypt::server_key).await?;
+    let token: [u8; 4] = rand::random();
+    let mut b = Vec::new();
+    b.str("").vi(key.public_der.len() as i32).raw(&key.public_der).vi(4).raw(&token).bool(true);
+    sock.write_all(&frame(0x01, &b)).await?;
+    sock.flush().await?;
+    let pkt = read_packet(sock, 1024).await?;
+    let mut r = Reader::new(&pkt);
+    anyhow::ensure!(r.varint()? == 0x01, "expected encryption response");
+    let n = r.varint()?;
+    anyhow::ensure!((0..=256).contains(&n), "bad shared secret length");
+    let secret_enc = r.bytes(n as usize)?.to_vec();
+    let n = r.varint()?;
+    anyhow::ensure!((0..=256).contains(&n), "bad verify token length");
+    let token_enc = r.bytes(n as usize)?.to_vec();
+    let secret = key.decrypt(&secret_enc)?;
+    let tok = key.decrypt(&token_enc)?;
+    anyhow::ensure!(tok == token, "verify token mismatch");
+    let secret: [u8; 16] = secret.as_slice().try_into().map_err(|_| anyhow::anyhow!("bad shared secret"))?;
+    sock.enable(&secret);
+    let hash = crypt::server_hash("", &secret, &key.public_der);
+    let name = name.to_string();
+    let prof = tokio::task::spawn_blocking(move || crypt::has_joined(&name, &hash)).await??;
+    Ok(prof)
 }
 
 #[cfg(test)]

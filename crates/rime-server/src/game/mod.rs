@@ -7,6 +7,7 @@
 pub mod entity;
 pub mod fluid;
 pub mod inventory;
+pub mod survival;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
@@ -265,6 +266,8 @@ pub struct Player {
     pub eid: i32,
     pub uuid: uuid::Uuid,
     pub name: String,
+    /// profile properties (skin `textures`): (name, value, signature)
+    pub props: Vec<(String, String, Option<String>)>,
     pub pose: Mutex<Pose>,
     /// incremented on every movement, so viewers know when to resend
     pub moved: AtomicU64,
@@ -272,6 +275,8 @@ pub struct Player {
     /// selected hotbar slot (0-8)
     pub held: AtomicI32,
     pub inv: Mutex<Inventory>,
+    /// health, hunger, air, fire
+    pub vit: Mutex<survival::Vitals>,
     /// outgoing, already-encoded packets
     tx: mpsc::Sender<Arc<Vec<u8>>>,
     /// (center chunk x, z, view distance) of this player's client
@@ -384,7 +389,8 @@ impl Game {
     }
 
     /// Register a player; returns None when the name/UUID is already online.
-    pub fn join(&self, uuid: uuid::Uuid, name: String, pose: Pose, gamemode: i32, view: i32, tx: mpsc::Sender<Arc<Vec<u8>>>) -> Option<Arc<Player>> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn join(&self, uuid: uuid::Uuid, name: String, props: Vec<(String, String, Option<String>)>, pose: Pose, gamemode: i32, view: i32, tx: mpsc::Sender<Arc<Vec<u8>>>) -> Option<Arc<Player>> {
         let mut m = self.players.write();
         if m.values().any(|p| p.uuid == uuid || p.name.eq_ignore_ascii_case(&name)) {
             return None;
@@ -396,11 +402,13 @@ impl Game {
             eid,
             uuid,
             name,
+            props,
             pose: Mutex::new(pose),
             moved: AtomicU64::new(0),
             gamemode: AtomicI32::new(gamemode),
             held: AtomicI32::new(0),
             inv: Mutex::new(Inventory::default()),
+            vit: Mutex::new(survival::Vitals::default()),
             tx,
             view: Mutex::new((cx, cz, view)),
         });

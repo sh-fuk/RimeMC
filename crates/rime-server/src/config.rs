@@ -38,6 +38,8 @@ pub struct ServerCfg {
     pub compression_threshold: i32,
     /// Game mode for joining players: survival / creative / adventure / spectator
     pub default_gamemode: GameMode,
+    /// Verify accounts with Mojang and encrypt the connection (vanilla `online-mode`)
+    pub online_mode: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,6 +70,7 @@ impl Default for ServerCfg {
             connection_rate_per_ip: 5,
             compression_threshold: 256,
             default_gamemode: GameMode::Survival,
+            online_mode: true,
         }
     }
 }

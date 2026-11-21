@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+
+use super::crypt::{CryptStream, Profile};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -17,6 +19,7 @@ use crate::anticheat::xray::{self, MiningStats};
 use crate::anticheat::{Check, Verdict, Violations};
 use crate::config::XrayMode;
 use crate::data::{Items, Stack};
+use crate::game::survival::{self, Cause, Surroundings};
 use crate::game::{fluid, Player, Pose};
 use rand::Rng;
 use crate::nbt::Tag;
@@ -113,7 +116,19 @@ fn text_nbt(msg: &str) -> Vec<u8> {
 }
 
 /// Run a Java client from Login Start until it disconnects.
-pub async fn run(mut sock: TcpStream, st: Arc<ServerState>, name: String, uuid: uuid::Uuid) -> anyhow::Result<()> {
+/// Writes the profile properties of a `player_info_update` add-player entry.
+fn write_props(b: &mut Vec<u8>, props: &[(String, String, Option<String>)]) {
+    b.vi(props.len() as i32);
+    for (n, v, sig) in props {
+        b.str(n).str(v).bool(sig.is_some());
+        if let Some(s) = sig {
+            b.str(s);
+        }
+    }
+}
+
+pub async fn run(mut sock: CryptStream<TcpStream>, st: Arc<ServerState>, profile: Profile) -> anyhow::Result<()> {
+    let Profile { uuid, name, properties } = profile;
     let th = st.game.threshold;
     // ---- login
     if th >= 0 {
@@ -122,8 +137,10 @@ pub async fn run(mut sock: TcpStream, st: Arc<ServerState>, name: String, uuid: 
         sock.write_all(&conn::encode(id("login", "clientbound", "login_compression"), &b, -1)).await?;
     }
     let mut b = Vec::new();
-    b.uuid(uuid).str(&name).vi(0);
+    b.uuid(uuid).str(&name);
+    write_props(&mut b, &properties);
     sock.write_all(&conn::encode(id("login", "clientbound", "login_finished"), &b, th)).await?;
+    sock.flush().await?;
     let compressed = th >= 0;
     loop {
         let p = timeout(PHASE_TIMEOUT, conn::read(&mut sock, compressed, 4096)).await??;
@@ -174,6 +191,7 @@ pub async fn run(mut sock: TcpStream, st: Arc<ServerState>, name: String, uuid: 
             out.extend_from_slice(&cfg_out("update_tags", &cd.tags_body));
             out.extend_from_slice(&cfg_out("finish_configuration", &[]));
             sock.write_all(&out).await?;
+            sock.flush().await?;
             sent_registries = true;
         } else if pid == id("configuration", "serverbound", "finish_configuration") && sent_registries {
             break;
@@ -186,15 +204,16 @@ pub async fn run(mut sock: TcpStream, st: Arc<ServerState>, name: String, uuid: 
     let gamemode = st.cfg.server.default_gamemode.id();
     let (tx, rx) = mpsc::channel::<Arc<Vec<u8>>>(OUT_QUEUE);
     let pose = Pose { pos: spawn, yaw: 0.0, pitch: 0.0, on_ground: false };
-    let Some(me) = st.game.join(uuid, name.clone(), pose, gamemode, view, tx) else {
+    let Some(me) = st.game.join(uuid, name.clone(), properties, pose, gamemode, view, tx) else {
         let b = text_nbt("You are already logged in from another location.");
         sock.write_all(&conn::encode(id("play", "clientbound", "disconnect"), &b, th)).await?;
+        sock.flush().await?;
         return Ok(());
     };
     st.online.store(st.game.count() as u32, Ordering::Relaxed);
     tracing::info!("{name} joined the game ({uuid}, entity {})", me.eid);
 
-    let (rd, wr) = sock.into_split();
+    let (rd, wr) = tokio::io::split(sock);
     let writer = tokio::spawn(writer_task(wr, rx));
     let (in_tx, in_rx) = mpsc::channel::<(Instant, Vec<u8>)>(1024);
     let reader = tokio::spawn(reader_task(rd, in_tx));
@@ -227,7 +246,7 @@ pub async fn run(mut sock: TcpStream, st: Arc<ServerState>, name: String, uuid: 
     Ok(())
 }
 
-async fn writer_task(mut wr: tokio::net::tcp::OwnedWriteHalf, mut rx: mpsc::Receiver<Arc<Vec<u8>>>) {
+async fn writer_task(mut wr: tokio::io::WriteHalf<CryptStream<TcpStream>>, mut rx: mpsc::Receiver<Arc<Vec<u8>>>) {
     let mut buf = Vec::with_capacity(64 * 1024);
     while let Some(p) = rx.recv().await {
         buf.clear();
@@ -239,14 +258,14 @@ async fn writer_task(mut wr: tokio::net::tcp::OwnedWriteHalf, mut rx: mpsc::Rece
                 Err(_) => break,
             }
         }
-        if wr.write_all(&buf).await.is_err() {
+        if wr.write_all(&buf).await.is_err() || wr.flush().await.is_err() {
             return;
         }
     }
     let _ = wr.shutdown().await;
 }
 
-async fn reader_task(mut rd: tokio::net::tcp::OwnedReadHalf, tx: mpsc::Sender<(Instant, Vec<u8>)>) {
+async fn reader_task(mut rd: tokio::io::ReadHalf<CryptStream<TcpStream>>, tx: mpsc::Sender<(Instant, Vec<u8>)>) {
     let mut window = Instant::now();
     let mut count = 0u32;
     loop {
@@ -298,6 +317,9 @@ struct Session {
     epoch: Instant,
     /// arrival time of the packet being handled (ms since `epoch`)
     arrived_ms: u64,
+    /// y of the previous accepted move (fall distance)
+    last_y: f64,
+    was_on_ground: bool,
 }
 
 enum Flow {
@@ -338,6 +360,8 @@ impl Session {
             tick: 0,
             epoch: Instant::now(),
             arrived_ms: 0,
+            last_y: p[1],
+            was_on_ground: false,
         }
     }
 
@@ -407,11 +431,15 @@ impl Session {
         let mut b = Vec::new();
         b.u8(0x01 | 0x04 | 0x08 | 0x10).vi(all.len() as i32);
         for p in &all {
-            b.uuid(p.uuid).str(&p.name).vi(0).vi(p.gamemode.load(Ordering::Relaxed)).bool(true).vi(0);
+            b.uuid(p.uuid).str(&p.name);
+            write_props(&mut b, &p.props);
+            b.vi(p.gamemode.load(Ordering::Relaxed)).bool(true).vi(0);
         }
         self.send("player_info_update", &b);
         let mut b = Vec::new();
-        b.u8(0x01 | 0x04 | 0x08 | 0x10).vi(1).uuid(self.me.uuid).str(&self.me.name).vi(0).vi(gm).bool(true).vi(0);
+        b.u8(0x01 | 0x04 | 0x08 | 0x10).vi(1).uuid(self.me.uuid).str(&self.me.name);
+        write_props(&mut b, &self.me.props);
+        b.vi(gm).bool(true).vi(0);
         let info = st.game.encode("player_info_update", &b);
         for p in &all {
             if p.eid != self.me.eid {
@@ -438,9 +466,8 @@ impl Session {
         self.send("ticking_step", &b);
         self.set_center(self.center, true);
         self.pump_chunks().await;
-        let mut b = Vec::new();
-        b.f32(20.0).vi(20).f32(5.0);
-        self.send("set_health", &b);
+        self.me.vit.lock().dirty = true;
+        self.me.vit.lock().data_dirty = true;
         let mut b = Vec::new();
         b.f32(0.0).vi(0).vi(0);
         self.send("set_experience", &b);
@@ -473,6 +500,8 @@ impl Session {
         self.next_tp = self.next_tp.wrapping_add(1).max(1);
         self.pending_tp = Some(tid);
         self.checker.teleported(pos);
+        self.last_y = pos[1];
+        self.me.vit.lock().fall_distance = 0.0;
         {
             let mut p = self.me.pose.lock();
             p.pos = pos;
@@ -639,8 +668,200 @@ impl Session {
             self.per_second();
         }
         self.track_players();
+        self.tick_vitals();
         self.pump_chunks().await;
         Flow::Continue
+    }
+
+    // ------------------------------------------------------------ health
+
+    fn surroundings(&self) -> Surroundings {
+        let pose = *self.me.pose.lock();
+        let w = &self.st.game.world;
+        let reg = BlockRegistry::get();
+        let at = |dy: f64| w.get_block(pose.pos[0].floor() as i32, (pose.pos[1] + dy).floor() as i32, pose.pos[2].floor() as i32).unwrap_or(blocks::AIR);
+        let water = |s: BlockState| matches!(s.name(), "water" | "bubble_column" | "kelp" | "kelp_plant" | "seagrass" | "tall_seagrass") || reg.property(s, "waterlogged") == Some("true");
+        let (feet, body, eyes) = (at(0.0), at(1.0), at(1.62));
+        Surroundings {
+            eyes_in_water: water(eyes),
+            in_water: water(feet) || water(body),
+            in_lava: feet.name() == "lava" || body.name() == "lava",
+            in_fire: matches!(feet.name(), "fire" | "soul_fire") || matches!(body.name(), "fire" | "soul_fire"),
+            y: pose.pos[1],
+            min_y: MIN_Y,
+            gamemode: self.gamemode(),
+            difficulty: 2,
+        }
+    }
+
+    fn tick_vitals(&mut self) {
+        if self.me.vit.lock().dead {
+            return;
+        }
+        let s = self.surroundings();
+        let hits = self.me.vit.lock().tick(&s);
+        for (cause, amount) in hits {
+            self.damage(cause, amount);
+        }
+        self.finish_eating();
+        let (dirty, data_dirty, health, food, sat, air, fire) = {
+            let mut v = self.me.vit.lock();
+            let d = (v.dirty, v.data_dirty, v.health, v.food, v.saturation, v.air, v.fire);
+            v.dirty = false;
+            v.data_dirty = false;
+            d
+        };
+        if dirty {
+            let mut b = Vec::new();
+            b.f32(health).vi(food).f32(sat);
+            self.send("set_health", &b);
+        }
+        if data_dirty {
+            let flags = (fire > 0) as u8 | if self.sneaking { 0x02 } else { 0 } | if self.sprinting { 0x08 } else { 0 };
+            let mut b = Vec::new();
+            b.vi(self.me.eid).u8(0).vi(0).u8(flags).u8(1).vi(1).vi(air).u8(0xff);
+            let pkt = self.st.game.encode("set_entity_data", &b);
+            self.to_viewers(pkt, true);
+        }
+    }
+
+    /// Sends to every player that can see me (and to me when `me`).
+    fn to_viewers(&self, pkt: Arc<Vec<u8>>, me: bool) {
+        let pos = self.me.pose.lock().pos;
+        let c = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
+        for p in self.st.game.players() {
+            if p.eid == self.me.eid {
+                if me {
+                    p.send(pkt.clone());
+                }
+            } else if p.sees_chunk(c.0, c.1) {
+                p.send(pkt.clone());
+            }
+        }
+    }
+
+    fn damage(&mut self, cause: Cause, amount: f32) {
+        let gm = self.gamemode();
+        let (dealt, dead) = {
+            let mut v = self.me.vit.lock();
+            let d = v.hurt(cause, amount, gm, 2);
+            (d, v.dead)
+        };
+        if dealt.is_none() {
+            return;
+        }
+        let ty = self.st.config_data.entry_id("minecraft:damage_type", cause.damage_type());
+        let mut b = Vec::new();
+        b.vi(self.me.eid).vi(ty).vi(0).vi(0).bool(false);
+        let pkt = self.st.game.encode("damage_event", &b);
+        self.to_viewers(pkt, true);
+        if dead {
+            self.die(cause);
+        }
+    }
+
+    fn die(&mut self, cause: Cause) {
+        let msg = cause.death_message(&self.me.name);
+        let mut b = Vec::new();
+        b.vi(self.me.eid).raw(&text_nbt(&msg));
+        self.send("player_combat_kill", &b);
+        let mut b = Vec::new();
+        b.i32(self.me.eid).u8(3);
+        let pkt = self.st.game.encode("entity_event", &b);
+        self.to_viewers(pkt, false);
+        self.st.game.broadcast(self.st.game.system_chat(&msg));
+        tracing::info!("{msg}");
+        // Inventory.dropAll
+        let stacks: Vec<Stack> = {
+            let mut inv = self.me.inv.lock();
+            let mut out = Vec::new();
+            for slot in 1..46 {
+                if let Some(s) = inv.slots[slot] {
+                    out.push(s);
+                    inv.set(slot, None);
+                }
+            }
+            out
+        };
+        for s in stacks {
+            self.throw(s, true);
+        }
+        self.st.game.flush_inventory(&self.me);
+        self.me.moved.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn respawn(&mut self) {
+        if !self.me.vit.lock().dead {
+            return;
+        }
+        self.me.vit.lock().respawn();
+        let st = self.st.clone();
+        let cd = &st.config_data;
+        let gm = self.gamemode();
+        let mut b = Vec::new();
+        b.vi(cd.entry_id("minecraft:dimension_type", "minecraft:overworld")).str("minecraft:overworld").i64(hashed_seed(st.seed));
+        b.u8(gm as u8).u8(255).bool(false).bool(false).bool(false).vi(0).vi(63);
+        b.u8(0);
+        self.send("respawn", &b);
+        self.send_abilities();
+        let spawn = st.spawn;
+        self.teleport(spawn, 0.0, 0.0);
+        let c = ((spawn[0].floor() as i32) >> 4, (spawn[2].floor() as i32) >> 4);
+        self.set_center(c, true);
+        let mut b = Vec::new();
+        b.u8(13).f32(0.0);
+        self.send("game_event", &b);
+        let mut b = Vec::new();
+        b.vi(self.me.held.load(Ordering::Relaxed));
+        self.send("set_held_slot", &b);
+        st.game.send_inventory(&self.me);
+        self.send_time();
+    }
+
+    /// Starts eating the held food (`use_item`); true when it is food.
+    fn start_eating(&mut self, slot: usize) -> bool {
+        let Some(held) = self.me.inv.lock().slots[slot] else { return false };
+        let name = Items::get().name(held.item).to_string();
+        let Some((_, _, ticks, always)) = survival::food(&name) else { return false };
+        let gm = self.gamemode();
+        let mut v = self.me.vit.lock();
+        if gm == 3 || (!always && v.food >= 20 && gm != 1) {
+            return true;
+        }
+        v.eating = Some((slot as i32, self.tick, ticks));
+        true
+    }
+
+    fn finish_eating(&mut self) {
+        let Some((slot, start, ticks)) = self.me.vit.lock().eating else { return };
+        if self.tick < start + ticks {
+            return;
+        }
+        self.me.vit.lock().eating = None;
+        let slot = slot as usize;
+        let Some(held) = self.me.inv.lock().slots[slot] else { return };
+        let items = Items::get();
+        let name = items.name(held.item).to_string();
+        let Some((n, s, _, _)) = survival::food(&name) else { return };
+        let gm = self.gamemode();
+        self.me.vit.lock().eat(n, s);
+        if gm != 1 {
+            let mut inv = self.me.inv.lock();
+            inv.consume(slot, 1);
+            if let Some(rest) = survival::food_remainder(&name).and_then(|r| items.id(r)) {
+                let st = Stack::new(rest, 1);
+                if inv.slots[slot].is_none() {
+                    inv.set(slot, Some(st));
+                } else if inv.add(st, self.me.held.load(Ordering::Relaxed) as i16) > 0 {
+                    drop(inv);
+                    self.throw(st, false);
+                }
+            }
+        }
+        let mut b = Vec::new();
+        b.i32(self.me.eid).u8(9);
+        self.send("entity_event", &b);
+        self.st.game.flush_inventory(&self.me);
     }
 
     fn per_second(&mut self) {
@@ -682,7 +903,7 @@ impl Session {
         for p in others.iter().filter(|p| p.eid != self.me.eid) {
             let pose = *p.pose.lock();
             let c = ((pose.pos[0].floor() as i32) >> 4, (pose.pos[2].floor() as i32) >> 4);
-            if !self.in_view(c, self.center, self.view) || p.gamemode.load(Ordering::Relaxed) == 3 {
+            if !self.in_view(c, self.center, self.view) || p.gamemode.load(Ordering::Relaxed) == 3 || p.vit.lock().dead {
                 continue;
             }
             seen.insert(p.eid);
@@ -782,6 +1003,7 @@ impl Session {
             let s = r.i16()?;
             if (0..9).contains(&s) {
                 self.me.held.store(s as i32, Ordering::Relaxed);
+                self.me.vit.lock().eating = None;
             }
         } else if pid == sb("set_creative_mode_slot") {
             let slot = r.i16()?;
@@ -837,6 +1059,10 @@ impl Session {
                 6 => self.gliding = true,
                 _ => {}
             }
+        } else if pid == sb("client_command") {
+            if r.varint()? == 0 {
+                self.respawn();
+            }
         } else if pid == sb("client_information") {
             let _locale = r.string(16)?;
             let v = (r.i8()? as i32).clamp(2, 32).min(self.st.cfg.server.view_distance as i32);
@@ -880,11 +1106,13 @@ impl Session {
             if on_ground {
                 self.gliding = false;
             }
+            let from = self.me.pose.lock().pos;
             {
                 let mut p = self.me.pose.lock();
                 p.pos = to;
                 p.on_ground = on_ground;
             }
+            self.after_move(from, to, on_ground, &ctx);
             let c = ((to[0].floor() as i32) >> 4, (to[2].floor() as i32) >> 4);
             self.set_center(c, false);
         } else {
@@ -892,6 +1120,35 @@ impl Session {
         }
         self.me.moved.fetch_add(1, Ordering::Relaxed);
         Flow::Continue
+    }
+
+    /// Fall damage and food exhaustion of one accepted move.
+    fn after_move(&mut self, from: [f64; 3], to: [f64; 3], on_ground: bool, ctx: &MoveContext) {
+        let dy = to[1] - self.last_y;
+        self.last_y = to[1];
+        let gm = self.gamemode();
+        let below = self.st.game.world.get_block(to[0].floor() as i32, (to[1] - 0.2).floor() as i32, to[2].floor() as i32).unwrap_or(blocks::AIR);
+        let mult = survival::landing_multiplier(below.name(), self.sneaking);
+        let reset = ctx.in_liquid || ctx.climbing || ctx.in_web_or_powder_snow || (self.gliding && dy > -0.5) || (on_ground && mult.is_none());
+        let hit = self.me.vit.lock().on_move(dy, on_ground, reset, mult.unwrap_or(1.0), gm);
+        if let Some(d) = hit {
+            self.damage(Cause::Fall, d);
+        }
+        // Player.checkMovementStatistics / jumpFromGround
+        let (dx, dz) = (to[0] - from[0], to[2] - from[2]);
+        let h = (dx * dx + dz * dz).sqrt();
+        if gm == 0 || gm == 2 {
+            let mut v = self.me.vit.lock();
+            if ctx.in_liquid {
+                v.add_exhaustion(0.01 * (h * 100.0).round() as f32 * 0.01);
+            } else if self.sprinting {
+                v.add_exhaustion(0.1 * (h * 100.0).round() as f32 * 0.01);
+            }
+            if self.was_on_ground && !on_ground && dy > 0.0 && !ctx.in_liquid && !ctx.climbing {
+                v.add_exhaustion(if self.sprinting { 0.2 } else { 0.05 });
+            }
+        }
+        self.was_on_ground = on_ground;
     }
 
     fn move_context(&self, to: [f64; 3]) -> MoveContext {
@@ -1108,6 +1365,9 @@ impl Session {
                 return Flow::Continue;
             }
             5 | 6 => {
+                if status == 5 {
+                    self.me.vit.lock().eating = None;
+                }
                 self.ack(seq);
                 return Flow::Continue;
             }
@@ -1148,6 +1408,7 @@ impl Session {
             // a waterlogged block leaves its water behind
             let after = if BlockRegistry::get().property(cur, "waterlogged") == Some("true") { blocks::WATER } else { blocks::AIR };
             st.game.player_change_block([pos.0, pos.1, pos.2], after, gm == 0, tool);
+            self.me.vit.lock().add_exhaustion(0.005);
             self.ack(seq);
             self.after_change(pos);
         } else {
@@ -1269,6 +1530,9 @@ impl Session {
 
     fn use_item(&mut self, hand: i32, yaw: f32, pitch: f32) {
         let slot = if hand == 1 { 45 } else { 36 + self.me.held.load(Ordering::Relaxed) as usize };
+        if self.start_eating(slot) {
+            return;
+        }
         let Some(held) = self.me.inv.lock().slots[slot] else { return };
         let items = Items::get();
         let name = items.name(held.item).to_string();
