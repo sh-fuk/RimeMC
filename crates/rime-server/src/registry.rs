@@ -254,6 +254,10 @@ impl Registries {
         r.get(name).copied().or_else(|| if name.contains(':') { None } else { r.get(&format!("minecraft:{name}")).copied() })
     }
 
+    pub fn name(&self, registry: &str, id: i32) -> Option<String> {
+        self.regs.get(registry)?.0.get(usize::try_from(id).ok()?).cloned()
+    }
+
     pub fn entries(&self, registry: &str) -> Option<&[String]> {
         self.regs.get(registry).map(|r| r.0.as_slice())
     }

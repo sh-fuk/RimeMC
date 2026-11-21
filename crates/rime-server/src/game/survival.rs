@@ -1,87 +1,14 @@
-//! Player health, hunger, air, fire and fall damage, following vanilla
-//! `FoodData`, `LivingEntity.hurt` (invulnerability frames), `causeFallDamage`,
-//! drowning, lava / fire and the void.
+//! Player hunger, air, fire and fall damage, following vanilla `FoodData`,
+//! `LivingEntity.baseTick` (drowning, burning), `causeFallDamage`, lava / fire
+//! and the void. Health itself lives in [`Living`] (exact damage pipeline).
 
-/// Why a player was hurt (vanilla damage type name and death message).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Cause {
-    Fall,
-    Drown,
-    Lava,
-    InFire,
-    OnFire,
-    Starve,
-    Void,
-    Generic,
-    /// melee hit by a mob (display name)
-    Mob(&'static str),
-    /// shot by a mob
-    Arrow(&'static str),
-    /// blown up by a mob
-    Explosion(&'static str),
-    /// hit by another player (their entity id)
-    Player(i32),
-}
-
-impl Cause {
-    /// `minecraft:damage_type` entry
-    pub fn damage_type(self) -> &'static str {
-        match self {
-            Cause::Fall => "minecraft:fall",
-            Cause::Drown => "minecraft:drown",
-            Cause::Lava => "minecraft:lava",
-            Cause::InFire => "minecraft:in_fire",
-            Cause::OnFire => "minecraft:on_fire",
-            Cause::Starve => "minecraft:starve",
-            Cause::Void => "minecraft:out_of_world",
-            Cause::Generic => "minecraft:generic",
-            Cause::Mob(_) => "minecraft:mob_attack",
-            Cause::Arrow(_) => "minecraft:arrow",
-            Cause::Explosion(_) => "minecraft:explosion",
-            Cause::Player(_) => "minecraft:player_attack",
-        }
-    }
-
-    pub fn death_message(self, name: &str) -> String {
-        match self {
-            Cause::Fall => format!("{name} fell from a high place"),
-            Cause::Drown => format!("{name} drowned"),
-            Cause::Lava => format!("{name} tried to swim in lava"),
-            Cause::InFire => format!("{name} went up in flames"),
-            Cause::OnFire => format!("{name} burned to death"),
-            Cause::Starve => format!("{name} starved to death"),
-            Cause::Void => format!("{name} fell out of the world"),
-            Cause::Generic => format!("{name} died"),
-            Cause::Mob(m) => format!("{name} was slain by {m}"),
-            Cause::Arrow(m) => format!("{name} was shot by {m}"),
-            Cause::Explosion(m) => format!("{name} was blown up by {m}"),
-            Cause::Player(_) => format!("{name} was slain"),
-        }
-    }
-
-    /// reduced by armour
-    pub fn armor_applies(self) -> bool {
-        matches!(self, Cause::Mob(_) | Cause::Arrow(_) | Cause::Explosion(_) | Cause::Player(_) | Cause::Generic)
-    }
-
-    /// `#bypasses_invulnerability`
-    fn bypasses_invulnerability(self) -> bool {
-        self == Cause::Void
-    }
-
-    /// `DamageSource.getFoodExhaustion`
-    fn exhaustion(self) -> f32 {
-        match self {
-            Cause::Starve | Cause::Drown | Cause::Void | Cause::Fall => 0.0,
-            _ => 0.1,
-        }
-    }
-}
+use crate::game::combat::damage::DamageSource;
+use crate::game::combat::living::Living;
 
 /// Health and hunger state of one player.
 #[derive(Clone, Debug)]
 pub struct Vitals {
-    pub health: f32,
+    pub living: Living,
     pub food: i32,
     pub saturation: f32,
     pub exhaustion: f32,
@@ -90,9 +17,6 @@ pub struct Vitals {
     /// remaining burning ticks (`remainingFireTicks`)
     pub fire: i32,
     pub fall_distance: f64,
-    invulnerable: i32,
-    last_hurt: f32,
-    pub dead: bool,
     /// the client needs a `set_health`
     pub dirty: bool,
     /// the air supply / burning flag changed (entity data)
@@ -106,7 +30,7 @@ pub const MAX_AIR: i32 = 300;
 impl Default for Vitals {
     fn default() -> Self {
         Vitals {
-            health: 20.0,
+            living: Living::player(),
             food: 20,
             saturation: 5.0,
             exhaustion: 0.0,
@@ -114,9 +38,6 @@ impl Default for Vitals {
             air: MAX_AIR,
             fire: 0,
             fall_distance: 0.0,
-            invulnerable: 0,
-            last_hurt: 0.0,
-            dead: false,
             dirty: true,
             data_dirty: true,
             eating: None,
@@ -131,6 +52,7 @@ pub struct Surroundings {
     pub in_water: bool,
     pub in_lava: bool,
     pub in_fire: bool,
+    pub bubble_column: bool,
     /// standing in rain / bubble column etc. that puts fire out
     pub y: f64,
     pub min_y: i32,
@@ -141,46 +63,16 @@ pub struct Surroundings {
 }
 
 impl Vitals {
-    fn vulnerable(&self, gm: i32, cause: Cause) -> bool {
-        !self.dead && (gm == 0 || gm == 2 || (cause.bypasses_invulnerability() && gm == 1))
+    pub fn health(&self) -> f32 {
+        self.living.health
     }
-
-    /// `LivingEntity.hurt` for a player; returns the damage actually dealt.
-    pub fn hurt(&mut self, cause: Cause, amount: f32, gm: i32, difficulty: i32) -> Option<f32> {
-        if !self.vulnerable(gm, cause) || amount <= 0.0 {
-            return None;
-        }
-        let _ = difficulty; // scaling only applies to mob attacks
-        let dealt = if self.invulnerable as f32 > 10.0 {
-            if amount <= self.last_hurt {
-                return None;
-            }
-            let d = amount - self.last_hurt;
-            self.last_hurt = amount;
-            d
-        } else {
-            self.last_hurt = amount;
-            self.invulnerable = 20;
-            amount
-        };
-        self.add_exhaustion(cause.exhaustion());
-        self.health = (self.health - dealt).max(0.0);
-        self.dirty = true;
-        if self.health <= 0.0 {
-            self.dead = true;
-            self.eating = None;
-        }
-        Some(dealt)
+    /// dead or dying (death screen)
+    pub fn dead(&self) -> bool {
+        self.living.dead || self.living.health <= 0.0
     }
 
     pub fn heal(&mut self, amount: f32) {
-        if !self.dead && self.health > 0.0 {
-            let h = (self.health + amount).min(20.0);
-            if h != self.health {
-                self.health = h;
-                self.dirty = true;
-            }
-        }
+        self.living.heal(amount);
     }
 
     pub fn add_exhaustion(&mut self, v: f32) {
@@ -194,14 +86,12 @@ impl Vitals {
         self.dirty = true;
     }
 
-    /// One server tick; returns the damage events of this tick.
-    pub fn tick(&mut self, s: &Surroundings) -> Vec<(Cause, f32)> {
+    /// One server tick; returns the damage this tick deals (applied by the
+    /// caller through the exact damage pipeline).
+    pub fn tick(&mut self, s: &Surroundings) -> Vec<(DamageSource, f32)> {
         let mut out = Vec::new();
-        if self.dead {
+        if self.dead() {
             return out;
-        }
-        if self.invulnerable > 0 {
-            self.invulnerable -= 1;
         }
         let survival = s.gamemode == 0 || s.gamemode == 2;
         // ---- FoodData.tick
@@ -215,7 +105,8 @@ impl Vitals {
                 }
                 self.dirty = true;
             }
-            let hurt = self.health > 0.0 && self.health < 20.0;
+            let max = self.living.max_health();
+            let hurt = self.living.health > 0.0 && self.living.health < max;
             if self.saturation > 0.0 && hurt && self.food >= 20 {
                 self.food_timer += 1;
                 if self.food_timer >= 10 {
@@ -234,8 +125,9 @@ impl Vitals {
             } else if self.food <= 0 {
                 self.food_timer += 1;
                 if self.food_timer >= 80 {
-                    if self.health > 10.0 || s.difficulty == 3 || (self.health > 1.0 && s.difficulty == 2) {
-                        out.push((Cause::Starve, 1.0));
+                    let h = self.living.health;
+                    if h > 10.0 || s.difficulty == 3 || (h > 1.0 && s.difficulty == 2) {
+                        out.push((DamageSource::new("starve"), 1.0));
                     }
                     self.food_timer = 0;
                 }
@@ -245,11 +137,20 @@ impl Vitals {
         }
         // ---- air supply (LivingEntity.baseTick)
         let old_air = self.air;
-        if s.eyes_in_water && survival {
-            self.air -= 1;
-            if self.air <= -20 {
-                self.air = 0;
-                out.push((Cause::Drown, 2.0));
+        let breathing = self.living.has_effect(crate::game::combat::effects::Effect::WaterBreathing) || self.living.has_effect(crate::game::combat::effects::Effect::ConduitPower);
+        if s.eyes_in_water && !s.bubble_column {
+            if !breathing && survival {
+                // decreaseAirSupply (respiration: oxygen_bonus)
+                let bonus = self.living.attrs.value(crate::game::combat::attr::Attr::OxygenBonus);
+                if !(bonus > 0.0 && rand::random::<f64>() >= 1.0 / (bonus + 1.0)) {
+                    self.air -= 1;
+                }
+                if self.air <= -20 {
+                    self.air = 0;
+                    out.push((DamageSource::new("drown"), 2.0));
+                }
+            } else if self.air < MAX_AIR && breathing {
+                self.air = (self.air + 4).min(MAX_AIR);
             }
         } else if self.air < MAX_AIR {
             self.air = (self.air + 4).min(MAX_AIR);
@@ -266,16 +167,16 @@ impl Vitals {
             if survival {
                 self.fire = self.fire.max(300);
             }
-            out.push((Cause::Lava, 4.0));
+            out.push((DamageSource::new("lava"), 4.0));
         } else if s.in_fire {
             if self.fire < 160 && survival {
                 self.fire = 160;
             }
-            out.push((Cause::InFire, 1.0));
+            out.push((DamageSource::new("in_fire"), 1.0));
         }
         if self.fire > 0 && !s.in_lava {
             if self.fire % 20 == 0 {
-                out.push((Cause::OnFire, 1.0));
+                out.push((DamageSource::new("on_fire"), 1.0));
             }
             self.fire -= 1;
         }
@@ -287,7 +188,7 @@ impl Vitals {
         }
         // ---- void
         if s.y < (s.min_y - 64) as f64 {
-            out.push((Cause::Void, 4.0));
+            out.push((DamageSource::new("out_of_world"), 4.0));
         }
         out
     }
@@ -303,10 +204,13 @@ impl Vitals {
             if self.fall_distance > 0.0 {
                 let d = self.fall_distance;
                 self.fall_distance = 0.0;
-                // LivingEntity.calculateFallDamage: safe fall distance 3
-                let dmg = ((d - 3.0) as f32 * landing_mult).ceil();
-                if dmg > 0.0 {
-                    return Some(dmg);
+                // LivingEntity.calculateFallDamage
+                let safe = self.living.attrs.value(crate::game::combat::attr::Attr::SafeFallDistance);
+                let mult = self.living.attrs.value(crate::game::combat::attr::Attr::FallDamageMultiplier);
+                let power = d + 1.0e-6 - safe;
+                let dmg = (power * landing_mult as f64 * mult).floor() as i32;
+                if dmg > 0 {
+                    return Some(dmg as f32);
                 }
             }
         } else if dy < 0.0 {
@@ -315,7 +219,7 @@ impl Vitals {
         None
     }
 
-    /// Back to full health at respawn.
+    /// Back to full health at respawn (attributes reset, effects cleared).
     pub fn respawn(&mut self) {
         *self = Vitals::default();
     }
@@ -425,28 +329,14 @@ mod tests {
     }
 
     #[test]
-    fn invulnerability_frames() {
-        let mut v = Vitals::default();
-        assert_eq!(v.hurt(Cause::Generic, 4.0, 0, 2), Some(4.0));
-        // a weaker hit during the frames does nothing, a stronger one the difference
-        assert_eq!(v.hurt(Cause::Generic, 3.0, 0, 2), None);
-        assert_eq!(v.hurt(Cause::Generic, 6.0, 0, 2), Some(2.0));
-        assert_eq!(v.health, 14.0);
-        for _ in 0..10 {
-            v.tick(&s(0));
-        }
-        assert_eq!(v.hurt(Cause::Generic, 1.0, 0, 2), Some(1.0));
-    }
-
-    #[test]
     fn natural_regeneration_uses_saturation() {
         let mut v = Vitals::default();
-        v.health = 10.0;
+        v.living.health = 10.0;
         for _ in 0..10 {
             v.tick(&s(0));
         }
         // saturation 5 → heal 5/6, exhaustion +5 → 1 saturation spent on the next tick
-        assert!((v.health - (10.0 + 5.0 / 6.0)).abs() < 1e-4);
+        assert!((v.living.health - (10.0 + 5.0 / 6.0)).abs() < 1e-4);
         v.tick(&s(0));
         assert_eq!(v.saturation, 4.0);
     }
@@ -458,7 +348,7 @@ mod tests {
         w.eyes_in_water = true;
         let mut hits = 0;
         for _ in 0..(300 + 20) {
-            hits += v.tick(&w).iter().filter(|(c, _)| *c == Cause::Drown).count();
+            hits += v.tick(&w).iter().filter(|(c, _)| c.ty == "drown").count();
         }
         assert_eq!(hits, 1);
     }

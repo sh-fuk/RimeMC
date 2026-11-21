@@ -5,6 +5,10 @@
 //! so sending a chunk to N players costs one serialisation, not N.
 
 pub mod blockentity;
+pub mod combat;
+pub mod etypes;
+pub mod hurt;
+pub mod weather;
 pub mod mob;
 mod mobtick;
 pub mod entity;
@@ -355,8 +359,14 @@ pub struct Player {
     tx: mpsc::Sender<Arc<Vec<u8>>>,
     /// (center chunk x, z, view distance) of this player's client
     pub view: Mutex<(i32, i32, i32)>,
-    /// damage from mobs / other players, applied by the player's session
-    pub hits: Mutex<Vec<Hit>>,
+    /// server-side `deltaMovement` (knockback; decays like vanilla's)
+    pub motion: Mutex<[f64; 3]>,
+    /// sneaking / sprinting / gliding … (`hurt::F_*`)
+    pub flags: std::sync::atomic::AtomicU8,
+    /// a velocity packet was sent (anticheat must allow the knockback)
+    pub knocked: std::sync::atomic::AtomicBool,
+    /// `getKnownMovement().horizontalDistanceSqr()` of the last move
+    pub known_speed_sq: Mutex<f64>,
     /// set when a newer login of the same player replaced this one
     pub kicked: std::sync::atomic::AtomicBool,
     /// actions requested from outside the session (plugins), run on its tick
@@ -373,17 +383,10 @@ pub enum Request {
     Command(String),
     /// say this in chat as the player
     Chat(String),
-}
-
-/// Damage queued for a player.
-#[derive(Clone, Debug)]
-pub struct Hit {
-    pub cause: survival::Cause,
-    pub amount: f32,
-    /// attacker entity id (-1: none)
-    pub source: i32,
-    /// knockback: horizontal direction away from the attacker and strength
-    pub knockback: Option<([f64; 2], f64)>,
+    /// stop using the held item (shield disabled)
+    StopUsingItem,
+    /// the player died from this damage
+    Died(Box<combat::damage::DamageSource>),
 }
 
 impl Player {
@@ -405,7 +408,8 @@ impl Player {
 pub fn write_slot(b: &mut Vec<u8>, s: Option<Stack>) {
     match s {
         Some(s) if s.count > 0 => {
-            b.vi(s.count as i32).vi(s.item).vi(0).vi(0);
+            b.vi(s.count as i32).vi(s.item);
+            crate::components::write_patch(b, s.comp);
         }
         _ => {
             b.vi(0);
@@ -445,6 +449,7 @@ pub struct Game {
     time_offset: AtomicU64,
     next_eid: AtomicI32,
     pub threshold: i32,
+    pub weather: Mutex<weather::Weather>,
 }
 
 struct GW<'a>(&'a Game);
@@ -474,6 +479,7 @@ impl Game {
             time_offset: AtomicU64::new(0),
             next_eid: AtomicI32::new(1),
             threshold: compression_threshold,
+            weather: Mutex::new(weather::Weather::default()),
         }
     }
 
@@ -520,7 +526,10 @@ impl Game {
             vit: Mutex::new(survival::Vitals::default()),
             tx,
             view: Mutex::new((cx, cz, view)),
-            hits: Mutex::new(Vec::new()),
+            motion: Mutex::new([0.0; 3]),
+            flags: std::sync::atomic::AtomicU8::new(0),
+            knocked: std::sync::atomic::AtomicBool::new(false),
+            known_speed_sq: Mutex::new(0.0),
             kicked: std::sync::atomic::AtomicBool::new(false),
             requests: Mutex::new(Vec::new()),
         });
@@ -827,7 +836,7 @@ impl Game {
     // ------------------------------------------------------------ entities
 
     fn spawn_packets(&self, e: &Entity) -> Vec<Arc<Vec<u8>>> {
-        if matches!(e.kind, EKind::Mob(_) | EKind::Arrow { .. }) {
+        if matches!(e.kind, EKind::Mob(_) | EKind::Arrow { .. } | EKind::Lightning { .. }) {
             return self.mob_spawn_packets(e);
         }
         let regs = Registries::get();
@@ -988,6 +997,7 @@ impl Game {
                 }
             }
         }
+        self.tick_weather();
         self.tick_entities();
         self.tick_mobs();
         // light changed by block updates
@@ -1013,7 +1023,7 @@ impl Game {
         {
             let mut ents = self.entities.lock();
             for e in ents.values_mut() {
-                if matches!(e.kind, EKind::Mob(_) | EKind::Arrow { .. }) {
+                if matches!(e.kind, EKind::Mob(_) | EKind::Arrow { .. } | EKind::Lightning { .. }) {
                     continue;
                 }
                 let old_chunk = e.chunk();
@@ -1037,7 +1047,7 @@ impl Game {
                             continue;
                         }
                     }
-                    EKind::Mob(_) | EKind::Arrow { .. } => {}
+                    EKind::Mob(_) | EKind::Arrow { .. } | EKind::Lightning { .. } => {}
                     EKind::Falling { state } => {
                         if ground || e.age > 600 {
                             landed.push(([e.pos[0].floor() as i32, e.pos[1].round() as i32, e.pos[2].floor() as i32], *state));

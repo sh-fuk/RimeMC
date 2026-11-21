@@ -22,6 +22,8 @@ pub struct Saved {
     /// (window slot, stack)
     pub slots: Vec<(usize, Stack)>,
     pub health: f32,
+    pub absorption: f32,
+    pub effects: Vec<crate::game::combat::effects::Instance>,
     pub food: i32,
     pub saturation: f32,
     pub exhaustion: f32,
@@ -84,7 +86,11 @@ pub fn to_nbt(p: &Player) -> Tag {
             if s.count == 0 {
                 continue;
             }
-            let item = Tag::Compound(vec![("id".into(), Tag::String(format!("minecraft:{}", items.name(s.item)))), ("count".into(), Tag::Int(s.count as i32))]);
+            let mut fields = vec![("id".into(), Tag::String(format!("minecraft:{}", items.name(s.item)))), ("count".into(), Tag::Int(s.count as i32))];
+            if let Some(c) = crate::components::to_nbt(s.comp) {
+                fields.push(("components".into(), c));
+            }
+            let item = Tag::Compound(fields);
             // 1.21.5+: armour and offhand live in `equipment`
             let key = match slot as u8 {
                 103 => Some("head"),
@@ -114,7 +120,9 @@ pub fn to_nbt(p: &Player) -> Tag {
         ("SelectedItemSlot".into(), Tag::Int(p.held.load(Ordering::Relaxed))),
         ("Inventory".into(), Tag::List(inv)),
         ("equipment".into(), Tag::Compound(equipment)),
-        ("Health".into(), Tag::Float(if v.dead { 0.0 } else { v.health })),
+        ("Health".into(), Tag::Float(if v.dead() { 0.0 } else { v.health() })),
+        ("AbsorptionAmount".into(), Tag::Float(v.living.absorption)),
+        ("active_effects".into(), Tag::List(v.living.effects.iter().map(|e| e.to_nbt()).collect())),
         ("foodLevel".into(), Tag::Int(v.food)),
         ("foodSaturationLevel".into(), Tag::Float(v.saturation)),
         ("foodExhaustionLevel".into(), Tag::Float(v.exhaustion)),
@@ -146,7 +154,11 @@ pub fn from_nbt(t: &Tag) -> Option<Saved> {
     let stack = |c: &Tag| -> Option<Stack> {
         let id = items.id(c.get("id")?.as_str()?)?;
         let n = c.get("count").or(c.get("Count")).and_then(|v| v.as_i64()).unwrap_or(1).clamp(1, 99) as u8;
-        Some(Stack::new(id, n))
+        let mut s = Stack::new(id, n);
+        if let Some(c) = c.get("components") {
+            s.comp = crate::components::from_nbt(c);
+        }
+        Some(s)
     };
     let mut slots = Vec::new();
     if let Some(Tag::List(l)) = t.get("Inventory") {
@@ -181,7 +193,12 @@ pub fn from_nbt(t: &Tag) -> Option<Saved> {
         gamemode: num("playerGameType").map(|v| v as i32).filter(|g| (0..=3).contains(g)).unwrap_or(-1),
         held: num("SelectedItemSlot").map(|v| v as i32).filter(|h| (0..9).contains(h)).unwrap_or(0),
         slots,
-        health: health.clamp(0.0, 20.0),
+        health: health.max(0.0),
+        absorption: num("AbsorptionAmount").unwrap_or(0.0).max(0.0) as f32,
+        effects: match t.get("active_effects") {
+            Some(Tag::List(l)) => l.iter().filter_map(crate::game::combat::effects::Instance::from_nbt).collect(),
+            _ => Vec::new(),
+        },
         food: num("foodLevel").unwrap_or(20.0).clamp(0.0, 20.0) as i32,
         saturation: num("foodSaturationLevel").unwrap_or(5.0).clamp(0.0, 20.0) as f32,
         exhaustion: num("foodExhaustionLevel").unwrap_or(0.0).clamp(0.0, 40.0) as f32,
@@ -243,14 +260,25 @@ impl Saved {
     /// Restores vitals (a dead player comes back dead and gets the death screen).
     pub fn vitals(&self) -> Vitals {
         let mut v = Vitals::default();
-        v.health = self.health;
+        for e in &self.effects {
+            let info = crate::game::combat::enchant::EntInfo { type_name: "player", ..Default::default() };
+            v.living.force_add_effect(&info, e.clone());
+        }
+        v.living.events.clear();
+        // health is clamped to max health (incl. health boost) like setHealth
+        v.living.set_health(self.health);
+        v.living.set_absorption(self.absorption);
+        v.living.events.clear();
         v.food = self.food;
         v.saturation = self.saturation;
         v.exhaustion = self.exhaustion;
         v.air = self.air;
         v.fire = self.fire;
         v.fall_distance = self.fall_distance;
-        v.dead = self.dead;
+        if self.dead {
+            v.living.health = 0.0;
+            v.living.dead = true;
+        }
         v
     }
 }

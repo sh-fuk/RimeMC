@@ -137,7 +137,11 @@ pub fn items(t: &Tag, size: usize) -> Vec<Option<Stack>> {
             let Some(id) = e.get("id").and_then(|s| s.as_str()).and_then(|n| reg.id(n)) else { continue };
             let n = e.get("count").or(e.get("Count")).and_then(|c| c.as_i64()).unwrap_or(1).clamp(1, 99) as u8;
             if (0..size as i64).contains(&slot) {
-                out[slot as usize] = Some(Stack::new(id, n));
+                let mut s = Stack::new(id, n);
+                if let Some(c) = e.get("components") {
+                    s.comp = crate::components::from_nbt(c);
+                }
+                out[slot as usize] = Some(s);
             }
         }
     }
@@ -152,11 +156,15 @@ pub fn set_items(t: &mut Tag, slots: &[Option<Stack>]) {
         .filter_map(|(i, s)| {
             let s = (*s)?;
             (s.count > 0).then(|| {
-                Tag::Compound(vec![
+                let mut f = vec![
                     ("Slot".into(), Tag::Byte(i as i8)),
                     ("id".into(), Tag::String(format!("minecraft:{}", reg.name(s.item)))),
                     ("count".into(), Tag::Int(s.count as i32)),
-                ])
+                ];
+                if let Some(c) = crate::components::to_nbt(s.comp) {
+                    f.push(("components".into(), c));
+                }
+                Tag::Compound(f)
             })
         })
         .collect();
@@ -295,7 +303,7 @@ impl Furnace {
         let Some(r) = result else { return false };
         match self.slots[2] {
             None => true,
-            Some(o) => o.item == r.item && o.count as u32 + r.count as u32 <= o.max() as u32,
+            Some(o) => o.same(&r) && o.count as u32 + r.count as u32 <= o.max() as u32,
         }
     }
 

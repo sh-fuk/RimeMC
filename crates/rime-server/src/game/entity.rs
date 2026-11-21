@@ -10,6 +10,8 @@ pub enum EKind {
     Mob(Box<super::mob::Mob>),
     /// shot arrow: shooter eid, base damage, ticks stuck in a block
     Arrow { owner: i32, damage: f64, stuck: u32 },
+    /// `LightningBolt`
+    Lightning { life: i32, flashes: i32, cause: Option<i32>, visual: bool, hit: Vec<i32> },
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +42,7 @@ impl Entity {
                 (w / 2.0, h)
             }
             EKind::Arrow { .. } => (0.25, 0.5),
+            EKind::Lightning { .. } => (0.0, 0.0),
         }
     }
 }

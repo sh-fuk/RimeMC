@@ -75,7 +75,7 @@ impl Inventory {
         let order: Vec<usize> = std::iter::once(36 + selected.clamp(0, 8) as usize).chain(std::iter::once(45)).chain(36..45).chain(9..36).collect();
         for &i in &order {
             if let Some(mut s) = self.slots[i] {
-                if s.item == st.item && s.count < max {
+                if s.same(&st) && s.count < max {
                     let n = (max - s.count).min(st.count);
                     s.count += n;
                     st.count -= n;
@@ -283,7 +283,7 @@ impl Inventory {
         let max = st.max();
         for &t in targets {
             if let Some(mut s) = self.get_w(t) {
-                if s.item == st.item && s.count < max {
+                if s.same(&st) && s.count < max {
                     let n = (max - s.count).min(st.count);
                     s.count += n;
                     st.count -= n;
@@ -332,7 +332,7 @@ impl Inventory {
                     if let Some(r) = self.get_w(0) {
                         match self.cursor {
                             None => self.cursor = self.take_result(data),
-                            Some(mut c) if c.item == r.item && c.count as u16 + r.count as u16 <= c.max() as u16 => {
+                            Some(mut c) if c.same(&r) && c.count as u16 + r.count as u16 <= c.max() as u16 => {
                                 self.take_result(data);
                                 c.count += r.count;
                                 self.cursor = Some(c);
@@ -368,7 +368,7 @@ impl Inventory {
                         self.cursor = (k.count > 0).then_some(k);
                     }
                     (Some(mut c), Some(mut k), b) => {
-                        if c.item == k.item && placeable(&k) {
+                        if c.same(&k) && placeable(&k) {
                             let room = c.max().saturating_sub(c.count);
                             let n = if b == 0 { k.count.min(room) } else { 1.min(room) };
                             c.count += n;
@@ -494,7 +494,7 @@ impl Inventory {
                             let list: Vec<usize> = list
                                 .into_iter()
                                 .map(|s| s as usize)
-                                .filter(|&s| self.get_w(s).is_none_or(|x| x.item == c.item) && (!self.is_armor(s) || armor_slot_for(c.item) == Some(s)) && self.may_place(s, c.item, data))
+                                .filter(|&s| self.get_w(s).is_none_or(|x| x.same(&c)) && (!self.is_armor(s) || armor_slot_for(c.item) == Some(s)) && self.may_place(s, c.item, data))
                                 .collect();
                             if list.is_empty() {
                                 return out;
@@ -536,7 +536,7 @@ impl Inventory {
                             }
                             if let Some(mut st) = self.get_w(s) {
                                 // full stacks are taken on the second pass only
-                                if st.item == c.item && (pass == 1 || st.count < st.max()) {
+                                if st.same(&c) && (pass == 1 || st.count < st.max()) {
                                     let n = (c.max() - c.count).min(st.count);
                                     c.count += n;
                                     st.count -= n;
@@ -561,7 +561,7 @@ impl Inventory {
         for &t in targets {
             match self.get_w(t) {
                 None => need -= st.max() as i32,
-                Some(s) if s.item == st.item => need -= (s.max() - s.count) as i32,
+                Some(s) if s.same(&st) => need -= (s.max() - s.count) as i32,
                 _ => {}
             }
             if need <= 0 {

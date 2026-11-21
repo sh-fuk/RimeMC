@@ -158,12 +158,11 @@ impl MobType {
 #[derive(Clone, Debug)]
 pub struct Mob {
     pub ty: MobType,
-    pub health: f32,
+    /// health, attributes, effects, invulnerability (vanilla `LivingEntity`)
+    pub living: crate::game::combat::living::Living,
+    pub eq: crate::game::combat::living::Equipment,
     pub yaw: f32,
     pub head_yaw_sent: f32,
-    /// invulnerability ticks after a hit (vanilla `invulnerableTime`)
-    pub invulnerable: u32,
-    pub last_hurt: f32,
     pub attack_cd: u32,
     pub target: Option<i32>,
     pub wander: Option<[f64; 3]>,
@@ -185,13 +184,13 @@ pub struct Mob {
 
 impl Mob {
     pub fn new(ty: MobType, persistent: bool) -> Mob {
+        let attrs = crate::game::etypes::EntityTypes::get().by_name(ty.name()).map(|t| t.attributes()).unwrap_or_else(|| crate::game::combat::attr::Map::new(&crate::game::combat::attr::living()));
         Mob {
             ty,
-            health: ty.max_health(),
+            living: crate::game::combat::living::Living::new(attrs),
+            eq: Default::default(),
             yaw: 0.0,
             head_yaw_sent: 0.0,
-            invulnerable: 0,
-            last_hurt: 0.0,
             attack_cd: 0,
             target: None,
             wander: None,
@@ -206,30 +205,6 @@ impl Mob {
             persistent: persistent || !ty.hostile(),
             ambient: 0,
         }
-    }
-
-    /// `LivingEntity.hurt` invulnerability rules; returns the damage dealt.
-    pub fn hurt(&mut self, amount: f32) -> Option<f32> {
-        if self.death > 0 || amount <= 0.0 {
-            return None;
-        }
-        let dealt = if self.invulnerable > 10 {
-            if amount <= self.last_hurt {
-                return None;
-            }
-            let d = amount - self.last_hurt;
-            self.last_hurt = amount;
-            d
-        } else {
-            self.last_hurt = amount;
-            self.invulnerable = 20;
-            amount
-        };
-        self.health -= dealt;
-        if !self.ty.hostile() {
-            self.panic = 100;
-        }
-        Some(dealt)
     }
 }
 

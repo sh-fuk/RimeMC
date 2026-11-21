@@ -42,6 +42,9 @@ impl Items {
     pub fn max_stack(&self, id: i32) -> u8 {
         self.stack.get(id as usize).copied().unwrap_or(64).max(1)
     }
+    pub fn count(&self) -> usize {
+        self.names.len()
+    }
     pub fn valid(&self, id: i32) -> bool {
         id > 0 && (id as usize) < self.names.len()
     }
@@ -76,11 +79,13 @@ impl Items {
 pub struct Stack {
     pub item: i32,
     pub count: u8,
+    /// interned component patch (`crate::components`), 0 = item defaults
+    pub comp: u32,
 }
 
 impl Stack {
     pub fn new(item: i32, count: u8) -> Self {
-        Self { item, count }
+        Self { item, count, comp: 0 }
     }
     pub fn max(&self) -> u8 {
         Items::get().max_stack(self.item)
@@ -132,7 +137,7 @@ fn strip(s: &str) -> &str {
 }
 
 /// Load `tags/<dir>` and resolve nested `#tag` references into plain names.
-fn load_tags(v: &VanillaData, dir: &str) -> anyhow::Result<HashMap<String, HashSet<String>>> {
+pub(crate) fn load_tags(v: &VanillaData, dir: &str) -> anyhow::Result<HashMap<String, HashSet<String>>> {
     let mut raw: HashMap<String, Vec<String>> = HashMap::new();
     for (key, path) in v.entries(&format!("tags/{dir}")) {
         let json: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
@@ -429,7 +434,7 @@ impl GameData {
         // merge identical items, split by stack size
         let mut merged: Vec<Stack> = Vec::new();
         for s in out {
-            match merged.iter_mut().find(|m| m.item == s.item && (m.count as u32 + s.count as u32) <= m.max() as u32) {
+            match merged.iter_mut().find(|m| m.same(&s) && (m.count as u32 + s.count as u32) <= m.max() as u32) {
                 Some(m) => m.count += s.count,
                 None => merged.push(s),
             }

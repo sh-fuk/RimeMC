@@ -4,6 +4,7 @@
 // they are attached to live player sessions by the play-state protocol.
 #[allow(dead_code)]
 mod anticheat;
+mod components;
 mod config;
 mod control;
 mod data;
@@ -285,6 +286,7 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
     let config_data = net::config_data::ConfigData::build(&vanilla)?;
     tracing::info!("loaded {} synchronized registries from vanilla {} data", config_data.registries.len(), registry::blocks::MC_VERSION);
 
+    game::combat::load(&vanilla)?;
     let game_data = data::GameData::load(&vanilla)?;
     tracing::info!("loaded {} crafting recipes and vanilla loot tables", game_data.recipes.len());
     let game = game::Game::new(cfg.server.compression_threshold, game_data);

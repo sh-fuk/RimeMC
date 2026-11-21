@@ -26,6 +26,14 @@ impl Aabb {
         }
         d2.sqrt()
     }
+    pub fn inflate(&self, x: f64, y: f64, z: f64) -> Self {
+        Aabb { min: [self.min[0] - x, self.min[1] - y, self.min[2] - z], max: [self.max[0] + x, self.max[1] + y, self.max[2] + z] }
+    }
+
+    pub fn intersects(&self, o: &Aabb) -> bool {
+        self.min[0] < o.max[0] && self.max[0] > o.min[0] && self.min[1] < o.max[1] && self.max[1] > o.min[1] && self.min[2] < o.max[2] && self.max[2] > o.min[2]
+    }
+
     pub fn center(&self) -> [f64; 3] {
         [(self.min[0] + self.max[0]) / 2.0, (self.min[1] + self.max[1]) / 2.0, (self.min[2] + self.max[2]) / 2.0]
     }

@@ -23,7 +23,9 @@ use crate::anticheat::xray::{self, MiningStats};
 use crate::anticheat::{Check, Verdict, Violations};
 use crate::config::XrayMode;
 use crate::data::{Items, Stack};
-use crate::game::survival::{self, Cause, Surroundings};
+use crate::game::combat::damage::DamageSource;
+use crate::game::hurt::{F_CLIMBING, F_FALL_FLYING, F_IN_WATER, F_SNEAKING, F_SPRINTING};
+use crate::game::survival::{self, Surroundings};
 use crate::game::{fluid, Player, Pose};
 use rand::Rng;
 use crate::nbt::Tag;
@@ -406,6 +408,8 @@ struct Session {
     arrived_ms: u64,
     /// y of the previous accepted move (fall distance)
     last_y: f64,
+    /// main hand item last tick (`Player.lastItemInMainHand`)
+    last_main: Option<i32>,
     was_on_ground: bool,
 }
 
@@ -449,6 +453,7 @@ impl Session {
             epoch: Instant::now(),
             arrived_ms: 0,
             last_y: p[1],
+            last_main: None,
             was_on_ground: false,
         }
     }
@@ -754,6 +759,8 @@ impl Session {
                 crate::game::Request::Teleport(pos, yaw, pitch) => self.teleport(pos, yaw, pitch),
                 crate::game::Request::Gamemode(gm) => self.set_gamemode(gm.clamp(0, 3)),
                 crate::game::Request::Kick(reason) => return Flow::Disconnect(reason),
+                crate::game::Request::StopUsingItem => self.stop_using_item(),
+                crate::game::Request::Died(src) => self.die(*src),
                 crate::game::Request::Chat(m) => {
                     if let Flow::Disconnect(r) = self.on_chat(&m) {
                         return Flow::Disconnect(r);
@@ -803,6 +810,7 @@ impl Session {
             in_water: water(feet) || water(body),
             in_lava: feet.name() == "lava" || body.name() == "lava",
             in_fire: matches!(feet.name(), "fire" | "soul_fire") || matches!(body.name(), "fire" | "soul_fire"),
+            bubble_column: eyes.name() == "bubble_column",
             y: pose.pos[1],
             min_y: MIN_Y,
             gamemode: self.gamemode(),
@@ -811,22 +819,46 @@ impl Session {
     }
 
     fn tick_vitals(&mut self) {
-        let hits = std::mem::take(&mut *self.me.hits.lock());
-        if self.me.vit.lock().dead {
+        if self.me.vit.lock().dead() {
             return;
         }
-        for h in hits {
-            self.take_hit(h);
+        // LivingEntity.aiStep on the server: deltaMovement decays
+        {
+            let on_ground = self.me.pose.lock().on_ground;
+            let mut m = self.me.motion.lock();
+            for v in m.iter_mut() {
+                *v *= 0.98;
+                if v.abs() < 0.003 {
+                    *v = 0.0;
+                }
+            }
+            if on_ground && m[1] < 0.0 {
+                m[1] = 0.0;
+            }
         }
+        if self.me.knocked.swap(false, Ordering::Relaxed) {
+            self.checker.knocked();
+        }
+        // Player.tick: a different item in the main hand resets the attack charge
+        let main = self.me.equipment()[0].map(|s| s.item);
+        if main != self.last_main {
+            self.last_main = main;
+            self.me.vit.lock().living.attack_ticker = 0;
+        }
+        let st = self.st.clone();
+        st.game.with_player(&self.me, |l, eq, body| {
+            l.tick_counters();
+            l.tick_effects(eq, body, &mut rand::thread_rng());
+        });
         let s = self.surroundings();
         let hits = self.me.vit.lock().tick(&s);
-        for (cause, amount) in hits {
-            self.damage(cause, amount);
+        for (src, amount) in hits {
+            self.damage(src, amount);
         }
         self.finish_eating();
-        let (dirty, data_dirty, health, food, sat, air, fire) = {
+        let (dirty, data_dirty, health, food, sat, air, fire, absorption, using) = {
             let mut v = self.me.vit.lock();
-            let d = (v.dirty, v.data_dirty, v.health, v.food, v.saturation, v.air, v.fire);
+            let d = (v.dirty, v.data_dirty, v.living.health, v.food, v.saturation, v.air, v.fire, v.living.absorption, v.living.using);
             v.dirty = false;
             v.data_dirty = false;
             d
@@ -836,10 +868,14 @@ impl Session {
             b.f32(health).vi(food).f32(sat);
             self.send("set_health", &b);
         }
-        if data_dirty {
-            let flags = (fire > 0) as u8 | if self.sneaking { 0x02 } else { 0 } | if self.sprinting { 0x08 } else { 0 };
+        if data_dirty || dirty {
+            let flags = (fire > 0) as u8 | if self.sneaking { 0x02 } else { 0 } | if self.sprinting { 0x08 } else { 0 } | if self.gliding { 0x80 } else { 0 };
+            let living_flags = using.map(|u| 1 | if u.hand == 1 { 2 } else { 0 }).unwrap_or(0);
             let mut b = Vec::new();
-            b.vi(self.me.eid).u8(0).vi(0).u8(flags).u8(1).vi(1).vi(air).u8(0xff);
+            b.vi(self.me.eid).u8(0).vi(0).u8(flags).u8(1).vi(1).vi(air);
+            b.u8(8).vi(0).u8(living_flags);
+            b.u8(17).vi(3).f32(absorption);
+            b.u8(0xff);
             let pkt = self.st.game.encode("set_entity_data", &b);
             self.to_viewers(pkt, true);
         }
@@ -860,42 +896,10 @@ impl Session {
         }
     }
 
-    /// Damage from a mob, an explosion or another player.
-    fn take_hit(&mut self, h: crate::game::Hit) {
-        let gm = self.gamemode();
-        if gm == 1 || gm == 3 || self.me.vit.lock().dead {
-            return;
-        }
-        let mut amount = h.amount;
-        if h.cause.armor_applies() {
-            let (mut armor, mut tough) = (0.0, 0.0);
-            let items = Items::get();
-            for s in self.me.inv.lock().slots[5..9].iter().flatten() {
-                let (a, t) = crate::game::mob::armor_of(items.name(s.item));
-                armor += a;
-                tough += t;
-            }
-            amount = crate::game::mob::after_armor(amount, armor, tough);
-        }
-        if !self.damage_from(h.cause, amount, h.source) {
-            return;
-        }
-        if let Some((dir, strength)) = h.knockback {
-            if strength > 0.0 && !self.me.vit.lock().dead {
-                let v = [dir[0] * strength, strength.min(0.4), dir[1] * strength];
-                let mut b = Vec::new();
-                b.vi(self.me.eid);
-                crate::game::mob::write_lpvec(&mut b, v);
-                self.send("set_entity_motion", &b);
-                self.checker.knocked();
-            }
-        }
-    }
-
     /// Player attack (left click on an entity).
     fn on_attack(&mut self, target: i32) -> Option<Flow> {
         let gm = self.gamemode();
-        if gm == 3 || self.me.vit.lock().dead || target == self.me.eid {
+        if gm == 3 || self.me.vit.lock().dead() || target == self.me.eid {
             return None;
         }
         let pose = *self.me.pose.lock();
@@ -916,54 +920,43 @@ impl Session {
         } else if bx.distance_to(eye) > 6.0 {
             return None;
         }
-        let held = self.me.inv.lock().slots[36 + self.me.held.load(Ordering::Relaxed) as usize];
-        let name = held.map(|s| Items::get().name(s.item)).unwrap_or("air");
-        let mut dmg = crate::game::mob::item_attack_damage(name);
-        // falling, not on the ground: critical hit
-        if !pose.on_ground && self.last_y > pose.pos[1] {
-            dmg *= 1.5;
-        }
-        let kb = if self.sprinting { 0.9 } else { 0.4 };
-        if self.st.game.attack_entity(&self.me, target, dmg, kb) {
-            self.me.vit.lock().add_exhaustion(0.1);
-        }
+        let st = self.st.clone();
+        st.game.player_attack(&self.me, target);
         None
     }
 
-    fn damage(&mut self, cause: Cause, amount: f32) {
-        self.damage_from(cause, amount, -1);
+    fn damage(&mut self, src: DamageSource, amount: f32) -> bool {
+        let st = self.st.clone();
+        st.game.hurt_player(&self.me, &src, amount)
     }
 
-    /// Returns true when the damage was dealt.
-    fn damage_from(&mut self, cause: Cause, amount: f32, source: i32) -> bool {
-        let gm = self.gamemode();
-        let (dealt, dead) = {
+    /// Stops using the held item (shield lowered / disabled).
+    fn stop_using_item(&mut self) {
+        let mut v = self.me.vit.lock();
+        if v.living.using.take().is_some() {
+            v.data_dirty = true;
+        }
+        v.eating = None;
+    }
+
+    fn die(&mut self, src: DamageSource) {
+        if self.me.vit.lock().living.dead {
+            return;
+        }
+        let credit = {
+            let v = self.me.vit.lock();
+            v.living.last_hurt_by_player.or(v.living.last_hurt_by_mob).map(|c| c.0)
+        };
+        let me_name = serde_json::json!({"text": self.me.name});
+        let msg_json = self.st.game.death_message(&src, me_name, credit);
+        let msg_nbt = crate::nbt::Tag::from_json(&msg_json).to_network_bytes();
+        {
             let mut v = self.me.vit.lock();
-            let d = v.hurt(cause, amount, gm, 2);
-            (d, v.dead)
-        };
-        if dealt.is_none() {
-            return false;
+            let body_src = src.clone();
+            v.living.dead = true;
+            v.living.using = None;
+            v.living.last_damage = Some((body_src, v.living.tick_count));
         }
-        let ty = self.st.config_data.entry_id("minecraft:damage_type", cause.damage_type());
-        let mut b = Vec::new();
-        b.vi(self.me.eid).vi(ty).vi(source + 1).vi(source + 1).bool(false);
-        let pkt = self.st.game.encode("damage_event", &b);
-        self.to_viewers(pkt, true);
-        if dead {
-            self.die(cause);
-        }
-        true
-    }
-
-    fn die(&mut self, cause: Cause) {
-        let msg = match cause {
-            Cause::Player(eid) => match self.st.game.players().into_iter().find(|p| p.eid == eid) {
-                Some(k) => format!("{} was slain by {}", self.me.name, k.name),
-                None => cause.death_message(&self.me.name),
-            },
-            _ => cause.death_message(&self.me.name),
-        };
         // ServerPlayer.die: the health packet goes first (client shows the death screen at 0)
         let (food, sat) = {
             let mut v = self.me.vit.lock();
@@ -974,14 +967,16 @@ impl Session {
         b.f32(0.0).vi(food).f32(sat);
         self.send("set_health", &b);
         let mut b = Vec::new();
-        b.vi(self.me.eid).raw(&text_nbt(&msg));
+        b.vi(self.me.eid).raw(&msg_nbt);
         self.send("player_combat_kill", &b);
         let mut b = Vec::new();
         b.i32(self.me.eid).u8(3);
         let pkt = self.st.game.encode("entity_event", &b);
         self.to_viewers(pkt, false);
-        self.st.game.broadcast(self.st.game.system_chat(&msg));
-        tracing::info!("{msg}");
+        let mut chat = msg_nbt.clone();
+        chat.bool(false);
+        self.st.game.broadcast(self.st.game.encode("system_chat", &chat));
+        tracing::info!("{} died: {}", self.me.name, msg_json);
         // Inventory.dropAll
         let stacks: Vec<Stack> = {
             let mut inv = self.me.inv.lock();
@@ -1002,7 +997,7 @@ impl Session {
     }
 
     fn respawn(&mut self) {
-        if !self.me.vit.lock().dead {
+        if !self.me.vit.lock().dead() {
             return;
         }
         self.me.vit.lock().respawn();
@@ -1114,7 +1109,7 @@ impl Session {
         for p in others.iter().filter(|p| p.eid != self.me.eid) {
             let pose = *p.pose.lock();
             let c = ((pose.pos[0].floor() as i32) >> 4, (pose.pos[2].floor() as i32) >> 4);
-            if !self.in_view(c, self.center, self.view) || p.gamemode.load(Ordering::Relaxed) == 3 || p.vit.lock().dead {
+            if !self.in_view(c, self.center, self.view) || p.gamemode.load(Ordering::Relaxed) == 3 || p.vit.lock().dead() {
                 continue;
             }
             seen.insert(p.eid);
@@ -1220,8 +1215,12 @@ impl Session {
             let slot = r.i16()?;
             let count = r.varint()?;
             let item = if count > 0 { r.varint()? } else { 0 };
+            let patch = if count > 0 { crate::components::read_patch(&mut r)? } else { Some(Default::default()) };
             if self.gamemode() == 1 {
-                let st = (count > 0 && Items::get().valid(item)).then(|| Stack::new(item, count.clamp(1, 99) as u8));
+                let st = (count > 0 && Items::get().valid(item)).then(|| Stack::new(item, count.clamp(1, 99) as u8)).and_then(|mut s| {
+                    s.comp = crate::components::intern(patch?);
+                    Some(s)
+                });
                 if (1..46).contains(&slot) {
                     self.me.inv.lock().set(slot as usize, st);
                     self.me.inv.lock().dirty.clear();
@@ -1348,7 +1347,7 @@ impl Session {
         let reset = ctx.in_liquid || ctx.climbing || ctx.in_web_or_powder_snow || (self.gliding && dy > -0.5) || (on_ground && mult.is_none());
         let hit = self.me.vit.lock().on_move(dy, on_ground, reset, mult.unwrap_or(1.0), gm);
         if let Some(d) = hit {
-            self.damage(Cause::Fall, d);
+            self.damage(DamageSource::new("fall"), d);
         }
         // Player.checkMovementStatistics / jumpFromGround
         let (dx, dz) = (to[0] - from[0], to[2] - from[2]);

@@ -402,7 +402,7 @@ extern "system" fn n_gamemode(mut env: JNIEnv, _: JClass, name: JString) -> jint
 
 extern "system" fn n_health(mut env: JNIEnv, _: JClass, name: JString) -> jdouble {
     let n = rs(&mut env, &name);
-    player(&n).map(|p| p.vit.lock().health as f64).unwrap_or(0.0)
+    player(&n).map(|p| p.vit.lock().health() as f64).unwrap_or(0.0)
 }
 
 extern "system" fn n_get_block(mut env: JNIEnv, _: JClass, x: jint, y: jint, z: jint) -> jstring {

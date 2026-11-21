@@ -407,7 +407,7 @@ fn check_handoffs(state: &ServerState, link: &NodeLink, recent: &mut HashMap<u12
     for p in state.game.players() {
         let pos = p.pose.lock().pos;
         let cell = CellId::of_chunk(0, (pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4, link.cell_shift);
-        if link.owned.lock().contains(&cell) || recent.contains_key(&p.uuid.as_u128()) || p.vit.lock().dead {
+        if link.owned.lock().contains(&cell) || recent.contains_key(&p.uuid.as_u128()) || p.vit.lock().dead() {
             continue;
         }
         recent.insert(p.uuid.as_u128(), Instant::now());

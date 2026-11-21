@@ -8,8 +8,9 @@ use rand::Rng;
 
 use super::entity::{self, Cell, EKind, Entity};
 use super::mob::{self, Mob, MobType};
-use super::survival::Cause;
-use super::{fluid, Game, Hit, Player};
+use super::combat::damage::DamageSource;
+use super::combat::living::{Body, Event};
+use super::{fluid, Game, Player};
 use crate::anticheat::combat::Aabb;
 use crate::data::Stack;
 use crate::net::codec::Out;
@@ -17,8 +18,15 @@ use crate::registry::{blocks, Registries};
 use crate::world::chunk::MIN_Y;
 
 /// Things decided while the entity map is locked, done afterwards.
-enum Act {
-    Hurt(Arc<Player>, Hit),
+pub(super) enum Act {
+    /// lightning: `thunderHit` on these entities, fire at these blocks
+    Thunder { bolt: i32, cause: Option<i32>, area: Option<Aabb>, fire: Vec<[i32; 3]> },
+    /// `Mob.doHurtTarget`
+    MobAttack { mob: i32, target: i32 },
+    /// an arrow hit a living entity
+    ArrowHit { arrow: i32, owner: i32, target: i32, amount: f32, vel: [f64; 3], pos: [f64; 3] },
+    /// events of a mob's own `Living` (self damage, effects)
+    MobEvents { eid: i32, chunk: (i32, i32), pos: [f64; 3], events: Vec<Event> },
     Shoot { owner: i32, from: [f64; 3], vel: [f64; 3] },
     Explode { pos: [f64; 3], power: f32, by: &'static str },
     Sound { name: &'static str, pos: [f64; 3], hostile: bool },
@@ -49,7 +57,7 @@ impl Game {
     pub fn kill_mobs(&self) -> usize {
         let gone: Vec<(i32, (i32, i32))> = {
             let mut ents = self.entities.lock();
-            let ids: Vec<(i32, (i32, i32))> = ents.values().filter(|e| matches!(e.kind, EKind::Mob(_) | EKind::Arrow { .. })).map(|e| (e.eid, e.chunk())).collect();
+            let ids: Vec<(i32, (i32, i32))> = ents.values().filter(|e| matches!(e.kind, EKind::Mob(_) | EKind::Arrow { .. } | EKind::Lightning { .. })).map(|e| (e.eid, e.chunk())).collect();
             for (id, _) in &ids {
                 ents.remove(id);
             }
@@ -95,7 +103,7 @@ impl Game {
         best.max(0) as u8
     }
 
-    fn mob_meta(&self, eid: i32, m: &Mob) -> Arc<Vec<u8>> {
+    pub(super) fn mob_meta(&self, eid: i32, m: &Mob) -> Arc<Vec<u8>> {
         let mut b = Vec::new();
         b.vi(eid);
         b.u8(0).vi(0).u8(if m.fire > 0 { 1 } else { 0 });
@@ -129,6 +137,11 @@ impl Game {
                 let yaw = (e.vel[0].atan2(e.vel[2])).to_degrees() as f32;
                 let pitch = (e.vel[1].atan2(h)).to_degrees() as f32;
                 b.u8(mob::angle_byte(pitch)).u8(mob::angle_byte(yaw)).u8(0).vi(*owner);
+                vec![self.encode("add_entity", &b)]
+            }
+            EKind::Lightning { .. } => {
+                let ty = regs.id("minecraft:entity_type", "minecraft:lightning_bolt").unwrap_or(0);
+                b.vi(e.eid).uuid(e.uuid).vi(ty).f64(e.pos[0]).f64(e.pos[1]).f64(e.pos[2]).u8(0).u8(0).u8(0).u8(0).vi(0);
                 vec![self.encode("add_entity", &b)]
             }
             _ => Vec::new(),
@@ -184,13 +197,13 @@ impl Game {
         // player positions (alive, not spectating)
         let targets: Vec<(Arc<Player>, [f64; 3], i32)> = players
             .iter()
-            .filter(|p| !p.vit.lock().dead)
+            .filter(|p| !p.vit.lock().dead())
             .map(|p| (p.clone(), p.pose.lock().pos, p.gamemode.load(Ordering::Relaxed)))
             .collect();
         {
             let mut ents = self.entities.lock();
             for e in ents.values_mut() {
-                if !matches!(e.kind, EKind::Mob(_) | EKind::Arrow { .. }) {
+                if !matches!(e.kind, EKind::Mob(_) | EKind::Arrow { .. } | EKind::Lightning { .. }) {
                     continue;
                 }
                 let old_chunk = e.chunk();
@@ -201,6 +214,7 @@ impl Game {
                 let gone = match e.kind {
                     EKind::Mob(_) => self.tick_mob(e, &targets, day, now, &mut rng, &mut acts, &mut sends),
                     EKind::Arrow { .. } => self.tick_arrow(e, &targets, &mut acts),
+                    EKind::Lightning { .. } => self.tick_lightning(e, &mut rng, &mut acts),
                     _ => false,
                 };
                 if gone {
@@ -260,7 +274,20 @@ impl Game {
         }
         for a in acts {
             match a {
-                Act::Hurt(p, hit) => p.hits.lock().push(hit),
+                Act::MobAttack { mob, target } => {
+                    self.mob_attack(mob, target);
+                }
+                Act::ArrowHit { arrow, owner, target, amount, vel, pos } => {
+                    let aref = crate::game::combat::damage::EntityRef::new(arrow, "arrow", pos, false);
+                    let mut src = DamageSource::indirect("arrow", aref, self.entity_ref(owner));
+                    src.projectile = true;
+                    src.projectile_motion = Some(vel);
+                    if self.hurt_entity(target, &src, amount) {
+                        self.post_attack(target, &src, None);
+                    }
+                }
+                Act::MobEvents { eid, chunk, pos, events } => self.mob_events(eid, chunk, pos, events),
+                Act::Thunder { bolt, cause, area, fire } => self.thunder(bolt, cause, area, fire),
                 Act::Shoot { owner, from, vel } => {
                     let e = Entity { eid: self.next_eid(), uuid: uuid::Uuid::new_v4(), kind: EKind::Arrow { owner, damage: 2.0, stuck: 0 }, pos: from, vel, on_ground: false, age: 0, synced: from };
                     self.add_entity(e);
@@ -290,7 +317,7 @@ impl Game {
             m.death += 1;
             return m.death > 20;
         }
-        m.invulnerable = m.invulnerable.saturating_sub(1);
+        m.living.tick_counters();
         m.attack_cd = m.attack_cd.saturating_sub(1);
         m.panic = m.panic.saturating_sub(1);
         let (w, h) = ty.size();
@@ -312,13 +339,13 @@ impl Game {
         let feet_block = self.world.get_block(feet[0], feet[1], feet[2]).unwrap_or(blocks::AIR);
         let in_water = fluid::fluid_state(feet_block).fluid() == Some(fluid::Fluid::Water);
         let in_lava = feet_block.name() == "lava";
-        let mut self_damage = 0.0f32;
+        let mut self_damage: Vec<(DamageSource, f32)> = Vec::new();
         if in_water {
             m.fire = 0;
         } else if in_lava {
             m.fire = 300;
             if now % 10 == 0 {
-                self_damage += 4.0;
+                self_damage.push((DamageSource::new("lava"), 4.0));
             }
         } else if ty.burns() && day && self.sky_visible(feet[0], feet[1] + 1, feet[2]) && rng.gen_range(0..20) == 0 {
             m.fire = m.fire.max(160);
@@ -326,7 +353,7 @@ impl Game {
         if m.fire > 0 {
             m.fire -= 1;
             if m.fire % 20 == 0 {
-                self_damage += 1.0;
+                self_damage.push((DamageSource::new("on_fire"), 1.0));
             }
         }
         // targeting
@@ -393,8 +420,7 @@ impl Game {
                     let dy = (tpos[1] - e.pos[1]).abs();
                     if dist2(*tpos, e.pos) <= reach && dy < h.max(1.8) && m.attack_cd == 0 && ty.attack() > 0.0 {
                         m.attack_cd = 20;
-                        let dir = norm2([tpos[0] - e.pos[0], tpos[2] - e.pos[2]]);
-                        acts.push(Act::Hurt(tp.clone(), Hit { cause: Cause::Mob(ty.display()), amount: ty.attack(), source: e.eid, knockback: Some((dir, 0.4)) }));
+                        acts.push(Act::MobAttack { mob: e.eid, target: tp.eid });
                     }
                 }
             }
@@ -482,7 +508,13 @@ impl Game {
         // falling
         if e.on_ground {
             if m.fall > 3.0 && ty != MobType::Chicken && !in_water {
-                self_damage += (m.fall - 3.0).ceil() as f32;
+                // calculateFallDamage
+                let safe = m.living.attrs.value(super::combat::attr::Attr::SafeFallDistance);
+                let mult = m.living.attrs.value(super::combat::attr::Attr::FallDamageMultiplier);
+                let d = ((m.fall + 1.0e-6 - safe) * mult).floor();
+                if d > 0.0 {
+                    self_damage.push((DamageSource::new("fall"), d as f32));
+                }
             }
             m.fall = 0.0;
         } else if vy < 0.0 && !in_water {
@@ -491,17 +523,21 @@ impl Game {
         if in_water {
             m.fall = 0.0;
         }
-        if self_damage > 0.0 && m.hurt(self_damage).is_some() {
-            let mut b = Vec::new();
-            b.vi(e.eid).vi(0).vi(0).vi(0).bool(false);
-            sends.push((chunk_of(e.pos), self.encode("damage_event", &b)));
-            if m.health <= 0.0 {
-                m.death = 1;
-                let mut b = Vec::new();
-                b.i32(e.eid).u8(3);
-                sends.push((chunk_of(e.pos), self.encode("entity_event", &b)));
-                sends.push((chunk_of(e.pos), self.mob_meta(eid_, m)));
-                acts.push(Act::Loot { ty, pos: e.pos });
+        {
+            let info = super::hurt::mob_info(m, e.on_ground);
+            let fire_immune = super::etypes::EntityTypes::get().by_name(ty.name()).is_some_and(|t| t.fire_immune);
+            let mut body = Body { eid: eid_, info, pos: e.pos, head_yaw: m.yaw, velocity: e.vel, player: None, invulnerable: false, fire_immune, raining: false, thundering: false };
+            let mut eq = m.eq;
+            for (src, amount) in self_damage {
+                m.living.hurt(&mut eq, &mut body, &src, amount, rng);
+            }
+            m.living.tick_effects(&mut eq, &mut body, rng);
+            m.living.update_equipment(&eq);
+            m.eq = eq;
+            e.vel = body.velocity;
+            let events = std::mem::take(&mut m.living.events);
+            if !events.is_empty() {
+                acts.push(Act::MobEvents { eid: eid_, chunk: chunk_of(e.pos), pos: e.pos, events });
             }
         }
         if fire_before != (m.fire > 0) {
@@ -537,9 +573,7 @@ impl Game {
                 let bx = Aabb::entity(*pos, 0.6 + 0.3, 1.8 + 0.3);
                 if bx.distance_to(next) == 0.0 {
                     let amount = (speed * *damage).clamp(0.0, i32::MAX as f64).ceil() as f32;
-                    let dir = norm2([e.vel[0], e.vel[2]]);
-                    let by = (*owner >= 0).then_some(()).map(|_| "Skeleton").unwrap_or("Arrow");
-                    acts.push(Act::Hurt(p.clone(), Hit { cause: Cause::Arrow(by), amount, source: *owner, knockback: Some((dir, 0.4)) }));
+                    acts.push(Act::ArrowHit { arrow: e.eid, owner: *owner, target: p.eid, amount, vel: e.vel, pos: next });
                     return true;
                 }
             }
@@ -556,7 +590,7 @@ impl Game {
         false
     }
 
-    fn mob_loot(&self, ty: MobType, pos: [f64; 3]) {
+    pub(super) fn mob_loot(&self, ty: MobType, pos: [f64; 3]) {
         let mut rng = rand::thread_rng();
         for s in self.data.roll_loot(&ty.loot_table(), &mut rng) {
             self.spawn_item([pos[0], pos[1] + 0.5, pos[2]], s, [rng.gen_range(-0.1..0.1), 0.2, rng.gen_range(-0.1..0.1)], 10);
@@ -564,72 +598,6 @@ impl Game {
     }
 
     // ------------------------------------------------------------ combat
-
-    /// A player hit entity `target`. Returns false when there is no such
-    /// (living) entity.
-    pub fn attack_entity(&self, attacker: &Arc<Player>, target: i32, amount: f32, knockback: f64) -> bool {
-        let apos = attacker.pose.lock().pos;
-        // players
-        if let Some(p) = self.players().into_iter().find(|p| p.eid == target) {
-            if p.eid == attacker.eid {
-                return false;
-            }
-            let dir = norm2([p.pose.lock().pos[0] - apos[0], p.pose.lock().pos[2] - apos[2]]);
-            p.hits.lock().push(Hit { cause: Cause::Player(attacker.eid), amount, source: attacker.eid, knockback: Some((dir, knockback)) });
-            return true;
-        }
-        let mut pkts = Vec::new();
-        let mut loot = None;
-        let chunk;
-        {
-            let mut ents = self.entities.lock();
-            let Some(e) = ents.get_mut(&target) else { return false };
-            chunk = e.chunk();
-            let pos = e.pos;
-            let EKind::Mob(m) = &mut e.kind else { return false };
-            let Some(_) = m.hurt(amount) else { return true };
-            if m.ty.hostile() {
-                m.target = Some(attacker.eid);
-            }
-            m.flee_from = apos;
-            m.wander = None;
-            let dir = norm2([pos[0] - apos[0], pos[2] - apos[2]]);
-            e.vel[0] = e.vel[0] / 2.0 + dir[0] * knockback;
-            e.vel[2] = e.vel[2] / 2.0 + dir[1] * knockback;
-            if e.on_ground {
-                e.vel[1] = (e.vel[1] / 2.0 + knockback).min(0.4);
-            }
-            let ty_id = Registries::get().id("minecraft:damage_type", "minecraft:player_attack").unwrap_or(0);
-            let mut b = Vec::new();
-            b.vi(e.eid).vi(ty_id).vi(attacker.eid + 1).vi(attacker.eid + 1).bool(false);
-            pkts.push(self.encode("damage_event", &b));
-            let mut b = Vec::new();
-            b.vi(e.eid);
-            mob::write_lpvec(&mut b, e.vel);
-            pkts.push(self.encode("set_entity_motion", &b));
-            let EKind::Mob(m) = &mut e.kind else { unreachable!() };
-            if m.health <= 0.0 {
-                m.death = 1;
-                let mut b = Vec::new();
-                b.i32(e.eid).u8(3);
-                pkts.push(self.encode("entity_event", &b));
-                let meta = {
-                    let EKind::Mob(m) = &e.kind else { unreachable!() };
-                    self.mob_meta(e.eid, m)
-                };
-                pkts.push(meta);
-                let EKind::Mob(m) = &e.kind else { unreachable!() };
-                loot = Some((m.ty, pos));
-            }
-        }
-        for p in pkts {
-            self.broadcast_chunk(chunk, &p);
-        }
-        if let Some((ty, pos)) = loot {
-            self.mob_loot(ty, pos);
-        }
-        true
-    }
 
     /// The box of an entity (players included), for reach checks.
     pub fn entity_box(&self, eid: i32) -> Option<Aabb> {
@@ -658,9 +626,15 @@ impl Game {
             let d = dist2([pos[0], pos[1] + 0.9, pos[2]], centre).sqrt();
             let dmg = mob::explosion_damage(power, d);
             if dmg > 0.0 {
+                let src = DamageSource::at("explosion", c);
+                self.hurt_player(&p, &src, dmg);
                 let dir = norm2([pos[0] - c[0], pos[2] - c[2]]);
                 let impact = 1.0 - d / (power as f64 * 2.0);
-                p.hits.lock().push(Hit { cause: Cause::Explosion(by), amount: dmg, source: -1, knockback: Some((dir, impact)) });
+                let kr = p.vit.lock().living.attrs.value(super::combat::attr::Attr::ExplosionKnockbackResistance);
+                let k = impact * (1.0 - kr);
+                if k > 0.0 {
+                    self.push_entity(p.eid, [dir[0] * k, k, dir[1] * k]);
+                }
             }
         }
         let victims: Vec<(i32, f32)> = self
@@ -675,7 +649,7 @@ impl Game {
             })
             .collect();
         for (eid, dmg) in victims {
-            self.hurt_mob(eid, dmg, c);
+            self.hurt_mob(eid, &DamageSource::at("explosion", c), dmg);
         }
         // the blast itself
         let regs = Registries::get();
@@ -687,47 +661,6 @@ impl Game {
         b.vi(0);
         let chunk = ((c[0].floor() as i32) >> 4, (c[2].floor() as i32) >> 4);
         self.broadcast_chunk(chunk, &self.encode("explode", &b));
-    }
-
-    /// Damage a mob from a non-player source (explosions).
-    fn hurt_mob(&self, eid: i32, amount: f32, from: [f64; 3]) {
-        let mut pkts = Vec::new();
-        let mut loot = None;
-        let chunk;
-        {
-            let mut ents = self.entities.lock();
-            let Some(e) = ents.get_mut(&eid) else { return };
-            chunk = e.chunk();
-            let pos = e.pos;
-            let EKind::Mob(m) = &mut e.kind else { return };
-            if m.hurt(amount).is_none() {
-                return;
-            }
-            m.flee_from = from;
-            let dir = norm2([pos[0] - from[0], pos[2] - from[2]]);
-            e.vel[0] += dir[0] * 0.5;
-            e.vel[2] += dir[1] * 0.5;
-            e.vel[1] = 0.4;
-            let mut b = Vec::new();
-            b.vi(eid).vi(0).vi(0).vi(0).bool(false);
-            pkts.push(self.encode("damage_event", &b));
-            let EKind::Mob(m) = &mut e.kind else { unreachable!() };
-            if m.health <= 0.0 {
-                m.death = 1;
-                let mut b = Vec::new();
-                b.i32(eid).u8(3);
-                pkts.push(self.encode("entity_event", &b));
-                let EKind::Mob(m) = &e.kind else { unreachable!() };
-                pkts.push(self.mob_meta(eid, m));
-                loot = Some((m.ty, pos));
-            }
-        }
-        for p in pkts {
-            self.broadcast_chunk(chunk, &p);
-        }
-        if let Some((ty, pos)) = loot {
-            self.mob_loot(ty, pos);
-        }
     }
 
     // ------------------------------------------------------------ spawning
