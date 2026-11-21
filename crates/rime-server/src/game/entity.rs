@@ -7,6 +7,9 @@ use crate::registry::BlockState;
 pub enum EKind {
     Item { stack: Stack, pickup_delay: u32 },
     Falling { state: BlockState },
+    Mob(Box<super::mob::Mob>),
+    /// shot arrow: shooter eid, base damage, ticks stuck in a block
+    Arrow { owner: i32, damage: f64, stuck: u32 },
 }
 
 #[derive(Clone, Debug)]
@@ -29,9 +32,14 @@ impl Entity {
 
     /// (half width, height)
     pub fn size(&self) -> (f64, f64) {
-        match self.kind {
+        match &self.kind {
             EKind::Item { .. } => (0.125, 0.25),
             EKind::Falling { .. } => (0.49, 0.98),
+            EKind::Mob(m) => {
+                let (w, h) = m.ty.size();
+                (w / 2.0, h)
+            }
+            EKind::Arrow { .. } => (0.25, 0.5),
         }
     }
 }
@@ -132,6 +140,7 @@ pub fn physics(e: &mut Entity, cell: &dyn Fn(i32, i32, i32) -> Cell, friction_be
                 *v *= 0.98;
             }
         }
+        _ => {}
     }
     for v in &mut e.vel {
         if v.abs() < 0.003 {

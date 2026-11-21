@@ -118,6 +118,8 @@ pub struct Structures {
     by_step: Vec<Vec<usize>>,
     starts: Mutex<HashMap<(i32, i32), Arc<Vec<Arc<Start>>>>>,
     heights: Mutex<HashMap<(i32, i32, u8), i32>>,
+    /// a thread is computing the ring placements
+    warming: std::sync::atomic::AtomicBool,
     /// biome network id -> in `#mineshaft_blocking`
     mineshaft_blocking: Vec<bool>,
     llib: legacy::LLib,
@@ -247,7 +249,7 @@ impl Structures {
                 mineshaft_blocking[id as usize] = true;
             }
         }
-        let s = Structures { seed, structures, sets, set_by_name, pools, by_step, starts: Mutex::new(HashMap::new()), heights: Mutex::new(HashMap::new()), mineshaft_blocking, llib };
+        let s = Structures { seed, structures, sets, set_by_name, pools, by_step, starts: Mutex::new(HashMap::new()), heights: Mutex::new(HashMap::new()), warming: std::sync::atomic::AtomicBool::new(false), mineshaft_blocking, llib };
         Ok((s, unported))
     }
 
@@ -274,6 +276,63 @@ impl Structures {
         s.structures.iter().any(|&(i, _)| !matches!(self.structures[i].kind, Kind::Unported))
     }
 
+    fn ring_sets(&self) -> impl Iterator<Item = &Set> {
+        self.sets.iter().filter(|s| matches!(s.placement.kind, placement::Kind::ConcentricRings { .. }) && self.set_possible(s))
+    }
+
+    pub fn rings_ready(&self) -> bool {
+        self.ring_sets().all(|s| s.placement.rings.get().is_some())
+    }
+
+    /// Ring placements (strongholds) per concentric set, for caching.
+    pub fn rings(&self) -> Vec<Vec<(i32, i32)>> {
+        self.ring_sets().map(|s| s.placement.rings.get().map(|r| r.iter().copied().collect()).unwrap_or_default()).collect()
+    }
+
+    /// Restore cached ring placements.
+    pub fn set_rings(&self, rings: Vec<Vec<(i32, i32)>>) {
+        for (set, r) in self.ring_sets().zip(rings) {
+            let _ = set.placement.rings.set(r.into_iter().collect());
+        }
+    }
+
+    /// Computes the concentric-ring placements (strongholds). This is slow
+    /// (hundreds of thousands of biome samples), so it runs once, on its own
+    /// threads (a scoped thread with a private rayon pool: computing it on a
+    /// global rayon worker inside a `OnceLock` deadlocked through work
+    /// stealing); everyone else waits for the result.
+    pub fn init_rings(&self, ctx: &dyn Ctx) {
+        use std::sync::atomic::Ordering;
+        if self.rings_ready() {
+            return;
+        }
+        if self.warming.swap(true, Ordering::AcqRel) {
+            while !self.rings_ready() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            return;
+        }
+        let computed: Vec<std::collections::HashSet<(i32, i32)>> = std::thread::scope(|sc| {
+            sc.spawn(|| {
+                let pool = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("rime-rings-{i}")).build().expect("thread pool");
+                pool.install(|| {
+                    self.ring_sets()
+                        .map(|set| {
+                            let placement::Kind::ConcentricRings { distance, spread, count, .. } = set.placement.kind else { unreachable!() };
+                            let nb = |x: i32, y: i32, z: i32| ctx.noise_biome(x, y, z);
+                            placement::ring_positions(self.seed, distance, spread, count, &set.ring_biomes, &nb).into_iter().collect()
+                        })
+                        .collect()
+                })
+            })
+            .join()
+            .expect("ring placement thread")
+        });
+        for (set, r) in self.ring_sets().zip(computed) {
+            let _ = set.placement.rings.set(r);
+        }
+    }
+
     /// Structure starts in chunk (cx, cz) (`createStructures`).
     fn starts(&self, ctx: &dyn Ctx, cx: i32, cz: i32) -> Arc<Vec<Arc<Start>>> {
         if let Some(s) = self.starts.lock().get(&(cx, cz)) {
@@ -281,13 +340,8 @@ impl Structures {
         }
         let mut out = Vec::new();
         for set in &self.sets {
-            if let placement::Kind::ConcentricRings { distance, spread, count, .. } = set.placement.kind {
-                if self.set_possible(set) {
-                    set.placement.rings.get_or_init(|| {
-                        let nb = |x: i32, y: i32, z: i32| ctx.noise_biome(x, y, z);
-                        placement::ring_positions(self.seed, distance, spread, count, &set.ring_biomes, &nb).into_iter().collect()
-                    });
-                }
+            if matches!(set.placement.kind, placement::Kind::ConcentricRings { .. }) && self.set_possible(set) && set.placement.rings.get().is_none() {
+                self.init_rings(ctx);
             }
             if !self.set_possible(set) || !set.placement.is_structure_chunk(self.seed, cx, cz, &|n| self.other_placement(n)) {
                 continue;

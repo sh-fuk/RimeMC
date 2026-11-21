@@ -14,6 +14,7 @@ use tokio::time::timeout;
 
 use super::codec::{Out, Reader};
 use super::conn;
+use crate::anticheat::combat::CombatChecker;
 use crate::anticheat::movement::{MoveContext, MovementChecker};
 use crate::anticheat::xray::{self, MiningStats};
 use crate::anticheat::{Check, Verdict, Violations};
@@ -113,7 +114,7 @@ pub fn light_data(b: &mut Vec<u8>, light: &crate::world::light::ChunkLight) {
 
 /// The `commands` tree: a few literals, each taking an optional greedy string.
 fn commands_body() -> Vec<u8> {
-    let names = ["rime", "stop", "op", "deop", "gamemode", "tp", "list", "help", "spawn"];
+    let names = ["rime", "stop", "op", "deop", "gamemode", "tp", "list", "help", "spawn", "summon", "time", "kill"];
     let parser = Registries::get().id("minecraft:command_argument_type", "brigadier:string").unwrap_or(5);
     let arg = names.len() as i32 + 1;
     let mut b = Vec::new();
@@ -338,6 +339,7 @@ struct Session {
     sneaking: bool,
     next_window: u8,
     checker: MovementChecker,
+    combat: CombatChecker,
     vl: Violations,
     mining: MiningStats,
     dig_start: Option<((i32, i32, i32), Instant)>,
@@ -382,6 +384,7 @@ impl Session {
             sneaking: false,
             next_window: 0,
             checker: MovementChecker::default(),
+            combat: CombatChecker::default(),
             vl: Violations::default(),
             mining: MiningStats::default(),
             dig_start: None,
@@ -526,8 +529,9 @@ impl Session {
 
     fn send_time(&self) {
         let age = self.st.started.elapsed().as_millis() as i64 / 50;
+        let day = self.st.game.clock() as i64;
         let mut b = Vec::new();
-        b.i64(age).vi(1).vi(self.st.config_data.entry_id("minecraft:world_clock", "minecraft:overworld")).vl(age + 1000).f32(0.0).f32(1.0);
+        b.i64(age).vi(1).vi(self.st.config_data.entry_id("minecraft:world_clock", "minecraft:overworld")).vl(day + 1000).f32(0.0).f32(1.0);
         self.send("set_time", &b);
     }
 
@@ -731,8 +735,12 @@ impl Session {
     }
 
     fn tick_vitals(&mut self) {
+        let hits = std::mem::take(&mut *self.me.hits.lock());
         if self.me.vit.lock().dead {
             return;
+        }
+        for h in hits {
+            self.take_hit(h);
         }
         let s = self.surroundings();
         let hits = self.me.vit.lock().tick(&s);
@@ -776,7 +784,82 @@ impl Session {
         }
     }
 
+    /// Damage from a mob, an explosion or another player.
+    fn take_hit(&mut self, h: crate::game::Hit) {
+        let gm = self.gamemode();
+        if gm == 1 || gm == 3 || self.me.vit.lock().dead {
+            return;
+        }
+        let mut amount = h.amount;
+        if h.cause.armor_applies() {
+            let (mut armor, mut tough) = (0.0, 0.0);
+            let items = Items::get();
+            for s in self.me.inv.lock().slots[5..9].iter().flatten() {
+                let (a, t) = crate::game::mob::armor_of(items.name(s.item));
+                armor += a;
+                tough += t;
+            }
+            amount = crate::game::mob::after_armor(amount, armor, tough);
+        }
+        if !self.damage_from(h.cause, amount, h.source) {
+            return;
+        }
+        if let Some((dir, strength)) = h.knockback {
+            if strength > 0.0 && !self.me.vit.lock().dead {
+                let v = [dir[0] * strength, strength.min(0.4), dir[1] * strength];
+                let mut b = Vec::new();
+                b.vi(self.me.eid);
+                crate::game::mob::write_lpvec(&mut b, v);
+                self.send("set_entity_motion", &b);
+                self.checker.knocked();
+            }
+        }
+    }
+
+    /// Player attack (left click on an entity).
+    fn on_attack(&mut self, target: i32) -> Option<Flow> {
+        let gm = self.gamemode();
+        if gm == 3 || self.me.vit.lock().dead || target == self.me.eid {
+            return None;
+        }
+        let pose = *self.me.pose.lock();
+        let Some(bx) = self.st.game.entity_box(target) else { return None };
+        let eye = [pose.pos[0], pose.pos[1] + 1.62, pose.pos[2]];
+        if self.st.cfg.anticheat.enabled {
+            let flags = self.combat.on_attack(self.now_ms(), eye, pose.yaw, pose.pitch, target as u32, &[bx], gm == 1);
+            let mut cancel = false;
+            for f in flags {
+                cancel |= matches!(f.check, Check::Reach);
+                if let Some(flow) = self.apply_flag(f.check, f.amount, f.detail) {
+                    return Some(flow);
+                }
+            }
+            if cancel {
+                return None;
+            }
+        } else if bx.distance_to(eye) > 6.0 {
+            return None;
+        }
+        let held = self.me.inv.lock().slots[36 + self.me.held.load(Ordering::Relaxed) as usize];
+        let name = held.map(|s| Items::get().name(s.item)).unwrap_or("air");
+        let mut dmg = crate::game::mob::item_attack_damage(name);
+        // falling, not on the ground: critical hit
+        if !pose.on_ground && self.last_y > pose.pos[1] {
+            dmg *= 1.5;
+        }
+        let kb = if self.sprinting { 0.9 } else { 0.4 };
+        if self.st.game.attack_entity(&self.me, target, dmg, kb) {
+            self.me.vit.lock().add_exhaustion(0.1);
+        }
+        None
+    }
+
     fn damage(&mut self, cause: Cause, amount: f32) {
+        self.damage_from(cause, amount, -1);
+    }
+
+    /// Returns true when the damage was dealt.
+    fn damage_from(&mut self, cause: Cause, amount: f32, source: i32) -> bool {
         let gm = self.gamemode();
         let (dealt, dead) = {
             let mut v = self.me.vit.lock();
@@ -784,20 +867,27 @@ impl Session {
             (d, v.dead)
         };
         if dealt.is_none() {
-            return;
+            return false;
         }
         let ty = self.st.config_data.entry_id("minecraft:damage_type", cause.damage_type());
         let mut b = Vec::new();
-        b.vi(self.me.eid).vi(ty).vi(0).vi(0).bool(false);
+        b.vi(self.me.eid).vi(ty).vi(source + 1).vi(source + 1).bool(false);
         let pkt = self.st.game.encode("damage_event", &b);
         self.to_viewers(pkt, true);
         if dead {
             self.die(cause);
         }
+        true
     }
 
     fn die(&mut self, cause: Cause) {
-        let msg = cause.death_message(&self.me.name);
+        let msg = match cause {
+            Cause::Player(eid) => match self.st.game.players().into_iter().find(|p| p.eid == eid) {
+                Some(k) => format!("{} was slain by {}", self.me.name, k.name),
+                None => cause.death_message(&self.me.name),
+            },
+            _ => cause.death_message(&self.me.name),
+        };
         // ServerPlayer.die: the health packet goes first (client shows the death screen at 0)
         let (food, sat) = {
             let mut v = self.me.vit.lock();
@@ -1084,6 +1174,11 @@ impl Session {
             self.st.game.send_inventory(&self.me);
         } else if pid == sb("player_input") {
             self.sneaking = r.u8()? & 0x20 != 0;
+        } else if pid == sb("attack") {
+            let target = r.varint()?;
+            if let Some(flow) = self.on_attack(target) {
+                return Ok(flow);
+            }
         } else if pid == sb("swing") {
             let hand = r.varint()?;
             let mut b = Vec::new();
@@ -1333,6 +1428,64 @@ impl Session {
                     }
                     None => self.msg("§cUsage: /tp <player> | /tp <x> <y> <z>"),
                 }
+            }
+            "summon" => {
+                if !self.st.ops.is_op(&sender) {
+                    self.msg("§cYou do not have permission (operator only).");
+                    return Flow::Continue;
+                }
+                let args: Vec<&str> = words.collect();
+                let pose = *self.me.pose.lock();
+                let pos = match args.as_slice() {
+                    [_] => Some(pose.pos),
+                    [_, x, y, z] => match (x.parse::<f64>(), y.parse::<f64>(), z.parse::<f64>()) {
+                        (Ok(x), Ok(y), Ok(z)) if [x, y, z].iter().all(|v| v.is_finite() && v.abs() < 2.9e7) => Some([x, y, z]),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match (args.first(), pos) {
+                    (Some(name), Some(pos)) => match self.st.game.summon(name, pos) {
+                        Some(_) => self.msg(&format!("Summoned new {}", name.trim_start_matches("minecraft:"))),
+                        None => self.msg(&format!("§cUnknown or unsupported entity: {name}")),
+                    },
+                    _ => self.msg("§cUsage: /summon <entity> [x y z]"),
+                }
+            }
+            "time" => {
+                if !self.st.ops.is_op(&sender) {
+                    self.msg("§cYou do not have permission (operator only).");
+                    return Flow::Continue;
+                }
+                let args: Vec<&str> = words.collect();
+                let target = match args.as_slice() {
+                    ["set", "day"] => Some(1000),
+                    ["set", "noon"] => Some(6000),
+                    ["set", "night"] => Some(13000),
+                    ["set", "midnight"] => Some(18000),
+                    ["set", n] => n.parse::<u64>().ok(),
+                    ["query", "daytime"] | [] => {
+                        self.msg(&format!("The time is {}", self.st.game.day_time()));
+                        None
+                    }
+                    _ => {
+                        self.msg("§cUsage: /time set <day|noon|night|midnight|ticks> | /time query daytime");
+                        None
+                    }
+                };
+                if let Some(t) = target {
+                    self.st.game.set_day_time(t);
+                    self.send_time();
+                    self.msg(&format!("Set the time to {t}"));
+                }
+            }
+            "kill" => {
+                if !self.st.ops.is_op(&sender) {
+                    self.msg("§cYou do not have permission (operator only).");
+                    return Flow::Continue;
+                }
+                let n = self.st.game.kill_mobs();
+                self.msg(&format!("Killed {n} entities"));
             }
             "list" => {
                 let names: Vec<String> = self.st.game.players().iter().map(|p| p.name.clone()).collect();

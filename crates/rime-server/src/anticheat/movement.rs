@@ -277,6 +277,14 @@ impl MovementChecker {
         None
     }
 
+    /// The server pushed the player (knockback): allow the launch.
+    pub fn knocked(&mut self) {
+        self.grace = GRACE;
+        self.speed_buffer = 0.0;
+        self.fly_buffer = 0.0;
+        self.fall_distance = 0.0;
+    }
+
     /// Server teleported the player; reset tracking.
     pub fn teleported(&mut self, to: [f64; 3]) {
         self.last_pos = Some(to);

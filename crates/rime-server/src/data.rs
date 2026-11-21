@@ -549,6 +549,8 @@ fn condition(c: &Value, ctx: &LootCtx, rng: &mut impl Rng) -> bool {
     let terms = |c: &Value| c.get("terms").and_then(|t| t.as_array()).cloned().unwrap_or_default();
     match c.get("condition").and_then(|t| t.as_str()).unwrap_or("") {
         "minecraft:survives_explosion" => true,
+        // mob loot is rolled for kills; no looting / fire / baby state yet
+        "minecraft:killed_by_player" => true,
         "minecraft:random_chance" => {
             let p = c.get("chance").map(|x| number(x, rng)).unwrap_or(1.0).clamp(0.0, 1.0);
             rng.gen_bool(p)

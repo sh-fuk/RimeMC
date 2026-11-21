@@ -134,6 +134,7 @@ impl ServerState {
         let st = self.clone();
         match tokio::task::spawn_blocking(move || {
             st.save_players();
+            st.game.stash_mobs(false);
             st.game.world.save(&st.store, true);
             st.store.flush()
         })
@@ -259,6 +260,26 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
         tracing::info!("vanilla 26.1 world generation ready (seed {seed}, {} ms); runs on all CPU cores", t.elapsed().as_millis());
     }
     let generator = Arc::new(generator);
+    // compute the stronghold rings (vanilla's slow first-chunk step) in the
+    // background instead of on the first player's chunk request
+    // (cached in the world folder: it takes vanilla's biome search ~30 s)
+    if let Some(v) = generator.vanilla() {
+        let cache = world_dir.join("rime-strongholds.txt");
+        if let Some(r) = load_rings(&cache, seed) {
+            v.set_rings(r);
+        } else {
+            let g = generator.clone();
+            std::thread::Builder::new().name("rime-warmup".into()).spawn(move || {
+                let t = std::time::Instant::now();
+                let Some(v) = g.vanilla() else { return };
+                v.warm_up();
+                if let Some(r) = v.rings() {
+                    save_rings(&cache, seed, &r);
+                }
+                tracing::info!("stronghold placement computed in {} ms", t.elapsed().as_millis());
+            })?;
+        }
+    }
     backup_on_generator_change(&world_dir, generator.gen_id())?;
     let config_data = net::config_data::ConfigData::build(&vanilla)?;
     tracing::info!("loaded {} synchronized registries from vanilla {} data", config_data.registries.len(), registry::blocks::MC_VERSION);
@@ -399,6 +420,7 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
         p.shutdown();
     }
     state.save_players();
+    state.game.stash_mobs(true);
     let saved = state.game.world.save(&state.store, false);
     tracing::info!("saved {saved} modified chunk(s)");
     let r = state.store.flush();
@@ -501,6 +523,40 @@ fn backup_on_generator_change(world_dir: &Path, id: u32) -> anyhow::Result<()> {
     }
     std::fs::write(&p, id.to_string())?;
     Ok(())
+}
+
+/// `rime-strongholds.txt`: "seed <n>", then per ring set a line "set" and
+/// "x z" chunk positions.
+fn load_rings(path: &std::path::Path, seed: i64) -> Option<Vec<Vec<(i32, i32)>>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    if lines.next()?.strip_prefix("seed ")?.trim().parse::<i64>().ok()? != seed {
+        return None;
+    }
+    let mut out: Vec<Vec<(i32, i32)>> = Vec::new();
+    for l in lines {
+        if l.trim() == "set" {
+            out.push(Vec::new());
+            continue;
+        }
+        let mut it = l.split_whitespace();
+        let (x, z) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+        out.last_mut()?.push((x, z));
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn save_rings(path: &std::path::Path, seed: i64, rings: &[Vec<(i32, i32)>]) {
+    let mut s = format!("seed {seed}\n");
+    for r in rings {
+        s.push_str("set\n");
+        for (x, z) in r {
+            s.push_str(&format!("{x} {z}\n"));
+        }
+    }
+    if let Err(e) = std::fs::write(path, s) {
+        tracing::warn!("could not cache stronghold placement: {e}");
+    }
 }
 
 fn load_or_create_seed(world_dir: &Path, cfg_seed: i64) -> anyhow::Result<i64> {

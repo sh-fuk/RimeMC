@@ -59,6 +59,28 @@ const STRUCTURE_SETS: [&str; 20] = [
     "ocean_ruins", "pillager_outposts", "ruined_portals", "shipwrecks", "strongholds", "swamp_huts", "trail_ruins", "trial_chambers", "villages", "woodland_mansions",
 ];
 
+impl VanillaGenerator {
+    /// Slow one-time setup (stronghold rings), so the first chunk near a
+    /// player does not wait for it.
+    pub fn warm_up(&self) {
+        if let Some(s) = &self.structures {
+            s.init_rings(self);
+        }
+    }
+
+    /// Stronghold ring placements, once computed (for the world cache).
+    pub fn rings(&self) -> Option<Vec<Vec<(i32, i32)>>> {
+        let s = self.structures.as_ref()?;
+        s.rings_ready().then(|| s.rings())
+    }
+
+    pub fn set_rings(&self, r: Vec<Vec<(i32, i32)>>) {
+        if let Some(s) = &self.structures {
+            s.set_rings(r);
+        }
+    }
+}
+
 impl structure::Ctx for VanillaGenerator {
     fn base_height(&self, x: i32, z: i32, hm: feature::Hm) -> i32 {
         chunk::base_height_stop(&self.router, &self.settings, self.aquifer_random, self.ore_random, x, z, &|s| hm.test(s))

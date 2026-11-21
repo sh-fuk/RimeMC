@@ -287,7 +287,51 @@ fn vanilla_chunk(g: crate::worldgen::Generated, cx: i32, cz: i32) -> Chunk {
     c.fluid_ticks = g.fluid_ticks;
     c.block_entities = g.block_entities.into_iter().collect();
     c.gen_entities = g.entities.into_iter().map(|(k, p)| (k.to_string(), p)).collect();
+    add_animals(&mut c);
     c
+}
+
+/// `NaturalSpawner.spawnMobsForChunkGeneration`: a pack of farm animals in
+/// about one chunk in ten, on grass in biomes that have them.
+fn add_animals(c: &mut Chunk) {
+    let mut h = hash2(c.x, c.z, 0x5EED_A41A);
+    let mut next = |n: u32| {
+        h ^= h << 13;
+        h ^= h >> 17;
+        h ^= h << 5;
+        h % n.max(1)
+    };
+    if next(10) != 0 {
+        return;
+    }
+    let names = &crate::world::chunk::Biomes::get().names;
+    let (x0, z0) = (next(16) as usize, next(16) as usize);
+    let top = c.heightmap[z0 * 16 + x0] as i32;
+    let biome = c.biomes[(((top - MIN_Y) >> 4).max(0) as usize).min(c.biomes.len() - 1)][((((top - MIN_Y) >> 2) & 3) << 4 | ((z0 as i32 >> 2) & 3) << 2 | ((x0 as i32 >> 2) & 3)) as usize];
+    let list = crate::game::mob::creatures(names.get(biome as usize).map(|s| s.as_str()).unwrap_or(""));
+    let total: u32 = list.iter().map(|x| x.1).sum();
+    if total == 0 {
+        return;
+    }
+    let mut r = next(total);
+    let Some(&(ty, _)) = list.iter().find(|(_, w)| {
+        if r < *w {
+            true
+        } else {
+            r -= w;
+            false
+        }
+    }) else {
+        return;
+    };
+    for _ in 0..4 {
+        let (x, z) = (((x0 as i32 + next(9) as i32 - 4).clamp(0, 15)) as usize, ((z0 as i32 + next(9) as i32 - 4).clamp(0, 15)) as usize);
+        let y = c.heightmap[z * 16 + x] as i32;
+        if y < MIN_Y || c.get(x, y, z).name() != "grass_block" || !c.get(x, y + 1, z).is_air() || !c.get(x, y + 2, z).is_air() {
+            continue;
+        }
+        c.gen_entities.push((ty.name().to_string(), [c.x * 16 + x as i32, y + 1, c.z * 16 + z as i32]));
+    }
 }
 
 #[cfg(test)]

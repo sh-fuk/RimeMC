@@ -13,6 +13,14 @@ pub enum Cause {
     Starve,
     Void,
     Generic,
+    /// melee hit by a mob (display name)
+    Mob(&'static str),
+    /// shot by a mob
+    Arrow(&'static str),
+    /// blown up by a mob
+    Explosion(&'static str),
+    /// hit by another player (their entity id)
+    Player(i32),
 }
 
 impl Cause {
@@ -27,6 +35,10 @@ impl Cause {
             Cause::Starve => "minecraft:starve",
             Cause::Void => "minecraft:out_of_world",
             Cause::Generic => "minecraft:generic",
+            Cause::Mob(_) => "minecraft:mob_attack",
+            Cause::Arrow(_) => "minecraft:arrow",
+            Cause::Explosion(_) => "minecraft:explosion",
+            Cause::Player(_) => "minecraft:player_attack",
         }
     }
 
@@ -40,7 +52,16 @@ impl Cause {
             Cause::Starve => format!("{name} starved to death"),
             Cause::Void => format!("{name} fell out of the world"),
             Cause::Generic => format!("{name} died"),
+            Cause::Mob(m) => format!("{name} was slain by {m}"),
+            Cause::Arrow(m) => format!("{name} was shot by {m}"),
+            Cause::Explosion(m) => format!("{name} was blown up by {m}"),
+            Cause::Player(_) => format!("{name} was slain"),
         }
+    }
+
+    /// reduced by armour
+    pub fn armor_applies(self) -> bool {
+        matches!(self, Cause::Mob(_) | Cause::Arrow(_) | Cause::Explosion(_) | Cause::Player(_) | Cause::Generic)
     }
 
     /// `#bypasses_invulnerability`
