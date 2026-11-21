@@ -553,6 +553,7 @@ impl Session {
         b.f64(0.0).f64(0.0).f64(59_999_968.0).f64(59_999_968.0).vl(0).vi(29_999_984).vi(5).vi(15);
         self.send("initialize_border", &b);
         self.send_time();
+        self.send_weather();
         let (sx, sy, sz) = spawn_block(st.spawn);
         let mut b = Vec::new();
         b.str("minecraft:overworld").pos(sx, sy, sz).f32(0.0).f32(0.0);
@@ -596,6 +597,12 @@ impl Session {
         let mut b = Vec::new();
         b.i64(age).vi(1).vi(self.st.config_data.entry_id("minecraft:world_clock", "minecraft:overworld")).vl(day + 1000).f32(0.0).f32(1.0);
         self.send("set_time", &b);
+    }
+
+    fn send_weather(&self) {
+        for pkt in self.st.game.weather_packets() {
+            self.me.send(pkt);
+        }
     }
 
     fn teleport(&mut self, pos: [f64; 3], yaw: f32, pitch: f32) {
@@ -1022,6 +1029,10 @@ impl Session {
         self.send("set_held_slot", &b);
         st.game.send_inventory(&self.me);
         self.send_time();
+        self.send_weather();
+        // the respawn packet resets client attributes: resend them all
+        let pkt = st.game.attributes_packet(self.me.eid, &mut self.me.vit.lock().living);
+        self.me.send(pkt);
     }
 
     /// Starts eating the held food (`use_item`); true when it is food.
@@ -1209,7 +1220,7 @@ impl Session {
             let s = r.i16()?;
             if (0..9).contains(&s) {
                 self.me.held.store(s as i32, Ordering::Relaxed);
-                self.me.vit.lock().eating = None;
+                self.stop_using_item();
             }
         } else if pid == sb("set_creative_mode_slot") {
             let slot = r.i16()?;
@@ -1345,6 +1356,17 @@ impl Session {
         let below = self.st.game.world.get_block(to[0].floor() as i32, (to[1] - 0.2).floor() as i32, to[2].floor() as i32).unwrap_or(blocks::AIR);
         let mult = survival::landing_multiplier(below.name(), self.sneaking);
         let reset = ctx.in_liquid || ctx.climbing || ctx.in_web_or_powder_snow || (self.gliding && dy > -0.5) || (on_ground && mult.is_none());
+        // Entity flags used by the attack code (crit / sweep conditions)
+        let f = if self.sneaking { F_SNEAKING } else { 0 }
+            | if self.sprinting { F_SPRINTING } else { 0 }
+            | if self.gliding { F_FALL_FLYING } else { 0 }
+            | if ctx.climbing { F_CLIMBING } else { 0 }
+            | if ctx.in_liquid { F_IN_WATER } else { 0 };
+        self.me.flags.store(f, Ordering::Relaxed);
+        {
+            let (mx, mz) = (to[0] - from[0], to[2] - from[2]);
+            *self.me.known_speed_sq.lock() = mx * mx + mz * mz;
+        }
         let hit = self.me.vit.lock().on_move(dy, on_ground, reset, mult.unwrap_or(1.0), gm);
         if let Some(d) = hit {
             self.damage(DamageSource::new("fall"), d);
@@ -1645,7 +1667,7 @@ impl Session {
             }
             5 | 6 => {
                 if status == 5 {
-                    self.me.vit.lock().eating = None;
+                    self.stop_using_item();
                 }
                 self.ack(seq);
                 return Flow::Continue;
@@ -1832,6 +1854,15 @@ impl Session {
             return;
         }
         let Some(held) = self.me.inv.lock().slots[slot] else { return };
+        // shields and other `blocks_attacks` items: start using (Item.use -> startUsingItem)
+        if held.defaults().blocks_attacks.is_some() {
+            let mut v = self.me.vit.lock();
+            if v.living.using.is_none() && !v.living.on_cooldown(held.item) {
+                v.living.using = Some(crate::game::combat::living::UseItem { hand: hand as u8, item: held.item, elapsed: 0 });
+                v.data_dirty = true;
+            }
+            return;
+        }
         let items = Items::get();
         let name = items.name(held.item).to_string();
         let gm = self.gamemode();
