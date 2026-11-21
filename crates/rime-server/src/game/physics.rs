@@ -82,34 +82,35 @@ impl Aabb {
         }
         s
     }
-    /// `AABB.clip`: entry point of the segment into the box and the face hit.
+    /// `AABB.clip`: entry point of the segment into the box and the face hit
+    /// (hits need `0 < t < 1`; a segment ending on a face misses).
     pub fn clip(&self, from: [f64; 3], to: [f64; 3]) -> Option<([f64; 3], u8)> {
+        const E: f64 = 1.0e-7;
         let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
-        let mut tmin = 0.0f64;
-        let mut tmax = 1.0f64;
+        let mut scale = 1.0f64;
         let mut face = 255u8;
-        for i in 0..3 {
-            if d[i].abs() < 1e-12 {
-                if from[i] < self.min[i] || from[i] > self.max[i] {
-                    return None;
-                }
+        // AABB.getDirection: per axis, the face the segment enters through
+        for a in 0..3 {
+            let (b, c) = ((a + 1) % 3, (a + 2) % 3);
+            let (plane, f) = if d[a] > E {
+                (self.min[a], axis_face(a, false))
+            } else if d[a] < -E {
+                (self.max[a], axis_face(a, true))
+            } else {
                 continue;
-            }
-            let (t1, t2) = ((self.min[i] - from[i]) / d[i], (self.max[i] - from[i]) / d[i]);
-            let (near, far, f) = if t1 < t2 { (t1, t2, axis_face(i, false)) } else { (t2, t1, axis_face(i, true)) };
-            if near > tmin {
-                tmin = near;
+            };
+            let t = (plane - from[a]) / d[a];
+            let pb = from[b] + t * d[b];
+            let pc = from[c] + t * d[c];
+            if 0.0 < t && t < scale && self.min[b] - E < pb && pb < self.max[b] + E && self.min[c] - E < pc && pc < self.max[c] + E {
+                scale = t;
                 face = f;
-            }
-            tmax = tmax.min(far);
-            if tmin > tmax {
-                return None;
             }
         }
         if face == 255 {
-            return None; // starts inside
+            return None;
         }
-        Some(([from[0] + d[0] * tmin, from[1] + d[1] * tmin, from[2] + d[2] * tmin], face))
+        Some(([from[0] + d[0] * scale, from[1] + d[1] * scale, from[2] + d[2] * scale], face))
     }
 }
 
@@ -266,6 +267,19 @@ pub fn clip(w: &impl Blocks, from: [f64; 3], to: [f64; 3]) -> Option<BlockHit> {
         let s = w.block(x, y, z)?;
         let mut best: Option<([f64; 3], u8)> = None;
         let mut best_d = f64::MAX;
+        let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+        if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 1.0e-7 {
+            return None;
+        }
+        // VoxelShape.clip: a segment starting inside the shape hits right away
+        let probe = [from[0] + d[0] * 0.001, from[1] + d[1] * 0.001, from[2] + d[2] * 0.001];
+        for b in collision(s) {
+            if b.translate([x as f64, y as f64, z as f64]).contains(probe) {
+                let (ax, _) = (0..3).map(|i| (i, d[i].abs())).fold((0, -1.0), |acc, v| if v.1 > acc.1 { v } else { acc });
+                // Direction.getApproximateNearest(d).getOpposite()
+                return Some(BlockHit { pos: probe, block: [x, y, z], face: axis_face(ax, d[ax] < 0.0), state: s });
+            }
+        }
         for b in collision(s) {
             if let Some((p, f)) = b.translate([x as f64, y as f64, z as f64]).clip(from, to) {
                 let d = (p[0] - from[0]).powi(2) + (p[1] - from[1]).powi(2) + (p[2] - from[2]).powi(2);
@@ -281,7 +295,9 @@ pub fn clip(w: &impl Blocks, from: [f64; 3], to: [f64; 3]) -> Option<BlockHit> {
         return Some(h);
     }
     let (dx, dy, dz) = (fx - tx, fy - ty, fz - tz);
-    let (sx, sy, sz) = (dx.signum() as i32, dy.signum() as i32, dz.signum() as i32);
+    // Mth.sign: 0 for 0 (f64::signum(0.0) is 1.0)
+    let sign = |v: f64| if v > 0.0 { 1 } else if v < 0.0 { -1 } else { 0 };
+    let (sx, sy, sz) = (sign(dx), sign(dy), sign(dz));
     let (ix, iy, iz) = (if sx == 0 { f64::MAX } else { sx as f64 / dx }, if sy == 0 { f64::MAX } else { sy as f64 / dy }, if sz == 0 { f64::MAX } else { sz as f64 / dz });
     let frac = |v: f64| v - v.floor();
     let mut px = ix * if sx > 0 { 1.0 - frac(tx) } else { frac(tx) };
@@ -310,6 +326,17 @@ pub fn clip(w: &impl Blocks, from: [f64; 3], to: [f64; 3]) -> Option<BlockHit> {
         }
     }
     None
+}
+
+/// Java `Math.signum` / `Mth.sign`: 0 for 0 (Rust's `signum(0.0)` is 1).
+pub fn jsign(v: f64) -> f64 {
+    if v > 0.0 {
+        1.0
+    } else if v < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
 }
 
 fn lerp(t: f64, a: f64, b: f64) -> f64 {

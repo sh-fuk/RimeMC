@@ -823,7 +823,7 @@ fn bat_step(m: &mut Mob, cx: &mut Ctx) {
     let t = m.v.target_pos.unwrap_or(pos);
     let d = [t[0] as f64 + 0.5 - cx.pos[0], t[1] as f64 + 0.1 - cx.pos[1], t[2] as f64 + 0.5 - cx.pos[2]];
     let v = cx.vel;
-    let nv = [v[0] + (d[0].signum() * 0.5 - v[0]) * 0.1, v[1] + (d[1].signum() * 0.7 - v[1]) * 0.1, v[2] + (d[2].signum() * 0.5 - v[2]) * 0.1];
+    let nv = [v[0] + (crate::game::physics::jsign(d[0]) * 0.5 - v[0]) * 0.1, v[1] + (crate::game::physics::jsign(d[1]) * 0.7 - v[1]) * 0.1, v[2] + (crate::game::physics::jsign(d[2]) * 0.5 - v[2]) * 0.1];
     cx.vel = nv;
     let yrd = nv[2].atan2(nv[0]).to_degrees() as f32 - 90.0;
     let diff = control::wrap(yrd - m.mo.yaw);

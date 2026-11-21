@@ -386,7 +386,7 @@ impl Special {
                     return false;
                 }
                 let yaw = m.mo.yaw.to_radians();
-                let (sx, sz) = ((-yaw.sin()).signum() as i32, (yaw.cos()).signum() as i32);
+                let (sx, sz) = (crate::game::physics::jsign((-yaw.sin()) as f64) as i32, crate::game::physics::jsign((yaw.cos()) as f64) as i32);
                 let p = cx.block_pos();
                 let steps = [0, 1, 4, 5, 6];
                 for s in steps {
@@ -1244,7 +1244,7 @@ impl Special {
                     m.mo.pitch = super::control::rotlerp(m.mo.pitch, 0.0, 0.2);
                 } else if v[0] * v[0] + v[2] * v[2] > 1e-7 {
                     let h = (v[0] * v[0] + v[2] * v[2]).sqrt();
-                    let ang = (v[1].signum() * (v[1] / h).abs().atan()).to_degrees() as f32;
+                    let ang = (crate::game::physics::jsign(v[1]) * (v[1] / h).abs().atan()).to_degrees() as f32;
                     m.mo.pitch = ang;
                 }
             }

@@ -789,7 +789,7 @@ impl Game {
             Act::Proj(p) => pacts.push(p),
             Act::MobEvents { eid, chunk, pos, events } => self.mob_events(eid, chunk, pos, events),
             Act::Thunder { bolt, cause, area, fire } => self.thunder(bolt, cause, area, fire),
-            Act::Explode { pos, power, fire, by } => self.explode_full(pos, power, fire, by, true),
+            Act::Explode { pos, power, fire, by } => self.explode_full(pos, power, fire, by, Some(true)),
             Act::Sound { name, pos, hostile, volume, pitch } => self.sound(&name, pos, hostile, volume, pitch),
             Act::Arrow { owner, from, target, power, tipped, fire, velocity, uncertainty } => {
                 // ProjectileUtil.getMobArrow: setBaseDamageFromMob(power)
@@ -1314,8 +1314,8 @@ impl Game {
     /// Explosion: destroys blocks (1/power of them drop), hurts players and
     /// mobs, and shows the blast.
     pub fn explode(&self, c: [f64; 3], power: f32, _by: &'static str) {
-        // PrimedTnt explodes at y + height / 16
-        self.explode_full([c[0], c[1] + 0.98 / 16.0, c[2]], power, false, None, true);
+        // PrimedTnt explodes at y + height / 16; tntExplosionDropDecay is false
+        self.explode_full([c[0], c[1] + 0.98 / 16.0, c[2]], power, false, None, Some(false));
     }
 
     pub fn entity_box(&self, eid: i32) -> Option<Aabb> {
@@ -1328,20 +1328,50 @@ impl Game {
         Some(Aabb::entity(e.pos, half * 2.0, h))
     }
 
+    /// Fireballs and skulls: mob explosions (mobExplosionDropDecay).
     pub fn explode_with_fire(&self, c: [f64; 3], power: f32, fire: bool) {
-        self.explode_full(c, power, fire, None, true);
+        self.explode_full(c, power, fire, None, Some(true));
     }
 
-    /// `ServerExplosion.explode`: blocks, entity damage with exposure,
-    /// knockback, fire.
-    pub fn explode_full(&self, c: [f64; 3], power: f32, fire: bool, by: Option<i32>, griefing: bool) {
+    /// `ServerExplosion.explode`. `blocks`: None keeps the blocks, Some(decay)
+    /// destroys them, with drops decaying by 1 / radius when `decay`.
+    pub fn explode_full(&self, c: [f64; 3], power: f32, fire: bool, by: Option<i32>, blocks_mode: Option<bool>) {
         let mut rng = rand::thread_rng();
         let get = |x: i32, y: i32, z: i32| self.world.get_block(x, y, z);
-        let hit = if griefing { mob::explosion_blocks(c, power, &get, &mut rng) } else { Vec::new() };
+        let hit = if blocks_mode.is_some() { mob::explosion_blocks(c, power, &get, &mut rng) } else { Vec::new() };
+        let griefing = blocks_mode.is_some();
         let n = hit.len();
+        // interactWithBlocks: collect the drops (merged), clear the blocks, then pop them
+        let radius = if blocks_mode == Some(true) { Some(power) } else { None };
+        let mut stacks: Vec<(Stack, [i32; 3])> = Vec::new();
         for p in &hit {
-            let drops = rng.r#gen::<f32>() < 1.0 / power;
-            self.change_block(*p, blocks::AIR, drops, None);
+            let Some(state) = self.world.get_block(p[0], p[1], p[2]) else { continue };
+            if state.is_air() {
+                continue;
+            }
+            for st in self.data.explosion_drops(state, radius, &mut rng) {
+                // Explosion.addOrAppendStack
+                let mut st = st;
+                for (have, _) in stacks.iter_mut() {
+                    if have.same(&st) && have.count < have.max() {
+                        let moved = (have.max() - have.count).min(st.count);
+                        have.count += moved;
+                        st.count -= moved;
+                        if st.count == 0 {
+                            break;
+                        }
+                    }
+                }
+                if st.count > 0 {
+                    stacks.push((st, *p));
+                }
+            }
+            self.change_block(*p, blocks::AIR, false, None);
+        }
+        for (st, p) in stacks {
+            // Block.popResource
+            let pos = [p[0] as f64 + 0.5 + rng.gen_range(-0.25..0.25), p[1] as f64 + 0.5 - 0.125 + rng.gen_range(-0.25..0.25), p[2] as f64 + 0.5 + rng.gen_range(-0.25..0.25)];
+            self.spawn_item(pos, st, [rng.gen_range(-0.1..0.1), 0.2, rng.gen_range(-0.1..0.1)], 10);
         }
         if fire {
             for p in &hit {
@@ -1935,4 +1965,19 @@ pub fn state_id(s: BlockState) -> i32 {
 
 fn dist2(a: [f64; 3], b: [f64; 3]) -> f64 {
     (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exposure_on_flat_ground() {
+        crate::registry::BlockRegistry::get();
+        let stone = blocks::STONE;
+        let get = move |_x: i32, y: i32, _z: i32| Some(if y < 64 { stone } else { blocks::AIR });
+        let bb = Aabb::entity([2.5, 64.0, 1.5], 0.6, 1.8);
+        let e = exposure(&get, [0.5, 64.0, 0.5], &bb);
+        assert!(e > 0.99, "exposure {e}");
+    }
 }

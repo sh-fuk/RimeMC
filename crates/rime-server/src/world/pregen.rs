@@ -135,7 +135,7 @@ impl Pregen {
                             continue;
                         }
                         // isolate panics so a bad chunk can never kill the worker pool
-                        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| generator.generate_batch(&todo)));
+                        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| generator.generate_background(&todo)));
                         match res {
                             Ok(chunks) => chunks.into_iter().for_each(|c| sink(c)),
                             Err(_) => tracing::error!("pregen worker panicked on batch {todo:?}"),

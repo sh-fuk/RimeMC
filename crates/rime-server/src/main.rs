@@ -463,7 +463,7 @@ fn tick_loop(state: Arc<ServerState>) {
             if plugins::active() {
                 plugins::tick();
             }
-            let mut s = sched.tick(&state.cfg.level_tick);
+            let mut s = game::tick_pool().install(|| sched.tick(&state.cfg.level_tick));
             s.mspt += t.elapsed().as_secs_f64() * 1000.0;
             s
         }));

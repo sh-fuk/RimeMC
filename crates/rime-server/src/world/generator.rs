@@ -176,6 +176,9 @@ pub struct Generator {
     #[cfg(feature = "gpu")]
     gpu: Option<super::gpu::GpuHeights>,
     min_gpu_batch: usize,
+    /// chunk requests from players in progress; background generation waits
+    /// for them
+    urgent: std::sync::atomic::AtomicUsize,
 }
 
 impl Generator {
@@ -189,14 +192,14 @@ impl Generator {
                 None if use_gpu => tracing::info!("no usable GPU found; world generation runs on all CPU cores"),
                 None => {}
             }
-            Self { seed, vanilla: None, gpu, min_gpu_batch }
+            Self { seed, vanilla: None, gpu, min_gpu_batch, urgent: Default::default() }
         }
         #[cfg(not(feature = "gpu"))]
         {
             if use_gpu {
                 tracing::info!("built without the `gpu` feature; world generation runs on all CPU cores");
             }
-            Self { seed, vanilla: None, min_gpu_batch }
+            Self { seed, vanilla: None, min_gpu_batch, urgent: Default::default() }
         }
     }
 
@@ -234,6 +237,29 @@ impl Generator {
         } else {
             FAST_GEN
         }
+    }
+
+    /// `generate_batch` for chunks a player is waiting for: background
+    /// generation (`generate_background`) holds off meanwhile.
+    pub fn generate_urgent(&self, coords: &[(i32, i32)]) -> Vec<Chunk> {
+        use std::sync::atomic::Ordering;
+        struct Guard<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        self.urgent.fetch_add(1, Ordering::SeqCst);
+        let _g = Guard(&self.urgent);
+        self.generate_batch(coords)
+    }
+
+    /// `generate_batch` that first waits until no player request is in progress.
+    pub fn generate_background(&self, coords: &[(i32, i32)]) -> Vec<Chunk> {
+        while self.urgent.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        self.generate_batch(coords)
     }
 
     /// Generate many chunks at once (parallel / GPU-batched).

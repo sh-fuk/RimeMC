@@ -31,6 +31,16 @@ use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
 use rand::Rng;
 use rayon::prelude::*;
+
+/// Threads for work the game tick waits on (light updates), separate from the
+/// global pool that generates and loads chunks.
+pub fn tick_pool() -> &'static rayon::ThreadPool {
+    static P: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        let n = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) / 2).max(1);
+        rayon::ThreadPoolBuilder::new().num_threads(n).thread_name(|i| format!("rime-tickpool-{i}")).build().expect("tick pool")
+    })
+}
 use tokio::sync::mpsc;
 
 use crate::data::{GameData, Items, Stack};
@@ -78,6 +88,10 @@ impl World {
         Self { shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(), pending_fluid: Mutex::new(Vec::new()), light_dirty: Mutex::new(HashSet::new()) }
     }
 
+    pub fn is_loaded(&self, x: i32, z: i32) -> bool {
+        self.shards[shard(x, z)].lock().contains_key(&(x, z))
+    }
+
     pub fn loaded(&self) -> usize {
         self.shards.iter().map(|s| s.lock().len()).sum()
     }
@@ -106,7 +120,7 @@ impl World {
             })
             .collect();
         let to_gen: Vec<(i32, i32)> = loaded.iter().filter(|(_, c)| c.is_none()).map(|(k, _)| *k).collect();
-        let generated = if to_gen.is_empty() { Vec::new() } else { generator.generate_batch(&to_gen) };
+        let generated = if to_gen.is_empty() { Vec::new() } else { generator.generate_urgent(&to_gen) };
         let insert = |c: Chunk, dirty: bool| {
             let mut s = self.shards[shard(c.x, c.z)].lock();
             s.entry((c.x, c.z)).or_insert(Entry { chunk: c, dirty, viewers: 0, version: 0, packet: None, light: None });
@@ -215,6 +229,11 @@ impl World {
     /// Recompute the light of chunks changed since the last call (at most
     /// `max` of them, in parallel); returns `(chunk, light_update body)`.
     pub fn relight(&self, max: usize) -> Vec<((i32, i32), Vec<u8>)> {
+        // its own pool: on the global one the tick would wait behind world generation jobs
+        tick_pool().install(|| self.relight_inner(max))
+    }
+
+    fn relight_inner(&self, max: usize) -> Vec<((i32, i32), Vec<u8>)> {
         let todo: Vec<(i32, i32)> = {
             let mut d = self.light_dirty.lock();
             let v: Vec<(i32, i32)> = d.iter().copied().take(max).collect();

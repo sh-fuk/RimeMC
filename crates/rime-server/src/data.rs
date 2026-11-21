@@ -320,7 +320,7 @@ impl GameData {
         let key = strip(table);
         let Some(t) = self.loot.get(key) else { return Vec::new() };
         let mut out = Vec::new();
-        let ctx = LootCtx { block: crate::registry::blocks::AIR, tool: None, data: self, entity: None };
+        let ctx = LootCtx { block: crate::registry::blocks::AIR, tool: None, data: self, entity: None, explosion: None };
         self.eval_table(t, &ctx, rng, &mut out, 0);
         out
     }
@@ -330,7 +330,7 @@ impl GameData {
         let key = strip(table);
         let Some(t) = self.loot.get(key) else { return Vec::new() };
         let mut out = Vec::new();
-        let ctx = LootCtx { block: crate::registry::blocks::AIR, tool: None, data: self, entity: Some(e) };
+        let ctx = LootCtx { block: crate::registry::blocks::AIR, tool: None, data: self, entity: Some(e), explosion: None };
         self.eval_table(t, &ctx, rng, &mut out, 0);
         out
     }
@@ -472,13 +472,23 @@ impl GameData {
     }
 
     /// Items dropped when `block` is broken with `tool` (no enchantments).
+    /// Drops of a block an explosion destroyed (`Block.onExplosionHit`): no
+    /// tool, no harvest check; `radius` when the explosion decays drops.
+    pub fn explosion_drops(&self, block: BlockState, radius: Option<f32>, rng: &mut impl Rng) -> Vec<Stack> {
+        let Some(table) = self.loot.get(block.name()) else { return Vec::new() };
+        let mut out = Vec::new();
+        let ctx = LootCtx { block, tool: None, data: self, entity: None, explosion: radius };
+        self.eval_table(table, &ctx, rng, &mut out, 0);
+        out
+    }
+
     pub fn block_drops(&self, block: BlockState, tool: Option<i32>, rng: &mut impl Rng) -> Vec<Stack> {
         if !self.can_harvest(block, tool) {
             return Vec::new();
         }
         let Some(table) = self.loot.get(block.name()) else { return Vec::new() };
         let mut out = Vec::new();
-        let ctx = LootCtx { block, tool, data: self, entity: None };
+        let ctx = LootCtx { block, tool, data: self, entity: None, explosion: None };
         self.eval_table(table, &ctx, rng, &mut out, 0);
         // merge identical items, split by stack size
         let mut merged: Vec<Stack> = Vec::new();
@@ -566,6 +576,8 @@ struct LootCtx<'a> {
     tool: Option<i32>,
     data: &'a GameData,
     entity: Option<&'a EntityLoot>,
+    /// `EXPLOSION_RADIUS` of an explosion that decays drops
+    explosion: Option<f32>,
 }
 
 /// What an entity loot table can test about the dead mob and its killer.
@@ -638,7 +650,11 @@ fn conditions(v: &Value, ctx: &LootCtx, rng: &mut impl Rng) -> bool {
 fn condition(c: &Value, ctx: &LootCtx, rng: &mut impl Rng) -> bool {
     let terms = |c: &Value| c.get("terms").and_then(|t| t.as_array()).cloned().unwrap_or_default();
     match c.get("condition").and_then(|t| t.as_str()).unwrap_or("") {
-        "minecraft:survives_explosion" => true,
+        // ExplosionCondition: 1 / radius when the explosion decays drops
+        "minecraft:survives_explosion" => match ctx.explosion {
+            Some(r) => rng.r#gen::<f32>() <= 1.0 / r,
+            None => true,
+        },
         "minecraft:killed_by_player" => ctx.entity.is_none_or(|e| e.by_player),
         "minecraft:entity_properties" => {
             let Some(e) = ctx.entity else { return false };
@@ -849,6 +865,11 @@ fn int_number(v: &Value, rng: &mut impl Rng) -> i32 {
 
 fn apply_fn(f: &Value, count: i32, ctx: &LootCtx, rng: &mut impl Rng) -> i32 {
     match f.get("function").and_then(|x| x.as_str()).unwrap_or("") {
+        // ApplyExplosionDecay: each item survives with 1 / radius
+        "minecraft:explosion_decay" => match ctx.explosion {
+            Some(r) => (0..count).filter(|_| rng.r#gen::<f32>() <= 1.0 / r).count() as i32,
+            None => count,
+        },
         "minecraft:enchanted_count_increase" => {
             // EnchantedCountIncreaseFunction: + level * count, capped by limit
             let level = ctx.entity.map(|e| e.looting).unwrap_or(0);

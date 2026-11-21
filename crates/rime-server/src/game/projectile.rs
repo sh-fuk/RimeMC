@@ -633,7 +633,7 @@ impl Game {
                 if let Some(b) = block {
                     // onHitBlock
                     p.stuck = Some((b.block, b.state));
-                    let s = [e.vel[0].signum() * 0.05, e.vel[1].signum() * 0.05, e.vel[2].signum() * 0.05];
+                    let s = [crate::game::physics::jsign(e.vel[0]) * 0.05, crate::game::physics::jsign(e.vel[1]) * 0.05, crate::game::physics::jsign(e.vel[2]) * 0.05];
                     e.pos = [e.pos[0] - s[0], e.pos[1] - s[1], e.pos[2] - s[2]];
                     e.vel = [0.0; 3];
                     let mut rng = rand::thread_rng();

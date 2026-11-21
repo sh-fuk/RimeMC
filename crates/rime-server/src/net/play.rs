@@ -386,6 +386,10 @@ struct Session {
     queue: Vec<(i32, i32)>,
     in_flight: u32,
     chunks_per_tick: f32,
+    /// chunk packets being loaded/generated in the background
+    building: Option<tokio::task::JoinHandle<Vec<((i32, i32), Option<Arc<Vec<u8>>>)>>>,
+    /// death screen sent (until respawn)
+    death_shown: bool,
     tracked: HashMap<i32, u64>,
     pending_tp: Option<i32>,
     next_tp: i32,
@@ -435,6 +439,8 @@ impl Session {
             queue: Vec::new(),
             in_flight: 0,
             chunks_per_tick: 9.0,
+            building: None,
+            death_shown: false,
             tracked: HashMap::new(),
             pending_tp: None,
             next_tp: 1,
@@ -687,15 +693,31 @@ impl Session {
     }
 
     async fn pump_chunks(&mut self) {
+        // a build in progress never holds up this session (keep-alives,
+        // movement): its packets go out on the first tick after it is done
+        if let Some(h) = &self.building {
+            if !h.is_finished() {
+                return;
+            }
+            let h = self.building.take().expect("building");
+            let built = h.await.unwrap_or_default();
+            self.send_built(built);
+        }
         if self.queue.is_empty() || self.in_flight >= 4 {
             return;
         }
         let limits = self.budget.limits(&self.st.cfg.player_cost, self.base_view as u32);
-        let n = (self.chunks_per_tick.ceil() as usize).clamp(1, 64).min(limits.chunk_sends_per_tick.max(1) as usize * 4);
+        let mut n = (self.chunks_per_tick.ceil() as usize).clamp(1, 64).min(limits.chunk_sends_per_tick.max(1) as usize * 4);
+        let world = &self.st.game.world;
         let mut batch = Vec::with_capacity(n);
         while batch.len() < n {
             let Some(c) = self.queue.pop() else { break };
             if self.in_view(c, self.center, self.view) && !self.sent.contains(&c) {
+                // chunks still to be generated go out in small batches so the
+                // nearest ones show up first
+                if n > 9 && (-1..=1).any(|dx| (-1..=1).any(|dz| !world.is_loaded(c.0 + dx, c.1 + dz))) {
+                    n = 9;
+                }
                 batch.push(c);
             }
         }
@@ -707,7 +729,7 @@ impl Session {
         // load/generate (with neighbours: a chunk's light depends on its 3x3
         // neighbourhood) and build the packets on the blocking pool, in
         // parallel, so this player's packets keep flowing meanwhile
-        let built = tokio::task::spawn_blocking(move || {
+        self.building = Some(tokio::task::spawn_blocking(move || {
             let mut all: Vec<(i32, i32)> = coords.iter().flat_map(|&(x, z)| (-1..=1).flat_map(move |dx| (-1..=1).map(move |dz| (x + dx, z + dz)))).collect();
             all.sort_unstable();
             all.dedup();
@@ -736,10 +758,12 @@ impl Session {
                     (c, pkt)
                 })
                 .collect::<Vec<_>>()
-        })
-        .await
-        .unwrap_or_default();
-        let world = &self.st.game.world;
+        }));
+    }
+
+    fn send_built(&mut self, built: Vec<((i32, i32), Option<Arc<Vec<u8>>>)>) {
+        let st = self.st.clone();
+        let world = &st.game.world;
         self.send("chunk_batch_start", &[]);
         let mut count = 0;
         for (c, pkt) in built {
@@ -978,9 +1002,12 @@ impl Session {
     }
 
     fn die(&mut self, src: DamageSource) {
-        if self.me.vit.lock().living.dead {
+        // `Living::die` has usually marked the player dead already (damage
+        // dealt by the game); the death screen is sent once either way
+        if self.death_shown {
             return;
         }
+        self.death_shown = true;
         let credit = {
             let v = self.me.vit.lock();
             v.living.last_hurt_by_player.or(v.living.last_hurt_by_mob).map(|c| c.0)
@@ -1039,6 +1066,7 @@ impl Session {
             return;
         }
         self.me.vit.lock().respawn();
+        self.death_shown = false;
         let st = self.st.clone();
         let cd = &st.config_data;
         let gm = self.gamemode();
