@@ -4,6 +4,7 @@
 //! cores never contend. Each loaded chunk caches its encoded network packet,
 //! so sending a chunk to N players costs one serialisation, not N.
 
+pub mod ai;
 pub mod blockentity;
 pub mod combat;
 pub mod consume;
@@ -15,9 +16,10 @@ pub mod etypes;
 pub mod hurt;
 pub mod weather;
 pub mod mob;
-mod mobtick;
+pub mod mobtick;
 pub mod entity;
 pub mod fluid;
+pub mod interact;
 pub mod inventory;
 pub mod playerdata;
 pub mod survival;
@@ -1081,7 +1083,7 @@ impl Game {
         {
             let mut ents = self.entities.lock();
             for e in ents.values_mut() {
-                if matches!(e.kind, EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. }) {
+                if matches!(e.kind, EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. } | EKind::Fangs { .. }) {
                     continue;
                 }
                 let old_chunk = e.chunk();
@@ -1105,7 +1107,7 @@ impl Game {
                             continue;
                         }
                     }
-                    EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. } => {}
+                    EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. } | EKind::Fangs { .. } => {}
                     EKind::Falling { state } => {
                         if ground || e.age > 600 {
                             landed.push(([e.pos[0].floor() as i32, e.pos[1].round() as i32, e.pos[2].floor() as i32], *state));

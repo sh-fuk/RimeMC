@@ -31,6 +31,16 @@ pub enum PType {
     SplashPotion,
     LingeringPotion,
     XpBottle,
+    /// ghast fireball
+    LargeFireball,
+    /// blaze fireball
+    SmallFireball,
+    WitherSkull,
+    DragonFireball,
+    ShulkerBullet,
+    LlamaSpit,
+    /// breeze wind charge
+    WindCharge,
 }
 
 impl PType {
@@ -45,7 +55,19 @@ impl PType {
             PType::SplashPotion => "splash_potion",
             PType::LingeringPotion => "lingering_potion",
             PType::XpBottle => "experience_bottle",
+            PType::LargeFireball => "fireball",
+            PType::SmallFireball => "small_fireball",
+            PType::WitherSkull => "wither_skull",
+            PType::DragonFireball => "dragon_fireball",
+            PType::ShulkerBullet => "shulker_bullet",
+            PType::LlamaSpit => "llama_spit",
+            PType::WindCharge => "breeze_wind_charge",
         }
+    }
+    /// `AbstractHurtingProjectile` (+ shulker bullets and llama spit, which
+    /// fly by their own rules)
+    pub fn is_hurting(self) -> bool {
+        matches!(self, PType::LargeFireball | PType::SmallFireball | PType::WitherSkull | PType::DragonFireball | PType::ShulkerBullet | PType::LlamaSpit | PType::WindCharge)
     }
     pub fn is_arrow(self) -> bool {
         matches!(self, PType::Arrow | PType::SpectralArrow | PType::Trident)
@@ -63,6 +85,10 @@ impl PType {
     pub fn size(self) -> (f64, f64) {
         match self {
             PType::Arrow | PType::SpectralArrow | PType::Trident => (0.5, 0.5),
+            PType::LargeFireball | PType::DragonFireball => (1.0, 1.0),
+            PType::SmallFireball | PType::WitherSkull => (0.3125, 0.3125),
+            PType::ShulkerBullet => (0.3125, 0.3125),
+            PType::WindCharge => (0.3125, 0.3125),
             _ => (0.25, 0.25),
         }
     }
@@ -114,6 +140,14 @@ pub struct Projectile {
     pub loyalty: u8,
     pub dealt_damage: bool,
     pub foil: bool,
+    /// homing target (shulker bullets)
+    pub target: Option<i32>,
+    /// `accelerationPower`
+    pub accel: f64,
+    /// `Arrow.addEffect`: extra effects (stray slowness, bogged poison...)
+    pub extra_effects: Vec<(Effect, i32, i32)>,
+    /// wither skulls: `setDangerous`
+    pub dangerous: bool,
 }
 
 impl Projectile {
@@ -140,6 +174,10 @@ impl Projectile {
             loyalty: 0,
             dealt_damage: false,
             foil: false,
+            target: None,
+            accel: 0.1,
+            extra_effects: Vec::new(),
+            dangerous: false,
         }
     }
 }
@@ -329,6 +367,8 @@ impl Game {
         }
         if p.ty.is_arrow() {
             self.tick_arrow_like(e, targets, acts)
+        } else if p.ty.is_hurting() {
+            self.tick_hurting(e, targets, acts)
         } else {
             self.tick_throwable(e, targets, acts)
         }
@@ -384,6 +424,86 @@ impl Game {
                 false
             }
         }
+    }
+
+    /// `AbstractHurtingProjectile.tick` / `ShulkerBullet.tick` / `LlamaSpit.tick`
+    fn tick_hurting(&self, e: &mut Entity, targets: &[Target], acts: &mut Vec<PAct>) -> bool {
+        let EKind::Projectile(p) = &mut e.kind else { return true };
+        let w = &self.world;
+        p.life += 1;
+        if p.life > 1200 && p.ty != PType::LlamaSpit || p.ty == PType::WindCharge && p.life > 100 {
+            return true;
+        }
+        if p.ty == PType::ShulkerBullet {
+            // ShulkerBullet: steer towards the target (simplified homing)
+            if let Some(t) = p.target.and_then(|t| targets.iter().find(|x| x.eid == t)) {
+                let c = [(t.bbox.min[0] + t.bbox.max[0]) / 2.0, (t.bbox.min[1] + t.bbox.max[1]) / 2.0, (t.bbox.min[2] + t.bbox.max[2]) / 2.0];
+                let d = [c[0] - e.pos[0], c[1] - e.pos[1], c[2] - e.pos[2]];
+                let l = len(d).max(1e-6);
+                for i in 0..3 {
+                    e.vel[i] = (e.vel[i] + (d[i] / l * 0.15 - e.vel[i]) * 0.2).clamp(-1.0, 1.0);
+                }
+            } else {
+                e.vel[1] -= 0.04;
+            }
+        }
+        let from = e.pos;
+        let mut to = [from[0] + e.vel[0], from[1] + e.vel[1], from[2] + e.vel[2]];
+        let block = physics::clip(w, from, to);
+        if let Some(b) = &block {
+            to = b.pos;
+        }
+        let (wd, h) = p.ty.size();
+        let sweep = Aabb::entity(from, wd, h).expand_towards(e.vel).inflate(1.0, 1.0, 1.0);
+        let mut hit: Option<(f64, i32, [f64; 3])> = None;
+        for t in targets {
+            if Some(t.eid) == p.owner && p.life < 30 || !t.bbox.intersects(&sweep) {
+                continue;
+            }
+            let bb = t.bbox.inflate(0.3, 0.3, 0.3);
+            let point = if bb.contains(from) { Some(from) } else { bb.clip(from, to).map(|c| c.0) };
+            if let Some(pt) = point {
+                let d = (pt[0] - from[0]).powi(2) + (pt[1] - from[1]).powi(2) + (pt[2] - from[2]).powi(2);
+                if hit.is_none_or(|h| d < h.0) {
+                    hit = Some((d, t.eid, pt));
+                }
+            }
+        }
+        match (hit, block) {
+            (Some((_, target, pt)), _) => {
+                acts.push(PAct::Land { eid: e.eid, proj: p.clone(), pos: pt, vel: e.vel, target: Some(target), block: None });
+                return true;
+            }
+            (None, Some(b)) => {
+                acts.push(PAct::Land { eid: e.eid, proj: p.clone(), pos: b.pos, vel: e.vel, target: None, block: Some(b) });
+                return true;
+            }
+            _ => {}
+        }
+        e.pos = to;
+        let in_water = w.get_block(e.pos[0].floor() as i32, e.pos[1].floor() as i32, e.pos[2].floor() as i32).is_some_and(vstate::is_water);
+        match p.ty {
+            PType::LlamaSpit => {
+                e.vel = [e.vel[0] * 0.99, e.vel[1] * 0.99 - 0.06, e.vel[2] * 0.99];
+                if in_water {
+                    return true;
+                }
+            }
+            PType::ShulkerBullet => {}
+            PType::WindCharge => {}
+            _ => {
+                let inertia = if in_water { 0.8 } else { 0.95 };
+                let l = len(e.vel);
+                let n = if l > 1e-7 { [e.vel[0] / l, e.vel[1] / l, e.vel[2] / l] } else { [0.0; 3] };
+                for i in 0..3 {
+                    e.vel[i] = (e.vel[i] + n[i] * p.accel) * inertia;
+                }
+            }
+        }
+        let (yaw, pitch) = rot_of(e.vel);
+        p.yaw = yaw;
+        p.pitch = pitch;
+        false
     }
 
     /// `AbstractArrow.tick` (+ `ThrownTrident.tick`)
@@ -730,6 +850,14 @@ impl Game {
             // doPostHurtEffects
             match p.ty {
                 PType::Arrow => {
+                    let extra = p.extra_effects.clone();
+                    if !extra.is_empty() {
+                        self.with_living(target, move |l, eq, body| {
+                            for (e, dur, amp) in extra {
+                                super::consume::apply_potion_effect(l, eq, body, e, dur, amp, 1.0, eid, &mut rand::thread_rng());
+                            }
+                        });
+                    }
                     let pot = p.item.patch().potion.clone();
                     if let Some(pot) = pot {
                         let scale = p.item.defaults().raw.get("potion_duration_scale").and_then(|s| s.as_f64()).unwrap_or(1.0) as f32;
@@ -821,6 +949,43 @@ impl Game {
                 PType::Egg | PType::EnderPearl => {
                     self.hurt_entity(t, &thrown(), 0.0);
                 }
+                PType::LargeFireball => {
+                    let s = DamageSource::indirect("fireball", me, owner);
+                    self.hurt_entity(t, &s, 6.0);
+                }
+                PType::SmallFireball => {
+                    let immune = self.victim_body(t).is_some_and(|b| super::etypes::EntityTypes::get().by_name(b.info.type_name).is_some_and(|i| i.fire_immune));
+                    if !immune {
+                        let s = DamageSource::indirect("fireball", me, owner);
+                        if self.hurt_entity(t, &s, 5.0) {
+                            self.ignite(t, 100);
+                        }
+                    }
+                }
+                PType::WitherSkull => {
+                    let s = DamageSource::indirect("wither_skull", me, owner);
+                    let dmg = if owner.is_some() { 8.0 } else { 5.0 };
+                    if self.hurt_entity(t, &s, dmg) {
+                        let secs = match self.difficulty() { 2 => 10, 3 => 40, _ => 0 };
+                        if secs > 0 {
+                            self.add_effect(t, super::combat::effects::Instance::new(super::combat::effects::Effect::Wither, secs * 20, 1));
+                        }
+                    }
+                }
+                PType::ShulkerBullet => {
+                    let s = DamageSource::indirect("mob_projectile", me, owner);
+                    if self.hurt_entity(t, &s, 4.0) {
+                        self.add_effect(t, super::combat::effects::Instance::new(super::combat::effects::Effect::Levitation, 200, 0));
+                    }
+                }
+                PType::LlamaSpit => {
+                    let s = DamageSource::indirect("spit", me, owner);
+                    self.hurt_entity(t, &s, 1.0);
+                }
+                PType::WindCharge => {
+                    let s = DamageSource::indirect("wind_charge", me, owner);
+                    self.hurt_entity(t, &s, 1.0);
+                }
                 _ => {}
             }
         }
@@ -832,7 +997,7 @@ impl Game {
                 if rng.gen_range(0..8) == 0 {
                     let n = if rng.gen_range(0..32) == 0 { 4 } else { 1 };
                     for _ in 0..n {
-                        self.spawn_mob(super::mob::MobType::Chicken, pos, false);
+                        self.spawn_mob(super::mob::MobType::CHICKEN, pos, false);
                     }
                 }
                 self.broadcast_chunk(c, &self.entity_event(eid, 3));
@@ -854,6 +1019,33 @@ impl Game {
                 }
             }
             PType::SplashPotion | PType::LingeringPotion => self.potion_land(eid, &p, pos, target, block, owner, rng),
+            PType::LargeFireball => {
+                self.explode_with_fire(pos, 1.0, true);
+            }
+            PType::WitherSkull => self.explode_with_fire(pos, 1.0, false),
+            PType::SmallFireball => {
+                if let Some(b) = block {
+                    let n = super::physics::face_normal(b.face);
+                    let q = [b.block[0] + n[0], b.block[1] + n[1], b.block[2] + n[2]];
+                    if self.world.get_block(q[0], q[1], q[2]).is_some_and(|s| s.is_air()) {
+                        if let Some(f) = crate::registry::BlockRegistry::get().state("fire", &[]) {
+                            self.change_block(q, f, false, None);
+                        }
+                    }
+                }
+            }
+            PType::ShulkerBullet => {
+                self.particles("minecraft:explosion", pos, 2, [0.2, 0.2, 0.2], 0.0);
+                self.play_sound("minecraft:entity.shulker_bullet.hit", 5, pos, 1.0, 1.0);
+            }
+            PType::WindCharge => self.wind_burst(pos, owner.map(|o| o.eid)),
+            PType::DragonFireball => {
+                // DragonFireball: a lingering cloud of dragon's breath (instant damage)
+                let mut c = Cloud { owner: p.owner, potion: Some("harming".into()), scale: 1.0, radius: 3.0, radius_on_use: 0.0, radius_per_tick: (7.0 - 3.0) / 600.0, duration: 600, wait_time: 0, reapplication_delay: 20, victims: Vec::new(), color: 0x9900ff };
+                c.radius_on_use = 0.0;
+                let eid = self.next_eid();
+                self.add_entity(Entity { eid, uuid: uuid::Uuid::new_v4(), kind: EKind::Cloud(Box::new(c)), pos, vel: [0.0; 3], on_ground: false, age: 0, synced: pos });
+            }
             PType::XpBottle => {
                 self.level_event(2002, [pos[0].floor() as i32, pos[1].floor() as i32, pos[2].floor() as i32], -13083194);
                 let xp = 3 + rng.gen_range(0..5) + rng.gen_range(0..5);
@@ -1088,6 +1280,38 @@ impl Game {
             vel = [vel[0] + motion[0], vel[1] + if on_ground { 0.0 } else { motion[1] }, vel[2] + motion[2]];
             self.launch(pr, eye, vel);
         }
+    }
+
+    /// A hurting projectile (fireball, skull, bullet, spit, wind charge)
+    /// fired by `owner` from `from` along `dir`.
+    pub fn mob_shoot(&self, ty: PType, owner: i32, from: [f64; 3], dir: [f64; 3], target: Option<i32>) -> i32 {
+        let item = match ty {
+            PType::LargeFireball | PType::SmallFireball => "fire_charge",
+            _ => "air",
+        };
+        let mut p = Projectile::new(ty, Some(owner), Stack::new(Items::get().id(item).unwrap_or(0), 1));
+        p.target = target;
+        let l = len(dir).max(1e-7);
+        let vel = match ty {
+            PType::LlamaSpit | PType::ShulkerBullet | PType::WindCharge => dir,
+            _ => [dir[0] / l * 0.1, dir[1] / l * 0.1, dir[2] / l * 0.1],
+        };
+        self.launch(p, from, vel)
+    }
+
+    /// `AbstractWindCharge.explode`: knocks back what is near (no block damage).
+    pub fn wind_burst(&self, c: [f64; 3], owner: Option<i32>) {
+        let area = Aabb { min: [c[0] - 2.4, c[1] - 2.4, c[2] - 2.4], max: [c[0] + 2.4, c[1] + 2.4, c[2] + 2.4] };
+        for (eid, pos) in self.living_in(&area) {
+            let d = [pos[0] - c[0], pos[1] + 0.9 - c[1], pos[2] - c[2]];
+            let l = len(d).max(0.1);
+            let k = (1.0 - l / 2.4).max(0.0) * 1.22;
+            if k > 0.0 && Some(eid) != owner || k > 0.0 {
+                self.push_entity(eid, [d[0] / l * k, d[1] / l * k + 0.1, d[2] / l * k]);
+            }
+        }
+        self.particles("minecraft:gust_emitter_small", c, 1, [0.0; 3], 0.0);
+        self.play_sound("minecraft:entity.breeze.wind_burst", 5, c, 1.0, 1.0);
     }
 
     /// Skeletons and other mobs shoot an arrow at a target point.

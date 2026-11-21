@@ -255,6 +255,14 @@ impl Map {
         }
     }
 
+    /// `getValue` without touching the cache (for `&self` callers).
+    pub fn peek(&self, a: Attr) -> f64 {
+        match self.get(a) {
+            Some(i) => i.cached.unwrap_or_else(|| calculate(a, i.base, &i.modifiers)),
+            None => a.default_value(),
+        }
+    }
+
     pub fn base(&self, a: Attr) -> f64 {
         self.get(a).map(|i| i.base).unwrap_or(a.default_value())
     }

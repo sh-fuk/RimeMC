@@ -14,6 +14,8 @@ pub enum EKind {
     Cloud(Box<super::projectile::Cloud>),
     /// `LightningBolt`
     Lightning { life: i32, flashes: i32, cause: Option<i32>, visual: bool, hit: Vec<i32> },
+    /// `EvokerFangs`
+    Fangs { owner: Option<i32>, warmup: i32, life: i32, sent: bool, yaw: f32 },
 }
 
 #[derive(Clone, Debug)]
@@ -40,7 +42,7 @@ impl Entity {
             EKind::Item { .. } => (0.125, 0.25),
             EKind::Falling { .. } => (0.49, 0.98),
             EKind::Mob(m) => {
-                let (w, h) = m.ty.size();
+                let (w, h) = m.ty.size_of(m);
                 (w / 2.0, h)
             }
             EKind::Projectile(p) => {
@@ -49,6 +51,7 @@ impl Entity {
             }
             EKind::Cloud(c) => (c.radius as f64, 0.5),
             EKind::Lightning { .. } => (0.0, 0.0),
+            EKind::Fangs { .. } => (0.25, 0.8),
         }
     }
 }

@@ -308,13 +308,13 @@ fn add_animals(c: &mut Chunk) {
     let (x0, z0) = (next(16) as usize, next(16) as usize);
     let top = c.heightmap[z0 * 16 + x0] as i32;
     let biome = c.biomes[(((top - MIN_Y) >> 4).max(0) as usize).min(c.biomes.len() - 1)][((((top - MIN_Y) >> 2) & 3) << 4 | ((z0 as i32 >> 2) & 3) << 2 | ((x0 as i32 >> 2) & 3)) as usize];
-    let list = crate::game::mob::creatures(names.get(biome as usize).map(|s| s.as_str()).unwrap_or(""));
+    let list = crate::data::biome_spawns(names.get(biome as usize).map(|s| s.as_str()).unwrap_or(""), "creature");
     let total: u32 = list.iter().map(|x| x.1).sum();
     if total == 0 {
         return;
     }
     let mut r = next(total);
-    let Some(&(ty, _)) = list.iter().find(|(_, w)| {
+    let Some((ty, _, min, max)) = list.iter().find(|(_, w, _, _)| {
         if r < *w {
             true
         } else {
@@ -324,13 +324,14 @@ fn add_animals(c: &mut Chunk) {
     }) else {
         return;
     };
-    for _ in 0..4 {
+    let count = *min + next(max.saturating_sub(*min) + 1);
+    for _ in 0..count {
         let (x, z) = (((x0 as i32 + next(9) as i32 - 4).clamp(0, 15)) as usize, ((z0 as i32 + next(9) as i32 - 4).clamp(0, 15)) as usize);
         let y = c.heightmap[z * 16 + x] as i32;
-        if y < MIN_Y || c.get(x, y, z).name() != "grass_block" || !c.get(x, y + 1, z).is_air() || !c.get(x, y + 2, z).is_air() {
+        if y < MIN_Y || !matches!(c.get(x, y, z).name(), "grass_block" | "snow_block" | "sand" | "mud" | "podzol" | "mycelium" | "coarse_dirt" | "dirt") || !c.get(x, y + 1, z).is_air() || !c.get(x, y + 2, z).is_air() {
             continue;
         }
-        c.gen_entities.push((ty.name().to_string(), [c.x * 16 + x as i32, y + 1, c.z * 16 + z as i32]));
+        c.gen_entities.push((ty.clone(), [c.x * 16 + x as i32, y + 1, c.z * 16 + z as i32]));
     }
 }
 

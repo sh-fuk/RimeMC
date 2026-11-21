@@ -226,6 +226,20 @@ impl BlockState {
     pub fn is_transparent(self) -> bool {
         !self.is_opaque()
     }
+    /// Default state of a block by name (air when unknown).
+    pub fn by_name(name: &str) -> BlockState {
+        BlockRegistry::get().by_name(name).map(|b| BlockState(b.default)).unwrap_or(BlockState(0))
+    }
+    /// This state with one property changed (unchanged when it has no such value).
+    pub fn with(self, key: &str, value: &str) -> BlockState {
+        BlockRegistry::get().with(self, key, value).unwrap_or(self)
+    }
+    pub fn prop(self, key: &str) -> Option<&'static str> {
+        BlockRegistry::get().property(self, key)
+    }
+    pub fn default_state(self) -> BlockState {
+        BlockState(BlockRegistry::get().block(self).default)
+    }
 }
 
 // ------------------------------------------------------------- registries

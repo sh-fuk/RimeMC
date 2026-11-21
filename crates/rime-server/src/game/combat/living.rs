@@ -115,6 +115,8 @@ pub struct Living {
     pub tick_count: i32,
     pub attack_ticker: i32,
     pub last_hurt_by_mob: Option<(i32, i32)>,
+    /// `lastHurtMob`: (eid, tick) of the last entity this one attacked
+    pub last_hurt_mob: Option<(i32, i32)>,
     pub last_hurt_by_player: Option<(i32, i32)>,
     pub last_damage: Option<(DamageSource, i32)>,
     pub events: Vec<Event>,
@@ -137,6 +139,7 @@ impl Living {
             tick_count: 0,
             attack_ticker: 0,
             last_hurt_by_mob: None,
+            last_hurt_mob: None,
             last_hurt_by_player: None,
             last_damage: None,
             events: Vec::new(),

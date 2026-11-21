@@ -110,6 +110,10 @@ pub struct GameData {
     pub item_tags: HashMap<String, HashSet<i32>>,
     /// block tags as sets of block names (without namespace)
     pub block_tags: HashMap<String, HashSet<String>>,
+    /// entity type tags as sets of type names (without namespace)
+    pub entity_tags: HashMap<String, HashSet<String>>,
+    /// natural spawns per biome: category -> [(type, weight, min, max)]
+    pub spawners: HashMap<String, HashMap<String, Vec<(String, u32, u32, u32)>>>,
     loot: HashMap<String, Value>,
     pub recipes: Vec<Recipe>,
     /// furnace / blast furnace / smoker / campfire recipes
@@ -178,11 +182,41 @@ pub(crate) fn load_tags(v: &VanillaData, dir: &str) -> anyhow::Result<HashMap<St
     Ok(out)
 }
 
+type SpawnerMap = HashMap<String, HashMap<String, Vec<(String, u32, u32, u32)>>>;
+static SPAWNERS: OnceLock<SpawnerMap> = OnceLock::new();
+
+/// The biome's spawn list for a category (`creature`, `monster`...): (type, weight, min, max).
+pub fn biome_spawns(biome: &str, category: &str) -> &'static [(String, u32, u32, u32)] {
+    SPAWNERS.get().and_then(|m| m.get(biome.trim_start_matches("minecraft:"))).and_then(|c| c.get(category)).map(|v| v.as_slice()).unwrap_or(&[])
+}
+
 impl GameData {
     pub fn load(v: &VanillaData) -> anyhow::Result<Self> {
         let items = Items::get();
         let item_tags = load_tags(v, "item")?.into_iter().map(|(k, names)| (k, names.iter().filter_map(|n| items.id(n)).collect())).collect();
         let block_tags = load_tags(v, "block")?;
+        let entity_tags = load_tags(v, "entity_type")?;
+        let mut spawners = HashMap::new();
+        for (key, path) in v.entries("worldgen/biome") {
+            let json: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+            let mut cats = HashMap::new();
+            if let Some(o) = json.get("spawners").and_then(|x| x.as_object()) {
+                for (cat, list) in o {
+                    let l: Vec<(String, u32, u32, u32)> = list
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|e| {
+                                    Some((strip(e.get("type")?.as_str()?).to_string(), e.get("weight")?.as_u64()? as u32, e.get("minCount").and_then(|x| x.as_u64()).unwrap_or(1) as u32, e.get("maxCount").and_then(|x| x.as_u64()).unwrap_or(1) as u32))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    cats.insert(cat.clone(), l);
+                }
+            }
+            spawners.insert(strip(&key).to_string(), cats);
+        }
         let mut loot = HashMap::new();
         for (key, path) in v.entries("loot_table/blocks") {
             let json: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
@@ -195,7 +229,8 @@ impl GameData {
                 loot.insert(format!("{dir}/{}", strip(&key)), json);
             }
         }
-        let mut d = GameData { item_tags, block_tags, loot, recipes: Vec::new(), cooking: Vec::new() };
+        let _ = SPAWNERS.set(spawners.clone());
+        let mut d = GameData { item_tags, block_tags, entity_tags, spawners, loot, recipes: Vec::new(), cooking: Vec::new() };
         for (_, path) in v.entries("recipe") {
             let json: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
             if let Some(r) = d.parse_recipe(&json) {
@@ -208,11 +243,15 @@ impl GameData {
     }
 
     pub fn empty() -> Self {
-        GameData { item_tags: HashMap::new(), block_tags: HashMap::new(), loot: HashMap::new(), recipes: Vec::new(), cooking: Vec::new() }
+        GameData { item_tags: HashMap::new(), block_tags: HashMap::new(), entity_tags: HashMap::new(), spawners: HashMap::new(), loot: HashMap::new(), recipes: Vec::new(), cooking: Vec::new() }
     }
 
     pub fn block_in(&self, tag: &str, block: &str) -> bool {
         self.block_tags.get(tag).is_some_and(|s| s.contains(block))
+    }
+
+    pub fn entity_in(&self, tag: &str, ty: &str) -> bool {
+        self.entity_tags.get(tag).is_some_and(|s| s.contains(ty))
     }
 
     pub fn item_in(&self, tag: &str, item: i32) -> bool {
@@ -281,7 +320,17 @@ impl GameData {
         let key = strip(table);
         let Some(t) = self.loot.get(key) else { return Vec::new() };
         let mut out = Vec::new();
-        let ctx = LootCtx { block: crate::registry::blocks::AIR, tool: None, data: self };
+        let ctx = LootCtx { block: crate::registry::blocks::AIR, tool: None, data: self, entity: None };
+        self.eval_table(t, &ctx, rng, &mut out, 0);
+        out
+    }
+
+    /// Rolls an entity loot table with the dead mob as `this`.
+    pub fn roll_entity_loot(&self, table: &str, e: &EntityLoot, rng: &mut impl Rng) -> Vec<Stack> {
+        let key = strip(table);
+        let Some(t) = self.loot.get(key) else { return Vec::new() };
+        let mut out = Vec::new();
+        let ctx = LootCtx { block: crate::registry::blocks::AIR, tool: None, data: self, entity: Some(e) };
         self.eval_table(t, &ctx, rng, &mut out, 0);
         out
     }
@@ -429,7 +478,7 @@ impl GameData {
         }
         let Some(table) = self.loot.get(block.name()) else { return Vec::new() };
         let mut out = Vec::new();
-        let ctx = LootCtx { block, tool, data: self };
+        let ctx = LootCtx { block, tool, data: self, entity: None };
         self.eval_table(table, &ctx, rng, &mut out, 0);
         // merge identical items, split by stack size
         let mut merged: Vec<Stack> = Vec::new();
@@ -479,11 +528,18 @@ impl GameData {
                 match pick.get("type").and_then(|t| t.as_str()) {
                     Some("minecraft:item") => {
                         let Some(item) = pick.get("name").and_then(|n| n.as_str()).and_then(|n| Items::get().id(n)) else { continue };
+                        let mut item = item;
                         let mut count: i32 = 1;
                         let fns = pool.get("functions").and_then(|f| f.as_array()).into_iter().flatten().chain(pick.get("functions").and_then(|f| f.as_array()).into_iter().flatten());
                         for f in fns {
                             if conditions(f, ctx, rng) {
-                                count = apply_fn(f, count, rng);
+                                if f.get("function").and_then(|x| x.as_str()) == Some("minecraft:furnace_smelt") {
+                                    if let Some(c) = self.cook(CookKind::Smelting, item) {
+                                        item = c.result.item;
+                                    }
+                                    continue;
+                                }
+                                count = apply_fn(f, count, ctx, rng);
                             }
                         }
                         let max = Items::get().max_stack(item) as i32;
@@ -509,6 +565,35 @@ struct LootCtx<'a> {
     block: BlockState,
     tool: Option<i32>,
     data: &'a GameData,
+    entity: Option<&'a EntityLoot>,
+}
+
+/// What an entity loot table can test about the dead mob and its killer.
+#[derive(Clone, Debug, Default)]
+pub struct EntityLoot {
+    /// the mob's type (`zombie`)
+    pub ty: String,
+    pub on_fire: bool,
+    pub baby: bool,
+    /// sheep wool colour name, when a sheep
+    pub sheep_color: Option<&'static str>,
+    pub sheared: bool,
+    pub slime_size: i32,
+    pub captain: bool,
+    /// a player killed it (or hurt it in the last 100 ticks)
+    pub by_player: bool,
+    /// looting level of the killer's weapon
+    pub looting: i32,
+    /// the attacker's type (`skeleton`) and frog variant
+    pub attacker: Option<String>,
+    pub attacker_variant: Option<String>,
+    /// the direct attacker (`fireball`, `arrow`)
+    pub direct: Option<String>,
+    /// damage type tags that hold (`is_lightning`, `is_projectile`)
+    pub source_tags: Vec<String>,
+    /// the direct attacker's weapon smelts loot (fire aspect)
+    pub smelts: bool,
+    pub vehicle: Option<String>,
 }
 
 fn expand<'v>(e: &'v Value, ctx: &LootCtx, rng: &mut impl Rng, out: &mut Vec<&'v Value>) -> bool {
@@ -554,15 +639,67 @@ fn condition(c: &Value, ctx: &LootCtx, rng: &mut impl Rng) -> bool {
     let terms = |c: &Value| c.get("terms").and_then(|t| t.as_array()).cloned().unwrap_or_default();
     match c.get("condition").and_then(|t| t.as_str()).unwrap_or("") {
         "minecraft:survives_explosion" => true,
-        // mob loot is rolled for kills; no looting / fire / baby state yet
-        "minecraft:killed_by_player" => true,
+        "minecraft:killed_by_player" => ctx.entity.is_none_or(|e| e.by_player),
+        "minecraft:entity_properties" => {
+            let Some(e) = ctx.entity else { return false };
+            let pred = c.get("predicate").cloned().unwrap_or(Value::Null);
+            match c.get("entity").and_then(|x| x.as_str()).unwrap_or("this") {
+                "this" => entity_matches(&pred, e, ctx),
+                "attacker" => e.attacker.as_deref().is_some_and(|a| type_matches(pred.get("type"), a, ctx) && pred.get("components").is_none()),
+                "direct_attacker" => {
+                    // fire aspect: equipment.mainhand smelts_loot
+                    pred.get("equipment").is_some() && e.smelts
+                }
+                _ => false,
+            }
+        }
+        "minecraft:damage_source_properties" => {
+            let Some(e) = ctx.entity else { return false };
+            let Some(pred) = c.get("predicate") else { return true };
+            if let Some(tags) = pred.get("tags").and_then(|t| t.as_array()) {
+                for t in tags {
+                    let id = t.get("id").and_then(|x| x.as_str()).map(strip).unwrap_or("");
+                    let expected = t.get("expected").and_then(|x| x.as_bool()).unwrap_or(true);
+                    if e.source_tags.iter().any(|s| s == id) != expected {
+                        return false;
+                    }
+                }
+            }
+            if let Some(d) = pred.get("direct_entity") {
+                if !e.direct.as_deref().is_some_and(|a| type_matches(d.get("type"), a, ctx)) {
+                    return false;
+                }
+            }
+            if let Some(src) = pred.get("source_entity") {
+                if !e.attacker.as_deref().is_some_and(|a| type_matches(src.get("type"), a, ctx)) {
+                    return false;
+                }
+                if let Some(v) = src.get("components").and_then(|c| c.get("minecraft:frog/variant")).and_then(|v| v.as_str()) {
+                    if e.attacker_variant.as_deref() != Some(strip(v)) {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
         "minecraft:random_chance" => {
             let p = c.get("chance").map(|x| number(x, rng)).unwrap_or(1.0).clamp(0.0, 1.0);
             rng.gen_bool(p)
         }
         "minecraft:random_chance_with_enchanted_bonus" => {
-            let p = c.get("unenchanted_chance").map(|x| number(x, rng)).unwrap_or(0.0).clamp(0.0, 1.0);
-            rng.gen_bool(p)
+            let level = ctx.entity.map(|e| e.looting).unwrap_or(0);
+            let p = if level > 0 {
+                // LevelBasedValue.linear: base + per_level_above_first * (level - 1)
+                let ec = c.get("enchanted_chance");
+                match ec {
+                    Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+                    Some(o) => o.get("base").and_then(|x| x.as_f64()).unwrap_or(0.0) + o.get("per_level_above_first").and_then(|x| x.as_f64()).unwrap_or(0.0) * (level - 1) as f64,
+                    None => 0.0,
+                }
+            } else {
+                c.get("unenchanted_chance").map(|x| number(x, rng)).unwrap_or(0.0)
+            };
+            rng.gen_bool(p.clamp(0.0, 1.0))
         }
         "minecraft:table_bonus" => {
             let p = c.get("chances").and_then(|x| x.as_array()).and_then(|a| a.first()).and_then(|x| x.as_f64()).unwrap_or(0.0);
@@ -616,6 +753,67 @@ fn condition(c: &Value, ctx: &LootCtx, rng: &mut impl Rng) -> bool {
     }
 }
 
+fn type_matches(t: Option<&Value>, ty: &str, ctx: &LootCtx) -> bool {
+    match t.and_then(|t| t.as_str()) {
+        None => true,
+        Some(t) => match t.strip_prefix('#') {
+            Some(tag) => ctx.data.entity_in(strip(tag), ty),
+            None => strip(t) == ty,
+        },
+    }
+}
+
+/// `EntityPredicate` against the dead mob.
+fn entity_matches(p: &Value, e: &EntityLoot, ctx: &LootCtx) -> bool {
+    if !type_matches(p.get("type"), &e.ty, ctx) {
+        return false;
+    }
+    if let Some(f) = p.get("flags") {
+        if f.get("is_on_fire").and_then(|x| x.as_bool()).is_some_and(|v| v != e.on_fire) {
+            return false;
+        }
+        if f.get("is_baby").and_then(|x| x.as_bool()).is_some_and(|v| v != e.baby) {
+            return false;
+        }
+    }
+    if let Some(v) = p.get("vehicle") {
+        if !e.vehicle.as_deref().is_some_and(|x| type_matches(v.get("type"), x, ctx)) {
+            return false;
+        }
+    }
+    if let Some(c) = p.get("components").and_then(|c| c.get("minecraft:sheep/color")).and_then(|x| x.as_str()) {
+        if e.sheep_color != Some(c) {
+            return false;
+        }
+    }
+    if let Some(ts) = p.get("type_specific") {
+        match ts.get("type").and_then(|x| x.as_str()).map(strip) {
+            Some("sheep") => {
+                if e.ty != "sheep" || ts.get("sheared").and_then(|x| x.as_bool()).is_some_and(|v| v != e.sheared) {
+                    return false;
+                }
+            }
+            Some("slime") => {
+                let ok = match ts.get("size") {
+                    Some(Value::Number(n)) => n.as_i64() == Some(e.slime_size as i64),
+                    Some(o) => o.get("min").and_then(|x| x.as_i64()).is_none_or(|m| e.slime_size as i64 >= m) && o.get("max").and_then(|x| x.as_i64()).is_none_or(|m| e.slime_size as i64 <= m),
+                    None => true,
+                };
+                if !ok {
+                    return false;
+                }
+            }
+            Some("raider") => {
+                if ts.get("is_captain").and_then(|x| x.as_bool()).is_some_and(|v| v != e.captain) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Number provider (constant, uniform, binomial).
 fn number(v: &Value, rng: &mut impl Rng) -> f64 {
     match v {
@@ -649,8 +847,23 @@ fn int_number(v: &Value, rng: &mut impl Rng) -> i32 {
     number(v, rng).round() as i32
 }
 
-fn apply_fn(f: &Value, count: i32, rng: &mut impl Rng) -> i32 {
+fn apply_fn(f: &Value, count: i32, ctx: &LootCtx, rng: &mut impl Rng) -> i32 {
     match f.get("function").and_then(|x| x.as_str()).unwrap_or("") {
+        "minecraft:enchanted_count_increase" => {
+            // EnchantedCountIncreaseFunction: + level * count, capped by limit
+            let level = ctx.entity.map(|e| e.looting).unwrap_or(0);
+            if level == 0 {
+                return count;
+            }
+            let per = f.get("count").map(|c| number(c, rng)).unwrap_or(0.0);
+            let mut n = count + (level as f64 * per).round() as i32;
+            if let Some(l) = f.get("limit").and_then(|l| l.as_i64()) {
+                if l > 0 {
+                    n = n.min(l as i32);
+                }
+            }
+            n
+        }
         "minecraft:set_count" => {
             let n = f.get("count").map(|c| int_number(c, rng)).unwrap_or(1);
             let add = f.get("add").and_then(|a| a.as_bool()).unwrap_or(false);

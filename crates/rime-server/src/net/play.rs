@@ -1322,6 +1322,20 @@ impl Session {
             self.st.game.send_inventory(&self.me);
         } else if pid == sb("player_input") {
             self.sneaking = r.u8()? & 0x20 != 0;
+        } else if pid == sb("interact") {
+            let target = r.varint()?;
+            let hand = r.varint()?;
+            // `Vec3.LP` location and the secondary-action flag follow
+            let near = {
+                let me = self.me.pose.lock().pos;
+                self.st.game.entity_box(target).is_some_and(|b| {
+                    let c = [me[0].clamp(b.min[0], b.max[0]), (me[1] + 1.62).clamp(b.min[1], b.max[1]), me[2].clamp(b.min[2], b.max[2])];
+                    (c[0] - me[0]).powi(2) + (c[1] - me[1] - 1.62).powi(2) + (c[2] - me[2]).powi(2) < 36.0
+                })
+            };
+            if near {
+                self.st.game.interact_mob(&self.me, target, hand);
+            }
         } else if pid == sb("attack") {
             let target = r.varint()?;
             if let Some(flow) = self.on_attack(target) {

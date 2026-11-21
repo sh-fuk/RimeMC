@@ -144,6 +144,7 @@ impl Game {
             EKind::Item { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "item", ..Default::default() } },
             EKind::Falling { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "falling_block", ..Default::default() } },
             EKind::Lightning { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "lightning_bolt", ..Default::default() } },
+            EKind::Fangs { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "evoker_fangs", ..Default::default() } },
         })
     }
 
@@ -209,7 +210,7 @@ impl Game {
                 eid,
                 info,
                 pos,
-                head_yaw: m.yaw,
+                head_yaw: m.mo.head_yaw,
                 velocity: vel,
                 player: None,
                 invulnerable: false,
@@ -401,26 +402,8 @@ impl Game {
                 Event::Damage { ty, causing, direct, pos } => {
                     let pkt = self.damage_event_packet(eid, ty, causing, direct, pos);
                     self.broadcast_chunk(chunk, &pkt);
-                    // passive mobs panic, hostile ones target the attacker
-                    if let Some(c) = causing {
-                        let mut ents = self.entities.lock();
-                        if let Some(e) = ents.get_mut(&eid) {
-                            if let EKind::Mob(m) = &mut e.kind {
-                                if m.ty.hostile() {
-                                    m.target = Some(c);
-                                } else {
-                                    m.panic = 100;
-                                }
-                                m.wander = None;
-                            }
-                        }
-                    } else if let Some(e) = self.entities.lock().get_mut(&eid) {
-                        if let EKind::Mob(m) = &mut e.kind {
-                            if !m.ty.hostile() {
-                                m.panic = 100;
-                            }
-                        }
-                    }
+                    // HurtByTargetGoal / PanicGoal read `last_hurt_by_mob`
+                    let _ = causing;
                 }
                 Event::Blocked => self.play_sound("minecraft:item.shield.block", 5, pos, 1.0, 1.0),
                 Event::VelocityChanged => {
@@ -430,17 +413,31 @@ impl Game {
                     }
                 }
                 Event::KnockAttacker { eid: a, power, xd, zd } => self.knockback_entity(a, power, xd, zd),
-                Event::ShieldDisabled { .. } | Event::Exhaustion(_) | Event::Eat(..) | Event::HealthChanged | Event::HurtSound => {}
+                Event::HurtSound => {
+                    let snd = {
+                        let ents = self.entities.lock();
+                        match ents.get(&eid).map(|e| &e.kind) {
+                            Some(EKind::Mob(m)) if m.death == 0 => Some((m.ty.hurt_sound(), m.ty.hostile(), m.is_baby())),
+                            _ => None,
+                        }
+                    };
+                    if let Some((name, hostile, baby)) = snd {
+                        let mut rng = rand::thread_rng();
+                        let pitch = (rng.r#gen::<f32>() - rng.r#gen::<f32>()) * 0.2 + if baby { 1.5 } else { 1.0 };
+                        self.play_sound(&name, if hostile { 5 } else { 6 }, pos, 1.0, pitch);
+                    }
+                }
+                Event::ShieldDisabled { .. } | Event::Exhaustion(_) | Event::Eat(..) | Event::HealthChanged => {}
                 Event::SlotChanged(_) => {}
                 Event::ItemBroken(slot, _) => self.broadcast_chunk(chunk, &self.entity_event(eid, break_event(slot))),
                 Event::Totem => self.broadcast_chunk(chunk, &self.entity_event(eid, 35)),
-                Event::Died(_) => {
+                Event::Died(src) => {
                     let mut ents = self.entities.lock();
                     if let Some(e) = ents.get_mut(&eid) {
                         if let EKind::Mob(m) = &mut e.kind {
                             if m.death == 0 {
                                 m.death = 1;
-                                loot = Some((m.ty, e.pos));
+                                loot = Some(src);
                                 let meta = self.mob_meta(eid, m);
                                 drop(ents);
                                 self.broadcast_chunk(chunk, &self.entity_event(eid, 3));
@@ -467,8 +464,8 @@ impl Game {
                 }
             }
         }
-        if let Some((ty, pos)) = loot {
-            self.mob_loot(ty, pos);
+        if let Some(src) = loot {
+            self.mob_died(eid, &src);
         }
     }
 
@@ -770,7 +767,7 @@ impl Game {
             let mut ents = self.entities.lock();
             let Some(e) = ents.get_mut(&mob_eid) else { return false };
             let EKind::Mob(m) = &mut e.kind else { return false };
-            (m.living.attrs.value(Attr::AttackDamage) as f32, m.eq[living::MAINHAND], m.yaw, m.living.attrs.value(Attr::AttackKnockback) as f32)
+            (m.living.attrs.value(Attr::AttackDamage) as f32, m.eq[living::MAINHAND], m.mo.yaw, m.living.attrs.value(Attr::AttackKnockback) as f32)
         };
         let mut rng = rand::thread_rng();
         let mut src = DamageSource::by("mob_attack", me);
