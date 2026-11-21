@@ -6,6 +6,8 @@
 
 pub mod blockentity;
 pub mod combat;
+pub mod consume;
+pub mod physics;
 pub mod etypes;
 pub mod hurt;
 pub mod weather;

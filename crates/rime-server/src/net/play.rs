@@ -1035,17 +1035,25 @@ impl Session {
         self.me.send(pkt);
     }
 
-    /// Starts eating the held food (`use_item`); true when it is food.
+    /// `Consumable.startConsuming` (`use_item`); true when the item is consumable.
     fn start_eating(&mut self, slot: usize) -> bool {
         let Some(held) = self.me.inv.lock().slots[slot] else { return false };
-        let name = Items::get().name(held.item).to_string();
-        let Some((_, _, ticks, always)) = survival::food(&name) else { return false };
+        let Some(c) = crate::game::consume::consumable(&held) else { return false };
         let gm = self.gamemode();
         let mut v = self.me.vit.lock();
-        if gm == 3 || (!always && v.food >= 20 && gm != 1) {
+        if gm == 3 || v.living.on_cooldown(held.item) {
             return true;
         }
-        v.eating = Some((slot as i32, self.tick, ticks));
+        // Player.canEat: invulnerable (creative) || can_always_eat || hungry
+        if let Some((_, _, always)) = crate::game::consume::food(&held) {
+            if !always && v.food >= 20 && gm != 1 {
+                return true;
+            }
+        }
+        v.eating = Some((slot as i32, self.tick, crate::game::consume::consume_ticks(c)));
+        let hand = if slot == 45 { 1 } else { 0 };
+        v.living.using = Some(crate::game::combat::living::UseItem { hand, item: held.item, elapsed: 0 });
+        v.data_dirty = true;
         true
     }
 
@@ -1054,31 +1062,51 @@ impl Session {
         if self.tick < start + ticks {
             return;
         }
-        self.me.vit.lock().eating = None;
+        {
+            let mut v = self.me.vit.lock();
+            v.eating = None;
+            v.living.using = None;
+            v.data_dirty = true;
+        }
         let slot = slot as usize;
         let Some(held) = self.me.inv.lock().slots[slot] else { return };
-        let items = Items::get();
-        let name = items.name(held.item).to_string();
-        let Some((n, s, _, _)) = survival::food(&name) else { return };
-        let gm = self.gamemode();
-        self.me.vit.lock().eat(n, s);
-        if gm != 1 {
-            let mut inv = self.me.inv.lock();
-            inv.consume(slot, 1);
-            if let Some(rest) = survival::food_remainder(&name).and_then(|r| items.id(r)) {
-                let st = Stack::new(rest, 1);
-                if inv.slots[slot].is_none() {
-                    inv.set(slot, Some(st));
-                } else if inv.add(st, self.me.held.load(Ordering::Relaxed) as i16) > 0 {
-                    drop(inv);
-                    self.throw(st, false);
-                }
-            }
+        if crate::game::consume::consumable(&held).is_none() {
+            return;
         }
+        let items = Items::get();
+        let gm = self.gamemode();
+        let st = self.st.clone();
+        // LivingEntity.completeUsingItem: entity event 9 to the user
         let mut b = Vec::new();
         b.i32(self.me.eid).u8(9);
         self.send("entity_event", &b);
-        self.st.game.flush_inventory(&self.me);
+        st.game.consume(&self.me, held);
+        // use_cooldown
+        if let Some(t) = crate::game::consume::use_cooldown(&held) {
+            {
+                let mut v = self.me.vit.lock();
+                let now = v.living.tick_count;
+                v.living.cooldowns.push((held.item, now, now + t));
+            }
+            let mut b = Vec::new();
+            b.str(&format!("minecraft:{}", items.name(held.item))).vi(t);
+            self.send("cooldown", &b);
+        }
+        // ItemStack.consume + use_remainder (ItemUtils.createFilledResult)
+        if gm != 1 {
+            let mut inv = self.me.inv.lock();
+            inv.consume(slot, 1);
+            if let Some(rest) = crate::game::consume::remainder(&held).and_then(|r| items.id(r.trim_start_matches("minecraft:"))) {
+                let rs = Stack::new(rest, 1);
+                if inv.slots[slot].is_none() {
+                    inv.set(slot, Some(rs));
+                } else if inv.add(rs, self.me.held.load(Ordering::Relaxed) as i16) > 0 {
+                    drop(inv);
+                    self.throw(rs, false);
+                }
+            }
+        }
+        st.game.flush_inventory(&self.me);
     }
 
     fn per_second(&mut self) {
