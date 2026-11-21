@@ -208,7 +208,7 @@ pub fn from_nbt(t: &Tag) -> Option<Saved> {
         saturation: num("foodSaturationLevel").unwrap_or(5.0).clamp(0.0, 20.0) as f32,
         exhaustion: num("foodExhaustionLevel").unwrap_or(0.0).clamp(0.0, 40.0) as f32,
         air: num("Air").unwrap_or(300.0).clamp(-20.0, 300.0) as i32,
-        fire: num("Fire").unwrap_or(0.0).max(-20.0) as i32,
+        fire: num("Fire").unwrap_or(-20.0).max(-20.0) as i32,
         fall_distance: num("fall_distance").or(num("FallDistance")).unwrap_or(0.0).clamp(0.0, 1.0e4),
         dead: health <= 0.0,
         xp: (num("XpLevel").unwrap_or(0.0).max(0.0) as i32, num("XpP").unwrap_or(0.0).clamp(0.0, 1.0) as f32, num("XpTotal").unwrap_or(0.0).max(0.0) as i32),

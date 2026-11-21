@@ -412,6 +412,8 @@ struct Session {
     last_y: f64,
     /// main hand item last tick (`Player.lastItemInMainHand`)
     last_main: Option<i32>,
+    /// position at the previous vitals tick (sweet berry bush movement test)
+    last_tick_pos: [f64; 3],
     was_on_ground: bool,
 }
 
@@ -456,6 +458,7 @@ impl Session {
             arrived_ms: 0,
             last_y: p[1],
             last_main: None,
+            last_tick_pos: [0.0; 3],
             was_on_ground: false,
         }
     }
@@ -814,11 +817,24 @@ impl Session {
         let at = |dy: f64| w.get_block(pose.pos[0].floor() as i32, (pose.pos[1] + dy).floor() as i32, pose.pos[2].floor() as i32).unwrap_or(blocks::AIR);
         let water = |s: BlockState| matches!(s.name(), "water" | "bubble_column" | "kelp" | "kelp_plant" | "seagrass" | "tall_seagrass") || reg.property(s, "waterlogged") == Some("true");
         let (feet, body, eyes) = (at(0.0), at(1.0), at(1.62));
+        let _ = (feet, body);
+        let bbox = crate::anticheat::combat::Aabb::entity(pose.pos, 0.6, if self.sneaking { 1.5 } else { 1.8 });
+        let inside = crate::game::hazards::inside(&|x, y, z| w.get_block(x, y, z), &bbox);
+        let below = w.get_block(pose.pos[0].floor() as i32, (pose.pos[1] - 0.2).floor() as i32, pose.pos[2].floor() as i32).unwrap_or(blocks::AIR);
+        let moving = {
+            let m = self.last_tick_pos;
+            (pose.pos[0] - m[0]).abs() >= 0.003 || (pose.pos[2] - m[2]).abs() >= 0.003
+        };
+        let freeze_immune = {
+            let inv = self.me.inv.lock();
+            (5..9).any(|i| inv.slots[i].is_some_and(|st| crate::game::hazards::freeze_immune_wearable(Items::get().name(st.item))))
+        };
         Surroundings {
             eyes_in_water: water(eyes),
-            in_water: water(feet) || water(body),
-            in_lava: feet.name() == "lava" || body.name() == "lava",
-            in_fire: matches!(feet.name(), "fire" | "soul_fire") || matches!(body.name(), "fire" | "soul_fire"),
+            inside,
+            on_magma: pose.on_ground && crate::game::hazards::hot_floor(below, self.sneaking),
+            moving,
+            freeze_immune,
             bubble_column: eyes.name() == "bubble_column",
             y: pose.pos[1],
             min_y: MIN_Y,
@@ -870,14 +886,15 @@ impl Session {
             l.tick_effects(eq, body, &mut rand::thread_rng());
         });
         let s = self.surroundings();
+        self.last_tick_pos = self.me.pose.lock().pos;
         let hits = self.me.vit.lock().tick(&s);
         for (src, amount) in hits {
             self.damage(src, amount);
         }
         self.finish_eating();
-        let (dirty, data_dirty, health, food, sat, air, fire, absorption, using) = {
+        let (dirty, data_dirty, health, food, sat, air, fire, absorption, using, frozen) = {
             let mut v = self.me.vit.lock();
-            let d = (v.dirty, v.data_dirty, v.living.health, v.food, v.saturation, v.air, v.fire, v.living.absorption, v.living.using);
+            let d = (v.dirty, v.data_dirty, v.living.health, v.food, v.saturation, v.air, v.fire, v.living.absorption, v.living.using, v.frozen);
             v.dirty = false;
             v.data_dirty = false;
             d
@@ -891,7 +908,7 @@ impl Session {
             let flags = (fire > 0) as u8 | if self.sneaking { 0x02 } else { 0 } | if self.sprinting { 0x08 } else { 0 } | if self.gliding { 0x80 } else { 0 };
             let living_flags = using.map(|u| 1 | if u.hand == 1 { 2 } else { 0 }).unwrap_or(0);
             let mut b = Vec::new();
-            b.vi(self.me.eid).u8(0).vi(0).u8(flags).u8(1).vi(1).vi(air);
+            b.vi(self.me.eid).u8(0).vi(0).u8(flags).u8(1).vi(1).vi(air).u8(7).vi(1).vi(frozen);
             b.u8(8).vi(0).u8(living_flags);
             b.u8(17).vi(3).f32(absorption);
             b.u8(0xff);
@@ -1397,8 +1414,8 @@ impl Session {
         self.last_y = to[1];
         let gm = self.gamemode();
         let below = self.st.game.world.get_block(to[0].floor() as i32, (to[1] - 0.2).floor() as i32, to[2].floor() as i32).unwrap_or(blocks::AIR);
-        let mult = survival::landing_multiplier(below.name(), self.sneaking);
-        let reset = ctx.in_liquid || ctx.climbing || ctx.in_web_or_powder_snow || (self.gliding && dy > -0.5) || (on_ground && mult.is_none());
+        let landing = crate::game::hazards::landing(below, self.sneaking);
+        let reset = ctx.in_liquid || ctx.climbing || ctx.in_web_or_powder_snow || (self.gliding && dy > -0.5) || (on_ground && landing.is_none());
         // Entity flags used by the attack code (crit / sweep conditions)
         let f = if self.sneaking { F_SNEAKING } else { 0 }
             | if self.sprinting { F_SPRINTING } else { 0 }
@@ -1410,9 +1427,10 @@ impl Session {
             let (mx, mz) = (to[0] - from[0], to[2] - from[2]);
             *self.me.known_speed_sq.lock() = mx * mx + mz * mz;
         }
-        let hit = self.me.vit.lock().on_move(dy, on_ground, reset, mult.unwrap_or(1.0), gm);
+        let (mult, extra, ty) = landing.unwrap_or((1.0, 0.0, "fall"));
+        let hit = self.me.vit.lock().on_move(dy, on_ground, reset, (mult, extra), gm);
         if let Some(d) = hit {
-            self.damage(DamageSource::new("fall"), d);
+            self.damage(DamageSource::new(ty), d);
         }
         // Player.checkMovementStatistics / jumpFromGround
         let (dx, dz) = (to[0] - from[0], to[2] - from[2]);

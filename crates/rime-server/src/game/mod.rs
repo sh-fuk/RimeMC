@@ -7,6 +7,7 @@
 pub mod blockentity;
 pub mod combat;
 pub mod consume;
+pub mod hazards;
 pub mod physics;
 pub mod projectile;
 pub mod etypes;
