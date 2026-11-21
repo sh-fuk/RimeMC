@@ -724,6 +724,8 @@ impl Session {
                         let around: Vec<Option<Chunk>> = (0..9).map(|i| if i == 4 { None } else { world.chunk_copy(c.0 + i / 3 - 1, c.1 + i % 3 - 1) }).collect();
                         let refs: [Option<&Chunk>; 9] = std::array::from_fn(|i| if i == 4 { Some(chunk) } else { around[i].as_ref() });
                         let light = crate::world::light::compute(&refs);
+                        let light = std::sync::Arc::new(light);
+                        world.store_light(c, light.clone());
                         if xray_on {
                             let safe = xray::obfuscate(chunk, xray_mode, seed, &|x, y, z| world.get_block(x, y, z));
                             chunk_body(&safe, &light)

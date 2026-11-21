@@ -8,6 +8,7 @@ pub mod blockentity;
 pub mod combat;
 pub mod consume;
 pub mod hazards;
+pub mod randomtick;
 pub mod physics;
 pub mod projectile;
 pub mod etypes;
@@ -50,6 +51,8 @@ struct Entry {
     version: u64,
     /// encoded `level_chunk_with_light` body (invalidated on change)
     packet: Option<Arc<Vec<u8>>>,
+    /// last computed light (random ticks, spawning)
+    light: Option<Arc<crate::world::light::ChunkLight>>,
 }
 
 pub struct World {
@@ -104,7 +107,7 @@ impl World {
         let generated = if to_gen.is_empty() { Vec::new() } else { generator.generate_batch(&to_gen) };
         let insert = |c: Chunk, dirty: bool| {
             let mut s = self.shards[shard(c.x, c.z)].lock();
-            s.entry((c.x, c.z)).or_insert(Entry { chunk: c, dirty, viewers: 0, version: 0, packet: None });
+            s.entry((c.x, c.z)).or_insert(Entry { chunk: c, dirty, viewers: 0, version: 0, packet: None, light: None });
         };
         for (_, c) in loaded {
             if let Some(c) = c {
@@ -163,6 +166,13 @@ impl World {
         Some(e.chunk.get((x & 15) as usize, y, (z & 15) as usize))
     }
 
+    /// Several blocks of one chunk under a single lock (random tick sampling).
+    pub fn blocks_in_chunk(&self, cx: i32, cz: i32, at: &[[i32; 3]]) -> Option<Vec<BlockState>> {
+        let s = self.shards[shard(cx, cz)].lock();
+        let e = s.get(&(cx, cz))?;
+        Some(at.iter().map(|p| e.chunk.get((p[0] & 15) as usize, p[1], (p[2] & 15) as usize)).collect())
+    }
+
     /// Change a block; returns the previous state (None when the chunk is not loaded
     /// or y is out of range).
     pub fn set_block(&self, x: i32, y: i32, z: i32, b: BlockState) -> Option<BlockState> {
@@ -216,13 +226,40 @@ impl World {
                 let around: Vec<Option<Chunk>> = (0..9).map(|i| self.chunk_copy(cx + i / 3 - 1, cz + i % 3 - 1)).collect();
                 around[4].as_ref()?;
                 let refs: [Option<&Chunk>; 9] = std::array::from_fn(|i| around[i].as_ref());
-                let light = crate::world::light::compute(&refs);
+                let light = Arc::new(crate::world::light::compute(&refs));
+                self.store_light((cx, cz), light.clone());
                 let mut b = Vec::with_capacity(8 * 1024);
                 b.vi(cx).vi(cz);
                 crate::net::play::light_data(&mut b, &light);
                 Some(((cx, cz), b))
             })
             .collect()
+    }
+
+    /// Keep a chunk's computed light.
+    pub fn store_light(&self, c: (i32, i32), l: Arc<crate::world::light::ChunkLight>) {
+        if let Some(e) = self.shards[shard(c.0, c.1)].lock().get_mut(&c) {
+            e.light = Some(l);
+        }
+    }
+
+    /// (sky, block) light at a block; sky falls back to the heightmap when
+    /// the chunk's light was never computed.
+    pub fn light_at(&self, x: i32, y: i32, z: i32) -> Option<(u8, u8)> {
+        let s = self.shards[shard(x >> 4, z >> 4)].lock();
+        let e = s.get(&(x >> 4, z >> 4))?;
+        let sec = ((y - MIN_Y) >> 4) + 1;
+        match &e.light {
+            Some(l) if sec >= 0 && (sec as usize) < l.sky.len() => {
+                let i = (((y & 15) << 8) | ((z & 15) << 4) | (x & 15)) as usize;
+                let nib = |a: &Option<Box<[u8; 2048]>>| a.as_ref().map(|a| (a[i >> 1] >> ((i & 1) * 4)) & 15).unwrap_or(0);
+                Some((nib(&l.sky[sec as usize]), nib(&l.block[sec as usize])))
+            }
+            _ => {
+                let top = e.chunk.heightmap[((z & 15) * 16 + (x & 15)) as usize] as i32;
+                Some((if y > top { 15 } else { 0 }, 0))
+            }
+        }
     }
 
     /// The block entity at `p` (vanilla NBT), if its chunk is loaded.
@@ -430,6 +467,8 @@ pub fn write_slot(b: &mut Vec<u8>, s: Option<Stack>) {
 pub enum TickKind {
     Fluid,
     Gravity,
+    /// `FireBlock.tick`
+    Fire,
 }
 
 #[derive(Default)]
@@ -616,6 +655,10 @@ impl Game {
             return Some(old);
         }
         self.broadcast_block(p[0], p[1], p[2], b);
+        if b.name() == "fire" && old.name() != "fire" {
+            // FireBlock.onPlace
+            self.schedule(p, TickKind::Fire, 30 + rand::thread_rng().gen_range(0..10));
+        }
         if drops {
             self.drop_loot(p, old, tool);
         }
@@ -994,6 +1037,11 @@ impl Game {
                         Flow { w: &mut GW(self), fluid: f }.tick(p);
                     }
                 }
+                TickKind::Fire => {
+                    if b.name() == "fire" {
+                        self.fire_tick(p, b);
+                    }
+                }
                 TickKind::Gravity => {
                     if is_gravity_block(b.name()) && p[1] > MIN_Y {
                         let below = self.world.get_block(p[0], p[1] - 1, p[2]);
@@ -1007,6 +1055,7 @@ impl Game {
             }
         }
         self.tick_weather();
+        self.random_ticks();
         self.tick_entities();
         self.tick_mobs();
         // light changed by block updates
