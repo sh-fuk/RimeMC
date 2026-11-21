@@ -23,11 +23,12 @@ pub(super) enum Act {
     Thunder { bolt: i32, cause: Option<i32>, area: Option<Aabb>, fire: Vec<[i32; 3]> },
     /// `Mob.doHurtTarget`
     MobAttack { mob: i32, target: i32 },
-    /// an arrow hit a living entity
-    ArrowHit { arrow: i32, owner: i32, target: i32, amount: f32, vel: [f64; 3], pos: [f64; 3] },
+    /// projectile / area effect cloud work
+    Proj(super::projectile::PAct),
     /// events of a mob's own `Living` (self damage, effects)
     MobEvents { eid: i32, chunk: (i32, i32), pos: [f64; 3], events: Vec<Event> },
-    Shoot { owner: i32, from: [f64; 3], vel: [f64; 3] },
+    /// a mob shoots an arrow at a point
+    Shoot { owner: i32, from: [f64; 3], target: [f64; 3] },
     Explode { pos: [f64; 3], power: f32, by: &'static str },
     Sound { name: &'static str, pos: [f64; 3], hostile: bool },
     Loot { ty: MobType, pos: [f64; 3] },
@@ -57,7 +58,7 @@ impl Game {
     pub fn kill_mobs(&self) -> usize {
         let gone: Vec<(i32, (i32, i32))> = {
             let mut ents = self.entities.lock();
-            let ids: Vec<(i32, (i32, i32))> = ents.values().filter(|e| matches!(e.kind, EKind::Mob(_) | EKind::Arrow { .. } | EKind::Lightning { .. })).map(|e| (e.eid, e.chunk())).collect();
+            let ids: Vec<(i32, (i32, i32))> = ents.values().filter(|e| matches!(e.kind, EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. })).map(|e| (e.eid, e.chunk())).collect();
             for (id, _) in &ids {
                 ents.remove(id);
             }
@@ -129,16 +130,7 @@ impl Game {
                 b.u8(0).u8(yaw).u8(yaw).vi(0);
                 vec![self.encode("add_entity", &b), self.mob_meta(e.eid, m)]
             }
-            EKind::Arrow { owner, .. } => {
-                let ty = regs.id("minecraft:entity_type", "minecraft:arrow").unwrap_or(0);
-                b.vi(e.eid).uuid(e.uuid).vi(ty).f64(e.pos[0]).f64(e.pos[1]).f64(e.pos[2]);
-                mob::write_lpvec(&mut b, e.vel);
-                let h = (e.vel[0] * e.vel[0] + e.vel[2] * e.vel[2]).sqrt();
-                let yaw = (e.vel[0].atan2(e.vel[2])).to_degrees() as f32;
-                let pitch = (e.vel[1].atan2(h)).to_degrees() as f32;
-                b.u8(mob::angle_byte(pitch)).u8(mob::angle_byte(yaw)).u8(0).vi(*owner);
-                vec![self.encode("add_entity", &b)]
-            }
+            EKind::Projectile(_) | EKind::Cloud(_) => self.projectile_spawn_packets(e),
             EKind::Lightning { .. } => {
                 let ty = regs.id("minecraft:entity_type", "minecraft:lightning_bolt").unwrap_or(0);
                 b.vi(e.eid).uuid(e.uuid).vi(ty).f64(e.pos[0]).f64(e.pos[1]).f64(e.pos[2]).u8(0).u8(0).u8(0).u8(0).vi(0);
@@ -200,10 +192,25 @@ impl Game {
             .filter(|p| !p.vit.lock().dead())
             .map(|p| (p.clone(), p.pose.lock().pos, p.gamemode.load(Ordering::Relaxed)))
             .collect();
+        let mut pacts: Vec<super::projectile::PAct> = Vec::new();
         {
             let mut ents = self.entities.lock();
+            // what projectiles and clouds can hit
+            let mut ptargets: Vec<super::projectile::Target> = targets
+                .iter()
+                .filter(|(_, _, gm)| *gm != 3)
+                .map(|(p, pos, gm)| super::projectile::Target { eid: p.eid, bbox: Aabb::entity(*pos, 0.6, 1.8), player: true, eye: [pos[0], pos[1] + 1.62, pos[2]], creative: *gm == 1 })
+                .collect();
+            for e in ents.values() {
+                if let EKind::Mob(m) = &e.kind {
+                    if m.death == 0 {
+                        let (half, h) = e.size();
+                        ptargets.push(super::projectile::Target { eid: e.eid, bbox: Aabb::entity(e.pos, half * 2.0, h), player: false, eye: [e.pos[0], e.pos[1] + h * 0.85, e.pos[2]], creative: false });
+                    }
+                }
+            }
             for e in ents.values_mut() {
-                if !matches!(e.kind, EKind::Mob(_) | EKind::Arrow { .. } | EKind::Lightning { .. }) {
+                if !matches!(e.kind, EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. }) {
                     continue;
                 }
                 let old_chunk = e.chunk();
@@ -213,7 +220,20 @@ impl Game {
                 e.age += 1;
                 let gone = match e.kind {
                     EKind::Mob(_) => self.tick_mob(e, &targets, day, now, &mut rng, &mut acts, &mut sends),
-                    EKind::Arrow { .. } => self.tick_arrow(e, &targets, &mut acts),
+                    EKind::Projectile(_) => {
+                        let before = match &e.kind {
+                            EKind::Projectile(p) => (p.in_ground, p.on_fire, p.crit),
+                            _ => (false, false, false),
+                        };
+                        let gone = self.tick_projectile(e, &ptargets, &mut pacts);
+                        if let EKind::Projectile(p) = &e.kind {
+                            if !gone && before != (p.in_ground, p.on_fire, p.crit) {
+                                sends.push((e.chunk(), self.projectile_meta(e.eid, p)));
+                            }
+                        }
+                        gone
+                    }
+                    EKind::Cloud(_) => self.tick_cloud(e, &ptargets, &mut pacts, &mut sends),
                     EKind::Lightning { .. } => self.tick_lightning(e, &mut rng, &mut acts),
                     _ => false,
                 };
@@ -241,6 +261,7 @@ impl Game {
                     e.synced = e.pos;
                     let (yaw, pitch) = match &e.kind {
                         EKind::Mob(m) => (m.yaw, 0.0),
+                        EKind::Projectile(p) => (p.yaw, p.pitch),
                         _ => {
                             let h = (e.vel[0] * e.vel[0] + e.vel[2] * e.vel[2]).sqrt();
                             (e.vel[0].atan2(e.vel[2]).to_degrees() as f32, e.vel[1].atan2(h).to_degrees() as f32)
@@ -277,27 +298,23 @@ impl Game {
                 Act::MobAttack { mob, target } => {
                     self.mob_attack(mob, target);
                 }
-                Act::ArrowHit { arrow, owner, target, amount, vel, pos } => {
-                    let aref = crate::game::combat::damage::EntityRef::new(arrow, "arrow", pos, false);
-                    let mut src = DamageSource::indirect("arrow", aref, self.entity_ref(owner));
-                    src.projectile = true;
-                    src.projectile_motion = Some(vel);
-                    if self.hurt_entity(target, &src, amount) {
-                        self.post_attack(target, &src, None);
-                    }
-                }
+                Act::Proj(p) => pacts.push(p),
                 Act::MobEvents { eid, chunk, pos, events } => self.mob_events(eid, chunk, pos, events),
                 Act::Thunder { bolt, cause, area, fire } => self.thunder(bolt, cause, area, fire),
-                Act::Shoot { owner, from, vel } => {
-                    let e = Entity { eid: self.next_eid(), uuid: uuid::Uuid::new_v4(), kind: EKind::Arrow { owner, damage: 2.0, stuck: 0 }, pos: from, vel, on_ground: false, age: 0, synced: from };
-                    self.add_entity(e);
-                    self.sound("minecraft:entity.skeleton.shoot", from, true, 1.0);
+                Act::Shoot { owner, from, target } => {
+                    // AbstractArrow.setBaseDamageFromMob(1.0) at the current difficulty
+                    let mut r = rand::thread_rng();
+                    let damage = 2.0 + self.difficulty() as f64 * 0.11 + 0.57425 * (r.r#gen::<f64>() - r.r#gen::<f64>());
+                    let unc = 14 - self.difficulty() * 4;
+                    self.mob_shoot_arrow(owner, from, target, 1.6, unc as f32, damage);
+                    self.play_sound("minecraft:entity.skeleton.shoot", 5, from, 1.0, 1.0 / (r.r#gen::<f32>() * 0.4 + 0.8));
                 }
                 Act::Explode { pos, power, by } => self.explode(pos, power, by),
                 Act::Sound { name, pos, hostile } => self.sound(name, pos, hostile, 1.0),
                 Act::Loot { ty, pos } => self.mob_loot(ty, pos),
             }
         }
+        self.projectile_acts(pacts);
         if now % 10 == 0 {
             self.natural_spawns(&targets, now, day);
         }
@@ -390,14 +407,7 @@ impl Game {
                     if sees && d < 15.0 && m.attack_cd == 0 {
                         m.attack_cd = 40;
                         let from = [e.pos[0], eye[1] - 0.1, e.pos[2]];
-                        let dx = tpos[0] - from[0];
-                        let dz = tpos[2] - from[2];
-                        let hd = (dx * dx + dz * dz).sqrt();
-                        let dy = tpos[1] + 1.8 / 3.0 - from[1] + hd * 0.2;
-                        let len = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-6);
-                        let spread = || rng_gauss(&mut rand::thread_rng()) * 0.0075 * 6.0;
-                        let vel = [(dx / len + spread()) * 1.6, (dy / len + spread()) * 1.6, (dz / len + spread()) * 1.6];
-                        acts.push(Act::Shoot { owner: e.eid, from, vel });
+acts.push(Act::Shoot { owner: e.eid, from, target: [tpos[0], tpos[1] + 1.8 / 3.0, tpos[2]] });
                     }
                 }
                 MobType::Creeper => {
@@ -549,44 +559,6 @@ impl Game {
             m.ambient = -80;
             acts.push(Act::Sound { name: ty.ambient_sound(), pos: e.pos, hostile: ty.hostile() });
         }
-        false
-    }
-
-    /// One arrow tick; true when the arrow is removed.
-    fn tick_arrow(&self, e: &mut Entity, targets: &[(Arc<Player>, [f64; 3], i32)], acts: &mut Vec<Act>) -> bool {
-        let EKind::Arrow { owner, damage, stuck } = &mut e.kind else { return true };
-        if *stuck > 0 {
-            *stuck += 1;
-            return *stuck > 1200;
-        }
-        if e.age > 1200 || e.pos[1] < (MIN_Y - 64) as f64 {
-            return true;
-        }
-        let speed = (e.vel[0] * e.vel[0] + e.vel[1] * e.vel[1] + e.vel[2] * e.vel[2]).sqrt();
-        let steps = (speed / 0.2).ceil().max(1.0) as i32;
-        for _ in 0..steps {
-            let next = [e.pos[0] + e.vel[0] / steps as f64, e.pos[1] + e.vel[1] / steps as f64, e.pos[2] + e.vel[2] / steps as f64];
-            for (p, pos, gm) in targets {
-                if p.eid == *owner && e.age < 5 || *gm == 3 {
-                    continue;
-                }
-                let bx = Aabb::entity(*pos, 0.6 + 0.3, 1.8 + 0.3);
-                if bx.distance_to(next) == 0.0 {
-                    let amount = (speed * *damage).clamp(0.0, i32::MAX as f64).ceil() as f32;
-                    acts.push(Act::ArrowHit { arrow: e.eid, owner: *owner, target: p.eid, amount, vel: e.vel, pos: next });
-                    return true;
-                }
-            }
-            if self.cell(next[0].floor() as i32, next[1].floor() as i32, next[2].floor() as i32) == Cell::Solid {
-                *stuck = 1;
-                e.vel = [0.0; 3];
-                return false;
-            }
-            e.pos = next;
-        }
-        e.vel[0] *= 0.99;
-        e.vel[1] = e.vel[1] * 0.99 - 0.05;
-        e.vel[2] *= 0.99;
         false
     }
 

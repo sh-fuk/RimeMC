@@ -8,8 +8,10 @@ pub enum EKind {
     Item { stack: Stack, pickup_delay: u32 },
     Falling { state: BlockState },
     Mob(Box<super::mob::Mob>),
-    /// shot arrow: shooter eid, base damage, ticks stuck in a block
-    Arrow { owner: i32, damage: f64, stuck: u32 },
+    /// arrows, tridents and thrown items
+    Projectile(Box<super::projectile::Projectile>),
+    /// `AreaEffectCloud`
+    Cloud(Box<super::projectile::Cloud>),
     /// `LightningBolt`
     Lightning { life: i32, flashes: i32, cause: Option<i32>, visual: bool, hit: Vec<i32> },
 }
@@ -41,7 +43,11 @@ impl Entity {
                 let (w, h) = m.ty.size();
                 (w / 2.0, h)
             }
-            EKind::Arrow { .. } => (0.25, 0.5),
+            EKind::Projectile(p) => {
+                let (w, h) = p.ty.size();
+                (w / 2.0, h)
+            }
+            EKind::Cloud(c) => (c.radius as f64, 0.5),
             EKind::Lightning { .. } => (0.0, 0.0),
         }
     }

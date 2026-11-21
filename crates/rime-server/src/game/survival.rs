@@ -23,6 +23,10 @@ pub struct Vitals {
     pub data_dirty: bool,
     /// (item, start tick, duration) while eating
     pub eating: Option<(i32, u64, u64)>,
+    pub xp_level: i32,
+    pub xp_progress: f32,
+    pub xp_total: i32,
+    pub xp_dirty: bool,
 }
 
 pub const MAX_AIR: i32 = 300;
@@ -38,6 +42,10 @@ impl Default for Vitals {
             air: MAX_AIR,
             fire: 0,
             fall_distance: 0.0,
+            xp_level: 0,
+            xp_progress: 0.0,
+            xp_total: 0,
+            xp_dirty: true,
             dirty: true,
             data_dirty: true,
             eating: None,
@@ -217,6 +225,39 @@ impl Vitals {
             self.fall_distance -= dy;
         }
         None
+    }
+
+    /// `Player.getXpNeededForNextLevel`
+    pub fn xp_needed(&self) -> i32 {
+        if self.xp_level >= 30 {
+            112 + (self.xp_level - 30) * 9
+        } else if self.xp_level >= 15 {
+            37 + (self.xp_level - 15) * 5
+        } else {
+            7 + self.xp_level * 2
+        }
+    }
+
+    /// `Player.giveExperiencePoints`
+    pub fn give_xp(&mut self, n: i32) {
+        self.xp_progress += n as f32 / self.xp_needed() as f32;
+        self.xp_total = (self.xp_total as i64 + n as i64).clamp(0, i32::MAX as i64) as i32;
+        while self.xp_progress < 0.0 {
+            let p = self.xp_progress * self.xp_needed() as f32;
+            if self.xp_level > 0 {
+                self.xp_level -= 1;
+                self.xp_progress = 1.0 + p / self.xp_needed() as f32;
+            } else {
+                self.xp_level = 0;
+                self.xp_progress = 0.0;
+            }
+        }
+        while self.xp_progress >= 1.0 {
+            self.xp_progress = (self.xp_progress - 1.0) * self.xp_needed() as f32;
+            self.xp_level += 1;
+            self.xp_progress /= self.xp_needed() as f32;
+        }
+        self.xp_dirty = true;
     }
 
     /// Back to full health at respawn (attributes reset, effects cleared).

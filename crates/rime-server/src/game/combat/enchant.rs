@@ -80,7 +80,7 @@ pub enum ValueEffect {
 }
 
 impl ValueEffect {
-    fn parse(v: &Value) -> ValueEffect {
+    pub fn parse(v: &Value) -> ValueEffect {
         let lv = |k: &str| LevelValue::parse(v.get(k).unwrap_or(&Value::Null));
         match v["type"].as_str().unwrap_or("").trim_start_matches("minecraft:") {
             "add" => ValueEffect::Add(lv("value")),
@@ -456,6 +456,10 @@ impl Enchantments {
     pub fn by(&self, name: &str) -> Option<&Enchantment> {
         self.by_name.get(name.trim_start_matches("minecraft:"))
     }
+}
+
+pub fn conditionals_pub(v: &Value) -> Vec<Conditional<ValueEffect>> {
+    conditionals(v)
 }
 
 fn conditionals(v: &Value) -> Vec<Conditional<ValueEffect>> {

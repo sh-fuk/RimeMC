@@ -32,6 +32,10 @@ pub struct Patch {
     pub custom_name: Option<String>,
     pub repair_cost: Option<i32>,
     pub unbreakable: bool,
+    /// `charged_projectiles`: (item, count, patch)
+    pub charged: Vec<(i32, u8, u32)>,
+    /// `intangible_projectile`: only picked up in creative
+    pub intangible: bool,
 }
 
 impl Patch {
@@ -286,6 +290,17 @@ pub fn write_patch(b: &mut Vec<u8>, comp: u32) {
         x.bool(true).vi(id + 1).bool(false).vi(0).bool(false);
         added.push((type_id("minecraft:potion_contents"), x));
     }
+    if p.intangible {
+        added.push((type_id("minecraft:intangible_projectile"), Vec::new()));
+    }
+    if !p.charged.is_empty() {
+        let mut x = Vec::new();
+        x.vi(p.charged.len() as i32);
+        for (item, count, comp) in &p.charged {
+            crate::game::write_slot(&mut x, Some(crate::data::Stack { item: *item, count: *count, comp: *comp }));
+        }
+        added.push((type_id("minecraft:charged_projectiles"), x));
+    }
     added.retain(|(id, _)| *id >= 0);
     b.vi(added.len() as i32).vi(0);
     for (id, data) in added {
@@ -380,6 +395,24 @@ pub fn to_nbt(comp: u32) -> Option<Tag> {
     if let Some(pot) = &p.potion {
         c.push(("minecraft:potion_contents".into(), Tag::Compound(vec![("potion".into(), Tag::String(format!("minecraft:{pot}")))])));
     }
+    if p.intangible {
+        c.push(("minecraft:intangible_projectile".into(), Tag::Compound(vec![])));
+    }
+    if !p.charged.is_empty() {
+        let items = crate::data::Items::get();
+        let list = p
+            .charged
+            .iter()
+            .map(|(item, count, comp)| {
+                let mut e = vec![("id".to_string(), Tag::String(format!("minecraft:{}", items.name(*item)))), ("count".to_string(), Tag::Int(*count as i32))];
+                if let Some(c) = to_nbt(*comp) {
+                    e.push(("components".to_string(), c));
+                }
+                Tag::Compound(e)
+            })
+            .collect();
+        c.push(("minecraft:charged_projectiles".into(), Tag::List(list)));
+    }
     Some(Tag::Compound(c))
 }
 
@@ -400,6 +433,16 @@ pub fn from_nbt(t: &Tag) -> u32 {
     p.stored_enchantments = ench(t.get("minecraft:stored_enchantments"));
     p.repair_cost = t.get("minecraft:repair_cost").and_then(|d| d.as_i64()).map(|d| d as i32);
     p.potion = t.get("minecraft:potion_contents").and_then(|pc| pc.get("potion").or(Some(pc))).and_then(|x| x.as_str()).map(|s| s.trim_start_matches("minecraft:").to_string());
+    p.intangible = t.get("minecraft:intangible_projectile").is_some();
+    if let Some(Tag::List(l)) = t.get("minecraft:charged_projectiles") {
+        let items = crate::data::Items::get();
+        for e in l {
+            let Some(id) = e.get("id").and_then(|i| i.as_str()).and_then(|n| items.id(n.trim_start_matches("minecraft:"))) else { continue };
+            let count = e.get("count").and_then(|c| c.as_i64()).unwrap_or(1).clamp(1, 99) as u8;
+            let comp = e.get("components").map(from_nbt).unwrap_or(0);
+            p.charged.push((id, count, comp));
+        }
+    }
     intern(p)
 }
 

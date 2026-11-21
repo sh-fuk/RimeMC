@@ -139,7 +139,8 @@ impl Game {
         let e = ents.get(&eid)?;
         Some(match &e.kind {
             EKind::Mob(m) => EntityRef { eid, player: false, living: true, pos: e.pos, info: mob_info(m, e.on_ground) },
-            EKind::Arrow { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "arrow", ..Default::default() } },
+            EKind::Projectile(p) => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: p.ty.entity_name(), ..Default::default() } },
+            EKind::Cloud(_) => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "area_effect_cloud", ..Default::default() } },
             EKind::Item { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "item", ..Default::default() } },
             EKind::Falling { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "falling_block", ..Default::default() } },
             EKind::Lightning { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "lightning_bolt", ..Default::default() } },
@@ -254,7 +255,7 @@ impl Game {
         self.encode("damage_event", &b)
     }
 
-    fn entity_event(&self, eid: i32, ev: u8) -> Arc<Vec<u8>> {
+    pub(crate) fn entity_event(&self, eid: i32, ev: u8) -> Arc<Vec<u8>> {
         let mut b = Vec::new();
         b.i32(eid).u8(ev);
         self.encode("entity_event", &b)
@@ -955,7 +956,7 @@ impl Game {
         }
         match self.entities.lock().get(&eid).map(|e| &e.kind) {
             Some(EKind::Mob(m)) => serde_json::json!({"translate": format!("entity.minecraft.{}", m.ty.name())}),
-            Some(EKind::Arrow { .. }) => serde_json::json!({"translate": "entity.minecraft.arrow"}),
+            Some(EKind::Projectile(p)) => serde_json::json!({"translate": format!("entity.minecraft.{}", p.ty.entity_name())}),
             _ => serde_json::json!({"translate": "entity.minecraft.player"}),
         }
     }

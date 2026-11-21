@@ -8,6 +8,7 @@ pub mod blockentity;
 pub mod combat;
 pub mod consume;
 pub mod physics;
+pub mod projectile;
 pub mod etypes;
 pub mod hurt;
 pub mod weather;
@@ -392,6 +393,11 @@ pub enum Request {
 }
 
 impl Player {
+    /// `Player.giveExperiencePoints`
+    pub fn give_xp(&self, n: i32) {
+        self.vit.lock().give_xp(n);
+    }
+
     /// Queue a packet; a client that cannot keep up is disconnected instead of
     /// letting its queue grow without bound.
     pub fn send(&self, pkt: Arc<Vec<u8>>) {
@@ -501,7 +507,7 @@ impl Game {
         self.players.read().len()
     }
 
-    fn next_eid(&self) -> i32 {
+    pub(crate) fn next_eid(&self) -> i32 {
         self.next_eid.fetch_add(1, Ordering::Relaxed)
     }
 
@@ -567,7 +573,7 @@ impl Game {
         }
     }
 
-    fn broadcast_chunk(&self, c: (i32, i32), pkt: &Arc<Vec<u8>>) {
+    pub(crate) fn broadcast_chunk(&self, c: (i32, i32), pkt: &Arc<Vec<u8>>) {
         for p in self.players.read().values() {
             if p.sees_chunk(c.0, c.1) {
                 p.send(pkt.clone());
@@ -838,7 +844,7 @@ impl Game {
     // ------------------------------------------------------------ entities
 
     fn spawn_packets(&self, e: &Entity) -> Vec<Arc<Vec<u8>>> {
-        if matches!(e.kind, EKind::Mob(_) | EKind::Arrow { .. } | EKind::Lightning { .. }) {
+        if matches!(e.kind, EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. }) {
             return self.mob_spawn_packets(e);
         }
         let regs = Registries::get();
@@ -864,7 +870,7 @@ impl Game {
         self.encode("set_entity_data", &b)
     }
 
-    fn remove_packet(&self, eids: &[i32]) -> Arc<Vec<u8>> {
+    pub(crate) fn remove_packet(&self, eids: &[i32]) -> Arc<Vec<u8>> {
         let mut b = Vec::new();
         b.vi(eids.len() as i32);
         for e in eids {
@@ -881,7 +887,7 @@ impl Game {
         self.add_entity(e);
     }
 
-    fn add_entity(&self, e: Entity) {
+    pub(crate) fn add_entity(&self, e: Entity) {
         let pkts = self.spawn_packets(&e);
         let c = e.chunk();
         self.entities.lock().insert(e.eid, e);
@@ -1025,7 +1031,7 @@ impl Game {
         {
             let mut ents = self.entities.lock();
             for e in ents.values_mut() {
-                if matches!(e.kind, EKind::Mob(_) | EKind::Arrow { .. } | EKind::Lightning { .. }) {
+                if matches!(e.kind, EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. }) {
                     continue;
                 }
                 let old_chunk = e.chunk();
@@ -1049,7 +1055,7 @@ impl Game {
                             continue;
                         }
                     }
-                    EKind::Mob(_) | EKind::Arrow { .. } | EKind::Lightning { .. } => {}
+                    EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. } => {}
                     EKind::Falling { state } => {
                         if ground || e.age > 600 {
                             landed.push(([e.pos[0].floor() as i32, e.pos[1].round() as i32, e.pos[2].floor() as i32], *state));

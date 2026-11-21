@@ -374,6 +374,8 @@ async fn reader_task<S: Io>(mut rd: tokio::io::ReadHalf<CryptStream<S>>, tx: mps
     }
 }
 
+mod ranged;
+
 struct Session {
     st: Arc<ServerState>,
     me: Arc<Player>,
@@ -829,6 +831,16 @@ impl Session {
         if self.me.vit.lock().dead() {
             return;
         }
+        self.tick_using();
+        let xp = {
+            let mut v = self.me.vit.lock();
+            std::mem::take(&mut v.xp_dirty).then_some((v.xp_progress, v.xp_level, v.xp_total))
+        };
+        if let Some((p, l, t)) = xp {
+            let mut b = Vec::new();
+            b.f32(p).vi(l).vi(t);
+            self.send("set_experience", &b);
+        }
         // LivingEntity.aiStep on the server: deltaMovement decays
         {
             let on_ground = self.me.pose.lock().on_ground;
@@ -1247,8 +1259,11 @@ impl Session {
         } else if pid == sb("set_carried_item") {
             let s = r.i16()?;
             if (0..9).contains(&s) {
-                self.me.held.store(s as i32, Ordering::Relaxed);
-                self.stop_using_item();
+                let changed = self.me.held.swap(s as i32, Ordering::Relaxed) != s as i32;
+                // ServerGamePacketListenerImpl.handleSetCarriedItem
+                if changed && self.me.vit.lock().living.using.is_some_and(|u| u.hand == 0) {
+                    self.stop_using_item();
+                }
             }
         } else if pid == sb("set_creative_mode_slot") {
             let slot = r.i16()?;
@@ -1695,6 +1710,7 @@ impl Session {
             }
             5 | 6 => {
                 if status == 5 {
+                    self.release_using();
                     self.stop_using_item();
                 }
                 self.ack(seq);
@@ -1889,6 +1905,9 @@ impl Session {
                 v.living.using = Some(crate::game::combat::living::UseItem { hand: hand as u8, item: held.item, elapsed: 0 });
                 v.data_dirty = true;
             }
+            return;
+        }
+        if self.use_ranged(hand, held) {
             return;
         }
         let items = Items::get();

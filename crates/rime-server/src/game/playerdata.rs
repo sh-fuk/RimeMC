@@ -31,6 +31,8 @@ pub struct Saved {
     pub fire: i32,
     pub fall_distance: f64,
     pub dead: bool,
+    /// (XpLevel, XpP, XpTotal)
+    pub xp: (i32, f32, i32),
 }
 
 pub fn path(world: &Path, uuid: uuid::Uuid) -> PathBuf {
@@ -124,6 +126,9 @@ pub fn to_nbt(p: &Player) -> Tag {
         ("AbsorptionAmount".into(), Tag::Float(v.living.absorption)),
         ("active_effects".into(), Tag::List(v.living.effects.iter().map(|e| e.to_nbt()).collect())),
         ("foodLevel".into(), Tag::Int(v.food)),
+        ("XpLevel".into(), Tag::Int(v.xp_level)),
+        ("XpP".into(), Tag::Float(v.xp_progress)),
+        ("XpTotal".into(), Tag::Int(v.xp_total)),
         ("foodSaturationLevel".into(), Tag::Float(v.saturation)),
         ("foodExhaustionLevel".into(), Tag::Float(v.exhaustion)),
         ("Air".into(), Tag::Short(v.air as i16)),
@@ -206,6 +211,7 @@ pub fn from_nbt(t: &Tag) -> Option<Saved> {
         fire: num("Fire").unwrap_or(0.0).max(-20.0) as i32,
         fall_distance: num("fall_distance").or(num("FallDistance")).unwrap_or(0.0).clamp(0.0, 1.0e4),
         dead: health <= 0.0,
+        xp: (num("XpLevel").unwrap_or(0.0).max(0.0) as i32, num("XpP").unwrap_or(0.0).clamp(0.0, 1.0) as f32, num("XpTotal").unwrap_or(0.0).max(0.0) as i32),
     })
 }
 
@@ -275,6 +281,7 @@ impl Saved {
         v.air = self.air;
         v.fire = self.fire;
         v.fall_distance = self.fall_distance;
+        (v.xp_level, v.xp_progress, v.xp_total) = self.xp;
         if self.dead {
             v.living.health = 0.0;
             v.living.dead = true;
