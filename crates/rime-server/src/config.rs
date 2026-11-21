@@ -19,6 +19,7 @@ pub struct Config {
     pub fleet: FleetCfg,
     pub anticheat: AntiCheatCfg,
     pub bedrock: BedrockCfg,
+    pub plugins: PluginsCfg,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -395,6 +396,25 @@ impl Default for BedrockCfg {
             protocol_version: 2225,
             game_version: "1.26.60".into(),
         }
+    }
+}
+
+/// `[plugins]`: Bukkit-API plugins (jars in `dir`) run in an embedded JVM.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginsCfg {
+    pub enabled: bool,
+    /// folder holding plugin jars, relative to the server directory
+    pub dir: String,
+    /// JDK/JRE home; empty = $JAVA_HOME, then `/usr/libexec/java_home`
+    pub java_home: String,
+    /// extra JVM options, e.g. ["-Xmx512m"]
+    pub jvm_options: Vec<String>,
+}
+
+impl Default for PluginsCfg {
+    fn default() -> Self {
+        Self { enabled: true, dir: "plugins".into(), java_home: String::new(), jvm_options: vec!["-Xmx512m".into()] }
     }
 }
 

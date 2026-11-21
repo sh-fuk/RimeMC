@@ -152,3 +152,11 @@ skins = true
 mtu = 1400
 protocol_version = 2225
 game_version = "1.26.60"
+
+# Bukkit-API plugins: jars in `dir` are loaded into an embedded JVM (needs a
+# Java 17+ runtime). Only part of the Bukkit API exists — see README.
+[plugins]
+enabled = true
+dir = "plugins"
+java_home = ""          # empty = $JAVA_HOME, then /usr/libexec/java_home
+jvm_options = ["-Xmx512m"]

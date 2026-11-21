@@ -13,6 +13,7 @@ mod net;
 #[allow(dead_code)]
 mod nbt;
 mod ops;
+mod plugins;
 #[allow(dead_code)]
 mod registry;
 mod tick;
@@ -338,6 +339,14 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
         *state.pregen.lock() = Some(p);
     }
 
+    // ---- Bukkit plugins (only when the plugin folder holds jars)
+    {
+        let _rt = rt.enter();
+        if let Err(e) = plugins::start(&state, &dir) {
+            tracing::error!("plugins disabled: {e:#}");
+        }
+    }
+
     // ---- tick thread (20 TPS, fixed timestep, parallel cells)
     let tick_thread = {
         let st = state.clone();
@@ -416,6 +425,7 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
     });
 
     let _ = tick_thread.join();
+    plugins::stop();
     if let Some(p) = state.pregen.lock().take() {
         p.shutdown();
     }
@@ -448,6 +458,9 @@ fn tick_loop(state: Arc<ServerState>) {
         let stats = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let t = Instant::now();
             state.game.tick();
+            if plugins::active() {
+                plugins::tick();
+            }
             let mut s = sched.tick(&state.cfg.level_tick);
             s.mspt += t.elapsed().as_secs_f64() * 1000.0;
             s

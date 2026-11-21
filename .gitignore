@@ -4,3 +4,4 @@
 *.air.tmp
 /cache/
 .DS_Store
+bukkit-api/example/*/HelloRime.jar

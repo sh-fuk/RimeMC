@@ -1,0 +1,16 @@
+name: HelloRime
+version: 1.0
+main: com.example.hello.HelloRime
+api-version: '1.20'
+author: tester
+commands:
+  hello:
+    description: Says hello
+    usage: /<command> [give|tp|time|ticks]
+    aliases: [hi]
+  secret:
+    description: Ops only
+    permission: hello.secret
+permissions:
+  hello.secret:
+    default: op

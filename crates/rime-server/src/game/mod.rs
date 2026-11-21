@@ -359,6 +359,20 @@ pub struct Player {
     pub hits: Mutex<Vec<Hit>>,
     /// set when a newer login of the same player replaced this one
     pub kicked: std::sync::atomic::AtomicBool,
+    /// actions requested from outside the session (plugins), run on its tick
+    pub requests: Mutex<Vec<Request>>,
+}
+
+/// Something another part of the server asks a player's session to do.
+#[derive(Clone, Debug)]
+pub enum Request {
+    Teleport([f64; 3], f32, f32),
+    Gamemode(i32),
+    Kick(String),
+    /// run a command as this player (without the leading slash)
+    Command(String),
+    /// say this in chat as the player
+    Chat(String),
 }
 
 /// Damage queued for a player.
@@ -508,6 +522,7 @@ impl Game {
             view: Mutex::new((cx, cz, view)),
             hits: Mutex::new(Vec::new()),
             kicked: std::sync::atomic::AtomicBool::new(false),
+            requests: Mutex::new(Vec::new()),
         });
         m.insert(eid, p.clone());
         Some(p)

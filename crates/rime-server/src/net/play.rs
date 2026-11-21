@@ -117,7 +117,14 @@ pub fn light_data(b: &mut Vec<u8>, light: &crate::world::light::ChunkLight) {
 
 /// The `commands` tree: a few literals, each taking an optional greedy string.
 fn commands_body() -> Vec<u8> {
-    let names = ["rime", "stop", "op", "deop", "gamemode", "tp", "list", "help", "spawn", "summon", "time", "kill"];
+    let mut names: Vec<String> = ["rime", "stop", "op", "deop", "gamemode", "tp", "list", "help", "spawn", "summon", "time", "kill"].map(String::from).to_vec();
+    if crate::plugins::active() {
+        for c in crate::plugins::command_names() {
+            if !names.contains(&c) && !c.is_empty() && c.chars().all(|ch| ch.is_ascii_graphic()) {
+                names.push(c);
+            }
+        }
+    }
     let parser = Registries::get().id("minecraft:command_argument_type", "brigadier:string").unwrap_or(5);
     let arg = names.len() as i32 + 1;
     let mut b = Vec::new();
@@ -127,7 +134,7 @@ fn commands_body() -> Vec<u8> {
     for i in 0..names.len() {
         b.vi(i as i32 + 1);
     }
-    for n in names {
+    for n in &names {
         b.u8(0x01 | 0x04).vi(1).vi(arg).str(n);
     }
     b.u8(0x02 | 0x04).vi(0).str("args").vi(parser).vi(2);
@@ -286,6 +293,12 @@ pub async fn run_with_state<S: Io>(mut sock: CryptStream<S>, st: Arc<ServerState
             }
         }
     }
+    let quit_msg = if replaced || !crate::plugins::active() {
+        format!("§e{name} left the game")
+    } else {
+        // PlayerQuitEvent while the player is still online
+        crate::plugins::quit(&name, &format!("§e{name} left the game"))
+    };
     st.game.leave(me.eid);
     st.online.store(st.game.count() as u32, Ordering::Relaxed);
     for c in &s.sent {
@@ -304,7 +317,9 @@ pub async fn run_with_state<S: Io>(mut sock: CryptStream<S>, st: Arc<ServerState
     let mut b = Vec::new();
     b.vi(1).vi(me.eid);
     st.game.broadcast(st.game.encode("remove_entities", &b));
-    st.game.broadcast(st.game.system_chat(&format!("§e{name} left the game")));
+    if !quit_msg.is_empty() {
+        st.game.broadcast(st.game.system_chat(&quit_msg));
+    }
     tracing::info!("{name} left the game{}", match &result {
         Err(e) => format!(" ({e:#})"),
         Ok(()) => String::new(),
@@ -524,7 +539,11 @@ impl Session {
                 p.send(info.clone());
             }
         }
-        st.game.broadcast(st.game.system_chat(&format!("§e{} joined the game", self.me.name)));
+        let join_msg = format!("§e{} joined the game", self.me.name);
+        let join_msg = if crate::plugins::active() { crate::plugins::join(&self.me.name, &join_msg) } else { join_msg };
+        if !join_msg.is_empty() {
+            st.game.broadcast(st.game.system_chat(&join_msg));
+        }
         let mut b = Vec::new();
         b.f64(0.0).f64(0.0).f64(59_999_968.0).f64(59_999_968.0).vl(0).vi(29_999_984).vi(5).vi(15);
         self.send("initialize_border", &b);
@@ -729,6 +748,24 @@ impl Session {
 
     async fn on_tick(&mut self) -> Flow {
         self.tick += 1;
+        let requests = std::mem::take(&mut *self.me.requests.lock());
+        for r in requests {
+            match r {
+                crate::game::Request::Teleport(pos, yaw, pitch) => self.teleport(pos, yaw, pitch),
+                crate::game::Request::Gamemode(gm) => self.set_gamemode(gm.clamp(0, 3)),
+                crate::game::Request::Kick(reason) => return Flow::Disconnect(reason),
+                crate::game::Request::Chat(m) => {
+                    if let Flow::Disconnect(r) = self.on_chat(&m) {
+                        return Flow::Disconnect(r);
+                    }
+                }
+                crate::game::Request::Command(line) => {
+                    if let Flow::Disconnect(r) = self.on_command(&line) {
+                        return Flow::Disconnect(r);
+                    }
+                }
+            }
+        }
         // keep-alive every 15 s, kick after 30 s without an answer
         if let Some((_, t)) = self.ka_pending {
             if t.elapsed() > Duration::from_secs(30) {
@@ -1409,8 +1446,11 @@ impl Session {
         if m.trim().is_empty() {
             return Flow::Continue;
         }
-        tracing::info!("<{}> {m}", self.me.name);
-        self.st.game.broadcast(self.st.game.system_chat(&format!("<{}> {m}", self.me.name)));
+        let Some(line) = crate::plugins::chat(&self.me.name, m) else {
+            return Flow::Continue;
+        };
+        tracing::info!("{line}");
+        self.st.game.broadcast(self.st.game.system_chat(&line));
         Flow::Continue
     }
 
@@ -1419,6 +1459,9 @@ impl Session {
             return Flow::Disconnect("Illegal characters in command".into());
         }
         tracing::info!("{} issued server command: /{line}", self.me.name);
+        if crate::plugins::active() && crate::plugins::command(&self.me.name, line) {
+            return Flow::Continue;
+        }
         let sender = CommandSender::Player { name: self.me.name.clone() };
         let mut words = line.split_whitespace();
         match words.next().unwrap_or("") {
@@ -1631,6 +1674,12 @@ impl Session {
         };
         let unbreakable = matches!(cur.name(), "bedrock" | "barrier" | "end_portal_frame" | "end_portal" | "end_gateway" | "command_block" | "structure_block" | "jigsaw");
         if breaks && (gm == 2 || gm == 3 || unbreakable && gm != 1 || !self.within_reach(pos) || BlockRegistry::get().is_fluid(cur)) {
+            self.ack(seq);
+            self.resync(pos);
+            return Flow::Continue;
+        }
+        if breaks && !cur.is_air() && crate::plugins::active() && crate::plugins::block_break(&self.me.name, [pos.0, pos.1, pos.2]) {
+            // BlockBreakEvent cancelled
             self.ack(seq);
             self.resync(pos);
             return Flow::Continue;
@@ -2052,8 +2101,12 @@ impl Session {
                 }
             }
         }
-        if !game.data.block_in("replaceable", info.name.as_str()) {
-            let _ = info;
+        if crate::plugins::active() && crate::plugins::block_place(&self.me.name, [target.0, target.1, target.2], state.name()) {
+            // BlockPlaceEvent cancelled
+            self.ack(seq);
+            self.resync(target);
+            game.send_inventory(&self.me);
+            return Flow::Continue;
         }
         game.player_change_block([target.0, target.1, target.2], state, false, None);
         if let Some((p, b)) = extra {

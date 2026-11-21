@@ -1,0 +1,5 @@
+# HelloRime settings
+greeting: '&aWelcome to the server, %name%!'
+protect: oak_log
+blocked-words:
+  - badword
