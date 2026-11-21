@@ -200,7 +200,7 @@ impl Pools {
         }
     }
 
-    fn template(&mut self, b: &mut Builder, name: &str) -> Result<Arc<Template>> {
+    pub fn template(&mut self, b: &mut Builder, name: &str) -> Result<Arc<Template>> {
         let k = key(name);
         if let Some(t) = self.templates.get(&k) {
             return Ok(t.clone());

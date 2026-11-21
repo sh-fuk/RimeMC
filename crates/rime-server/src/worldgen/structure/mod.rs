@@ -7,6 +7,13 @@
 //! cities, trail ruins, trial chambers). The others never start yet.
 
 pub mod jigsaw;
+pub mod legacy;
+mod mansion;
+mod monument;
+pub mod mineshaft;
+pub mod piece;
+pub mod stronghold;
+pub mod temples;
 pub mod placement;
 pub mod template;
 
@@ -35,6 +42,14 @@ pub trait Ctx: Sync {
     fn base_height(&self, x: i32, z: i32, hm: Hm) -> i32;
     /// `BiomeSource.getNoiseBiome` (network id)
     fn noise_biome(&self, qx: i32, qy: i32, qz: i32) -> u8;
+    /// `ChunkGenerator.getBaseColumn` (index `y - MIN_Y`)
+    fn base_column(&self, _x: i32, _z: i32) -> Vec<crate::registry::BlockState> {
+        Vec::new()
+    }
+    /// `Biome.getTemperature(pos, seaLevel)` of a biome
+    fn temperature(&self, _biome: u8, _p: P) -> f32 {
+        0.8
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -48,6 +63,8 @@ pub enum Adapt {
 
 enum Kind {
     Jigsaw(jigsaw::JigsawStructure),
+    Mineshaft { mesa: bool },
+    Legacy(legacy::LKind),
     /// structure type not ported yet: never starts
     Unported,
 }
@@ -63,6 +80,8 @@ struct Structure {
 
 struct Set {
     placement: Placement,
+    /// concentric rings: biome id -> preferred
+    ring_biomes: Vec<bool>,
     /// (structure index, weight)
     structures: Vec<(usize, i32)>,
 }
@@ -81,6 +100,10 @@ pub struct Piece {
 pub struct Start {
     structure: usize,
     pieces: Vec<Piece>,
+    /// pieces of a mineshaft (non-jigsaw structure)
+    shaft: Option<mineshaft::Mineshaft>,
+    /// pieces of other non-jigsaw structures
+    legacy: Vec<Box<dyn legacy::LPiece>>,
     /// `getBoundingBox` (adjusted for terrain adaptation)
     bb: Bb,
 }
@@ -95,6 +118,9 @@ pub struct Structures {
     by_step: Vec<Vec<usize>>,
     starts: Mutex<HashMap<(i32, i32), Arc<Vec<Arc<Start>>>>>,
     heights: Mutex<HashMap<(i32, i32, u8), i32>>,
+    /// biome network id -> in `#mineshaft_blocking`
+    mineshaft_blocking: Vec<bool>,
+    llib: legacy::LLib,
 }
 
 const STEPS: [&str; 11] = [
@@ -142,6 +168,7 @@ impl Structures {
         let mut unported = Vec::new();
         let mut by_step = vec![Vec::new(); STEPS.len()];
         let mut index = BTreeMap::new();
+        let mut llib = legacy::LLib::default();
         for name in structure_names {
             let v = b.load(&format!("worldgen/structure/{name}"))?;
             let mut biomes = vec![false; 256];
@@ -170,6 +197,12 @@ impl Structures {
             let overworld = possible.iter().any(|&p| biomes[p as usize]);
             let kind = match v["type"].as_str().unwrap_or("") {
                 "minecraft:jigsaw" if overworld => Kind::Jigsaw(jigsaw::JigsawStructure::parse(&mut pools, b, &v)?),
+                "minecraft:mineshaft" if overworld => Kind::Mineshaft { mesa: v["mineshaft_type"].as_str() == Some("mesa") },
+                t if overworld && legacy::LKind::parse(t.trim_start_matches("minecraft:"), &v).is_some() => {
+                    let k = legacy::LKind::parse(t.trim_start_matches("minecraft:"), &v).unwrap();
+                    k.load(&mut pools, b, &mut llib)?;
+                    Kind::Legacy(k)
+                }
                 t => {
                     if overworld {
                         unported.push(format!("{name} ({})", t.trim_start_matches("minecraft:")));
@@ -192,10 +225,29 @@ impl Structures {
                 .flatten()
                 .filter_map(|e| Some((*index.get(e["structure"].as_str()?.trim_start_matches("minecraft:"))?, e["weight"].as_i64().unwrap_or(1) as i32)))
                 .collect();
+            let mut ring_biomes = Vec::new();
+            if let placement::Kind::ConcentricRings { preferred, .. } = &placement.kind {
+                let mut set = HashSet::new();
+                biome_tag(b, preferred, &mut set, &mut HashSet::new())?;
+                ring_biomes = vec![false; 256];
+                for n in &set {
+                    if let Some(id) = names.id(n) {
+                        ring_biomes[id as usize] = true;
+                    }
+                }
+            }
             set_by_name.insert(name.clone(), sets.len());
-            sets.push(Set { placement, structures: list });
+            sets.push(Set { placement, ring_biomes, structures: list });
         }
-        let s = Structures { seed, structures, sets, set_by_name, pools, by_step, starts: Mutex::new(HashMap::new()), heights: Mutex::new(HashMap::new()) };
+        let mut blocking = HashSet::new();
+        biome_tag(b, "mineshaft_blocking", &mut blocking, &mut HashSet::new())?;
+        let mut mineshaft_blocking = vec![false; 256];
+        for n in &blocking {
+            if let Some(id) = names.id(n) {
+                mineshaft_blocking[id as usize] = true;
+            }
+        }
+        let s = Structures { seed, structures, sets, set_by_name, pools, by_step, starts: Mutex::new(HashMap::new()), heights: Mutex::new(HashMap::new()), mineshaft_blocking, llib };
         Ok((s, unported))
     }
 
@@ -219,7 +271,7 @@ impl Structures {
 
     /// Whether any structure of a set can be in this world at all.
     fn set_possible(&self, s: &Set) -> bool {
-        s.structures.iter().any(|&(i, _)| matches!(self.structures[i].kind, Kind::Jigsaw(_)))
+        s.structures.iter().any(|&(i, _)| !matches!(self.structures[i].kind, Kind::Unported))
     }
 
     /// Structure starts in chunk (cx, cz) (`createStructures`).
@@ -229,6 +281,14 @@ impl Structures {
         }
         let mut out = Vec::new();
         for set in &self.sets {
+            if let placement::Kind::ConcentricRings { distance, spread, count, .. } = set.placement.kind {
+                if self.set_possible(set) {
+                    set.placement.rings.get_or_init(|| {
+                        let nb = |x: i32, y: i32, z: i32| ctx.noise_biome(x, y, z);
+                        placement::ring_positions(self.seed, distance, spread, count, &set.ring_biomes, &nb).into_iter().collect()
+                    });
+                }
+            }
             if !self.set_possible(set) || !set.placement.is_structure_chunk(self.seed, cx, cz, &|n| self.other_placement(n)) {
                 continue;
             }
@@ -268,10 +328,38 @@ impl Structures {
     /// `ChunkGenerator.tryGenerateStructure` / `Structure.generate`
     fn try_start(&self, ctx: &dyn Ctx, si: usize, cx: i32, cz: i32) -> Option<Start> {
         let s = &self.structures[si];
-        let Kind::Jigsaw(j) = &s.kind else { return None };
         let mut r = placement::large_feature_seed(self.seed, cx, cz);
         let hctx = HeightCtx { s: self, ctx };
         let valid = |p: P| s.biomes[ctx.noise_biome(p[0] >> 2, p[1] >> 2, p[2] >> 2) as usize];
+        let j = match &s.kind {
+            Kind::Jigsaw(j) => j,
+            Kind::Mineshaft { mesa } => {
+                let (shaft, stub) = mineshaft::generate(&hctx, *mesa, cx, cz, &mut r);
+                if !valid(stub) || shaft.pieces.is_empty() {
+                    return None;
+                }
+                let mut bb = shaft.pieces[0].bb;
+                for p in &shaft.pieces[1..] {
+                    bb = bb_encapsulate(bb, &p.bb);
+                }
+                return Some(Start { structure: si, pieces: Vec::new(), shaft: Some(shaft), legacy: Vec::new(), bb });
+            }
+            Kind::Legacy(k) => {
+                let (pieces, stub) = legacy::generate(k, &self.llib, &hctx, self.seed, cx, cz, &mut r)?;
+                if !valid(stub) || pieces.is_empty() {
+                    return None;
+                }
+                let mut bb = pieces[0].bb();
+                for p in &pieces[1..] {
+                    bb = bb_encapsulate(bb, &p.bb());
+                }
+                if s.adapt != Adapt::None {
+                    bb = template::bb_inflate(bb, 12);
+                }
+                return Some(Start { structure: si, pieces: Vec::new(), shaft: None, legacy: pieces, bb });
+            }
+            Kind::Unported => return None,
+        };
         let pieces = jigsaw::generate(j, &self.pools, &hctx, self.seed, cx, cz, &mut r, &valid)?;
         if pieces.is_empty() {
             return None;
@@ -283,7 +371,7 @@ impl Structures {
         if s.adapt != Adapt::None {
             bb = template::bb_inflate(bb, 12);
         }
-        Some(Start { structure: si, pieces, bb })
+        Some(Start { structure: si, pieces, shaft: None, legacy: Vec::new(), bb })
     }
 
     /// Starts whose box reaches chunk (cx, cz) (`createReferences`), in
@@ -317,6 +405,13 @@ impl Structures {
             let adapt = self.structures[start.structure].adapt;
             if adapt == Adapt::None {
                 continue;
+            }
+            for p in &start.legacy {
+                let b = p.bb();
+                if bb_intersects_xz(&b, x0 - 12, z0 - 12, x0 + 15 + 12, z0 + 15 + 12) {
+                    rigids.push((b, adapt, 0));
+                    include(b);
+                }
             }
             for p in &start.pieces {
                 if !bb_intersects_xz(&p.bb, x0 - 12, z0 - 12, x0 + 15 + 12, z0 + 15 + 12) {
@@ -352,6 +447,22 @@ impl Structures {
         for (m, &si) in list.iter().enumerate() {
             r.set_feature_seed(dec, m as i32, step as i32);
             for start in refs.iter().filter(|s| s.structure == si) {
+                if let Some(shaft) = &start.shaft {
+                    shaft.place(lv, r, &area, &self.mineshaft_blocking);
+                    continue;
+                }
+                if let Some(first) = start.legacy.first() {
+                    let fb = first.bb();
+                    let c = bb_center(&fb);
+                    let reference = [c[0], fb.0[1], c[2]];
+                    for p in &start.legacy {
+                        if bb_intersects(&p.bb(), &area) {
+                            p.post_process(lv, &self.llib, self.seed, r, &area, reference);
+                        }
+                    }
+                    first.after_place(lv, &area, &start.legacy);
+                    continue;
+                }
                 let Some(first) = start.pieces.first() else { continue };
                 let c = bb_center(&first.bb);
                 let reference = [c[0], first.bb.0[1], c[2]];
@@ -368,6 +479,13 @@ impl Structures {
         self.starts(ctx, cx, cz)
             .iter()
             .map(|s| {
+                if !s.legacy.is_empty() {
+                    return (self.structures[s.structure].name.clone(), s.legacy.iter().map(|p| p.bb()).collect(), s.legacy.iter().map(|p| p.name()).collect());
+                }
+                if let Some(m) = &s.shaft {
+                    let names = m.pieces.iter().map(|p| p.name().to_string()).collect();
+                    return (self.structures[s.structure].name.clone(), m.pieces.iter().map(|p| p.bb).collect(), names);
+                }
                 let names = s.pieces.iter().map(|p| p.elem.describe()).collect();
                 (self.structures[s.structure].name.clone(), s.pieces.iter().map(|p| p.bb).collect(), names)
             })
@@ -376,7 +494,7 @@ impl Structures {
 
     /// (structure name, piece count, box) of the starts in a chunk.
     pub fn starts_info(&self, ctx: &dyn Ctx, cx: i32, cz: i32) -> Vec<(String, usize, Bb)> {
-        self.starts(ctx, cx, cz).iter().map(|s| (self.structures[s.structure].name.clone(), s.pieces.len(), s.bb)).collect()
+        self.starts(ctx, cx, cz).iter().map(|s| (self.structures[s.structure].name.clone(), s.shaft.as_ref().map_or(s.pieces.len().max(s.legacy.len()), |m| m.pieces.len()), s.bb)).collect()
     }
 }
 
@@ -391,6 +509,12 @@ impl Ctx for HeightCtx<'_> {
     }
     fn noise_biome(&self, qx: i32, qy: i32, qz: i32) -> u8 {
         self.ctx.noise_biome(qx, qy, qz)
+    }
+    fn base_column(&self, x: i32, z: i32) -> Vec<crate::registry::BlockState> {
+        self.ctx.base_column(x, z)
+    }
+    fn temperature(&self, biome: u8, p: P) -> f32 {
+        self.ctx.temperature(biome, p)
     }
 }
 

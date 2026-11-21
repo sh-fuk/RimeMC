@@ -61,10 +61,19 @@ const STRUCTURE_SETS: [&str; 20] = [
 
 impl structure::Ctx for VanillaGenerator {
     fn base_height(&self, x: i32, z: i32, hm: feature::Hm) -> i32 {
-        chunk::base_height(&self.router, &self.settings, self.aquifer_random, self.ore_random, x, z, &|s| hm.test(s))
+        chunk::base_height_stop(&self.router, &self.settings, self.aquifer_random, self.ore_random, x, z, &|s| hm.test(s))
+    }
+    fn base_column(&self, x: i32, z: i32) -> Vec<crate::registry::BlockState> {
+        chunk::base_column(&self.router, &self.settings, self.aquifer_random, self.ore_random, x, z)
     }
     fn noise_biome(&self, qx: i32, qy: i32, qz: i32) -> u8 {
         self.noise_biome_uncached(qx, qy, qz)
+    }
+    fn temperature(&self, biome: u8, p: [i32; 3]) -> f32 {
+        match &self.features {
+            Some(l) => l.climates.get(biome as usize).map_or(0.8, |c| l.temps.temperature(*c, p[0], p[1], p[2], l.sea_level)),
+            None => 0.8,
+        }
     }
 }
 

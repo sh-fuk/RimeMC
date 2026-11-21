@@ -431,6 +431,13 @@ impl PosTest {
     }
 }
 
+impl Rule {
+    /// `new ProcessorRule(input, location, output)`
+    pub fn new(input: RuleTest, loc: RuleTest, output: BlockState, adds_nbt: bool) -> Rule {
+        Rule { input, loc, pos: PosTest::Always, output, adds_nbt }
+    }
+}
+
 #[derive(Clone)]
 pub struct Rule {
     input: RuleTest,

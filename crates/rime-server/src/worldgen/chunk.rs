@@ -613,7 +613,21 @@ pub fn fill_with(nc: &NoiseChunk, router: &Router, settings: &Settings, aquifer_
 /// `NoiseBasedChunkGenerator.iterateNoiseColumn` / `getBaseHeight`: the
 /// y above the highest block of the raw noise column at (x, z) that
 /// matches `stop` (MIN_Y if none). Beardifier off, no surface or carvers.
-pub fn base_height(router: &Router, settings: &Settings, aquifer_random: XoroshiroFactory, ore_random: XoroshiroFactory, x: i32, z: i32, stop: &dyn Fn(BlockState) -> bool) -> i32 {
+/// `getBaseColumn`: the noise-fill block of every y (index `y - MIN_Y`).
+pub fn base_column(router: &Router, settings: &Settings, aquifer_random: XoroshiroFactory, ore_random: XoroshiroFactory, x: i32, z: i32) -> Vec<BlockState> {
+    let mut out = vec![settings.default_block; HEIGHT as usize];
+    base_height(router, settings, aquifer_random, ore_random, x, z, &mut |y, s| {
+        out[(y - MIN_Y) as usize] = s;
+        false
+    });
+    out
+}
+
+pub fn base_height_stop(router: &Router, settings: &Settings, aquifer_random: XoroshiroFactory, ore_random: XoroshiroFactory, x: i32, z: i32, stop: &dyn Fn(BlockState) -> bool) -> i32 {
+    base_height(router, settings, aquifer_random, ore_random, x, z, &mut |_, s| stop(s))
+}
+
+fn base_height(router: &Router, settings: &Settings, aquifer_random: XoroshiroFactory, ore_random: XoroshiroFactory, x: i32, z: i32, stop: &mut dyn FnMut(i32, BlockState) -> bool) -> i32 {
     let nc = NoiseChunk::column(&router.graph, x, z);
     let picker = FluidPicker::overworld(settings.sea_level, settings.default_fluid);
     let mut aq = Aquifer::new(&nc, router, aquifer_random, &picker, MIN_Y, HEIGHT);
@@ -633,7 +647,7 @@ pub fn base_height(router: &Router, settings: &Settings, aquifer_random: Xoroshi
             None => None,
         }
         .unwrap_or(settings.default_block);
-        if stop(state) {
+        if stop(y, state) {
             return y + 1;
         }
     }

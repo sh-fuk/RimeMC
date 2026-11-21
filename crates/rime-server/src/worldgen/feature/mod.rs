@@ -75,6 +75,8 @@ pub struct Proto {
     pub post: Vec<[i32; 3]>,
     /// scheduled fluid ticks (`scheduleTick`)
     pub ticks: Vec<[i32; 3]>,
+    /// entities added during generation (`addFreshEntity`): (type, pos)
+    pub entities: Vec<(&'static str, [i32; 3])>,
 }
 
 #[inline]
@@ -98,7 +100,7 @@ impl Proto {
                 }
             }
         }
-        Proto { blocks, biomes, hm, post: Vec::new(), ticks: Vec::new() }
+        Proto { blocks, biomes, hm, post: Vec::new(), ticks: Vec::new(), entities: Vec::new() }
     }
 
     pub fn get(&self, x: i32, y: i32, z: i32) -> BlockState {
@@ -211,6 +213,13 @@ impl Region<'_> {
         }
     }
 
+    /// `addFreshEntity` during generation
+    pub fn spawn_entity(&mut self, kind: &'static str, p: [i32; 3]) {
+        if let Some(i) = self.slot(p[0], p[2]) {
+            self.chunks[i].entities.push((kind, p));
+        }
+    }
+
     pub fn is_empty(&self, p: [i32; 3]) -> bool {
         vstate::air(self.get(p))
     }
@@ -242,8 +251,53 @@ pub fn post_process(lv: &mut Region) {
         }
         if !survive::can_survive(lv, s, p) {
             lv.set(p, if vstate::is_water(s) { blocks::WATER } else { blocks::AIR });
+            continue;
+        }
+        let n = shape_update(lv, s, p);
+        if n != s {
+            lv.set(p, n);
         }
     }
+}
+
+/// `updateShape` of fences (connections) and wall torches (support) for
+/// every neighbour, as `Block.updateFromNeighbourShapes` does.
+fn shape_update(lv: &Region, s: BlockState, p: [i32; 3]) -> BlockState {
+    let reg = crate::registry::BlockRegistry::get();
+    let name = s.name();
+    // north, south, west, east with vanilla direction ordinals
+    const H: [(u8, [i32; 3], &str); 4] = [(2, [0, 0, -1], "north"), (3, [0, 0, 1], "south"), (4, [-1, 0, 0], "west"), (5, [1, 0, 0], "east")];
+    if name.ends_with("_fence") {
+        let wooden = name != "nether_brick_fence";
+        let mut out = s;
+        for (d, o, prop) in H {
+            let q = [p[0] + o[0], p[1], p[2] + o[2]];
+            let nb = lv.get(q);
+            let nn = nb.name();
+            let solid = vstate::sturdy(nb, d ^ 1);
+            let exception = is_leaves(nb) || matches!(nn, "barrier" | "carved_pumpkin" | "jack_o_lantern" | "melon" | "pumpkin") || nn.ends_with("shulker_box");
+            let same = nn.ends_with("_fence") && (nn != "nether_brick_fence") == wooden;
+            let gate = nn.ends_with("_fence_gate") && {
+                // facing axis == clockwise(dir) axis: the gate faces along the other axis
+                let f = reg.property(nb, "facing").unwrap_or("north");
+                let gate_x = matches!(f, "east" | "west");
+                let dir_x = d >= 4;
+                gate_x != dir_x
+            };
+            let c = (!exception && solid) || same || gate;
+            out = reg.with(out, prop, if c { "true" } else { "false" }).unwrap_or(out);
+        }
+        return out;
+    }
+    if name == "wall_torch" || name == "soul_wall_torch" || name == "copper_wall_torch" || name == "redstone_wall_torch" {
+        let f = reg.property(s, "facing").unwrap_or("north");
+        let Some(&(d, o, _)) = H.iter().find(|h| h.2 == f) else { return s };
+        let behind = [p[0] - o[0], p[1], p[2] - o[2]];
+        if !vstate::sturdy(lv.get(behind), d) {
+            return blocks::AIR;
+        }
+    }
+    s
 }
 
 /// A placed feature.
