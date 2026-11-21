@@ -137,7 +137,17 @@ impl VanillaGenerator {
                 marks.sort_unstable();
                 marks.dedup();
                 marks.retain(|q| crate::registry::vstate::has_fluid(blocks[((q[1] - super::chunk::MIN_Y) * 256 + (q[2] & 15) * 16 + (q[0] & 15)) as usize]));
-                (c, Generated { blocks, biomes: p.biomes.clone(), heights: p.hm[Hm::NotAir as usize], fluid_ticks: marks })
+                // block entities whose block survived decoration
+                let block_entities = p
+                    .block_entities
+                    .iter()
+                    .filter(|(q, t)| {
+                        let b = blocks[((q[1] - super::chunk::MIN_Y) * 256 + (q[2] & 15) * 16 + (q[0] & 15)) as usize];
+                        crate::game::blockentity::be_id(b.name()).is_some_and(|id| t.get("id").and_then(|v| v.as_str()) == Some(id))
+                    })
+                    .cloned()
+                    .collect();
+                (c, Generated { blocks, biomes: p.biomes.clone(), heights: p.hm[Hm::NotAir as usize], fluid_ticks: marks, block_entities, entities: p.entities.clone() })
             })
             .collect();
         out.extend(made);
@@ -297,5 +307,5 @@ fn fix_leaves<'a>(lib: &Lib, c: (i32, i32), chunk: &dyn Fn((i32, i32)) -> &'a Ve
 }
 
 fn clone_gen(g: &Generated) -> Generated {
-    Generated { blocks: g.blocks.clone(), biomes: g.biomes.clone(), heights: g.heights, fluid_ticks: g.fluid_ticks.clone() }
+    Generated { blocks: g.blocks.clone(), biomes: g.biomes.clone(), heights: g.heights, fluid_ticks: g.fluid_ticks.clone(), block_entities: g.block_entities.clone(), entities: g.entities.clone() }
 }

@@ -712,13 +712,21 @@ fn monster_room(lv: &mut Region, r: &mut WgRandom, o: P) -> bool {
             if n == 1 {
                 let c = reorient_chest(lv, p);
                 safe_set(lv, p, c);
-                r.next_long(); // loot table seed
+                if lv.get(p).name() == "chest" {
+                    crate::worldgen::structure::piece::loot_container(lv, p, "minecraft:chest", "chests/simple_dungeon", r);
+                } else {
+                    r.next_long(); // loot table seed
+                }
                 break;
             }
         }
     }
     safe_set(lv, o, st("spawner"));
-    r.next_int_bound(4); // spawned mob
+    // MonsterRoomFeature.MOBS
+    let mob = ["skeleton", "zombie", "zombie", "spider"][r.next_int_bound(4) as usize];
+    if lv.get(o).name() == "spawner" {
+        crate::worldgen::structure::piece::spawner_entity(lv, o, mob);
+    }
     true
 }
 

@@ -90,6 +90,11 @@ pub struct Chunk {
     pub edited: bool,
     /// fluids to tick once the freshly generated chunk is loaded (not saved)
     pub fluid_ticks: Vec<[i32; 3]>,
+    /// block entities (vanilla NBT) by world position
+    pub block_entities: std::collections::BTreeMap<[i32; 3], Tag>,
+    /// entities placed by world generation, spawned when the chunk is first
+    /// loaded: (type, block position)
+    pub gen_entities: Vec<(String, [i32; 3])>,
 }
 
 impl Chunk {
@@ -103,6 +108,8 @@ impl Chunk {
             gen_id: 0,
             edited: false,
             fluid_ticks: Vec::new(),
+            block_entities: Default::default(),
+            gen_entities: Vec::new(),
         }
     }
 
@@ -205,7 +212,8 @@ impl Chunk {
             ("InhabitedTime", Tag::Long(0)),
             ("isLightOn", Tag::Byte(0)),
             ("sections", Tag::List(sections)),
-            ("block_entities", Tag::List(vec![])),
+            ("block_entities", Tag::List(self.block_entities.values().cloned().collect())),
+            ("RimeEntities", Tag::List(self.gen_entities.iter().map(|(k, p)| compound![("id", Tag::String(k.clone())), ("pos", Tag::IntArray(p.to_vec()))]).collect())),
             ("block_ticks", Tag::List(vec![])),
             ("fluid_ticks", Tag::List(vec![])),
             ("PostProcessing", Tag::List(vec![])),
@@ -226,6 +234,25 @@ impl Chunk {
         let mut c = Chunk::empty(x, z);
         c.gen_id = root.get("RimeGen").and_then(|t| t.as_i64()).unwrap_or(0) as u32;
         c.edited = root.get("RimeEdited").and_then(|t| t.as_i64()).unwrap_or(0) != 0;
+        if let Some(Tag::List(l)) = root.get("block_entities") {
+            for be in l {
+                let g = |k: &str| be.get(k).and_then(|v| v.as_i64()).map(|v| v as i32);
+                if let (Some(bx), Some(by), Some(bz)) = (g("x"), g("y"), g("z")) {
+                    if bx >> 4 == x && bz >> 4 == z {
+                        c.block_entities.insert([bx, by, bz], be.clone());
+                    }
+                }
+            }
+        }
+        if let Some(Tag::List(l)) = root.get("RimeEntities") {
+            for e in l {
+                if let (Some(id), Some(Tag::IntArray(p))) = (e.get("id").and_then(|v| v.as_str()), e.get("pos")) {
+                    if p.len() == 3 {
+                        c.gen_entities.push((id.to_string(), [p[0], p[1], p[2]]));
+                    }
+                }
+            }
+        }
         if let Some(Tag::List(secs)) = root.get("sections") {
             for s in secs {
                 let y = s.get("Y").and_then(|t| t.as_i64()).unwrap_or(i64::MIN);

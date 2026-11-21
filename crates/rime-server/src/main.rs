@@ -71,6 +71,8 @@ pub struct ServerState {
     pub seed: i64,
     /// where new players appear (feet position)
     pub spawn: [f64; 3],
+    /// world directory (player data lives in `playerdata/`)
+    pub world_dir: std::path::PathBuf,
     pub pregen: Mutex<Option<Pregen>>,
     bans: Mutex<std::collections::HashMap<String, Instant>>,
     pub online: AtomicU32,
@@ -83,6 +85,14 @@ pub struct ServerState {
 }
 
 impl ServerState {
+    /// Writes every online player's file (autosave, sync, shutdown).
+    pub fn save_players(&self) {
+        for p in self.game.players() {
+            if let Err(e) = game::playerdata::save(&self.world_dir, &p) {
+                tracing::error!("saving player {}: {e:#}", p.name);
+            }
+        }
+    }
     pub fn online_players(&self) -> u32 {
         self.online.load(Ordering::Relaxed)
     }
@@ -123,6 +133,7 @@ impl ServerState {
     pub async fn sync(self: &Arc<Self>) -> String {
         let st = self.clone();
         match tokio::task::spawn_blocking(move || {
+            st.save_players();
             st.game.world.save(&st.store, true);
             st.store.flush()
         })
@@ -267,6 +278,7 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
         config_data,
         seed,
         spawn,
+        world_dir: world_dir.clone(),
         pregen: Mutex::new(None),
         bans: Mutex::new(Default::default()),
         online: AtomicU32::new(0),
@@ -386,6 +398,7 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
     if let Some(p) = state.pregen.lock().take() {
         p.shutdown();
     }
+    state.save_players();
     let saved = state.game.world.save(&state.store, false);
     tracing::info!("saved {saved} modified chunk(s)");
     let r = state.store.flush();

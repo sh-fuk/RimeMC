@@ -64,7 +64,27 @@ pub fn chunk_body(c: &Chunk, light: &crate::world::light::ChunkLight) -> Vec<u8>
     }
     let data = c.network_sections();
     b.vi(data.len() as i32).raw(&data);
-    b.vi(0); // block entities
+    // block entities the client renders (chests, signs, beds, banners, …)
+    let reg = Registries::get();
+    let list: Vec<(&[i32; 3], i32, Vec<u8>)> = c
+        .block_entities
+        .iter()
+        .filter_map(|(p, t)| {
+            let id = t.get("id")?.as_str()?;
+            let ty = reg.id("minecraft:block_entity_type", id)?;
+            // only what the client needs to draw: no items / loot
+            let shown = match t {
+                Tag::Compound(v) => Tag::Compound(v.iter().filter(|(k, _)| !matches!(k.as_str(), "Items" | "LootTable" | "LootTableSeed" | "x" | "y" | "z" | "id")).cloned().collect()),
+                other => other.clone(),
+            };
+            Some((p, ty, shown.to_network_bytes()))
+        })
+        .collect();
+    b.vi(list.len() as i32);
+    for (p, ty, nbt) in list {
+        b.u8((((p[0] & 15) << 4) | (p[2] & 15)) as u8).i16(p[1] as i16).vi(ty);
+        b.extend_from_slice(&nbt);
+    }
     light_data(&mut b, light);
     b
 }
@@ -201,15 +221,28 @@ pub async fn run(mut sock: CryptStream<TcpStream>, st: Arc<ServerState>, profile
     // ---- play
     let view = client_view.min(st.cfg.server.view_distance as i32).max(2);
     let spawn = st.spawn;
-    let gamemode = st.cfg.server.default_gamemode.id();
+    let saved = crate::game::playerdata::load(&crate::game::playerdata::path(&st.world_dir, uuid)).filter(|s| !s.dead);
+    let gamemode = saved.as_ref().map(|s| s.gamemode).filter(|g| *g >= 0).unwrap_or(st.cfg.server.default_gamemode.id());
     let (tx, rx) = mpsc::channel::<Arc<Vec<u8>>>(OUT_QUEUE);
-    let pose = Pose { pos: spawn, yaw: 0.0, pitch: 0.0, on_ground: false };
+    let pose = match &saved {
+        Some(s) => Pose { pos: s.pos, yaw: s.yaw, pitch: s.pitch, on_ground: false },
+        None => Pose { pos: spawn, yaw: 0.0, pitch: 0.0, on_ground: false },
+    };
     let Some(me) = st.game.join(uuid, name.clone(), properties, pose, gamemode, view, tx) else {
         let b = text_nbt("You are already logged in from another location.");
         sock.write_all(&conn::encode(id("play", "clientbound", "disconnect"), &b, th)).await?;
         sock.flush().await?;
         return Ok(());
     };
+    if let Some(s) = &saved {
+        let mut inv = me.inv.lock();
+        for (w, stack) in &s.slots {
+            inv.slots[*w] = Some(*stack);
+        }
+        drop(inv);
+        me.held.store(s.held, Ordering::Relaxed);
+        *me.vit.lock() = s.vitals();
+    }
     st.online.store(st.game.count() as u32, Ordering::Relaxed);
     tracing::info!("{name} joined the game ({uuid}, entity {})", me.eid);
 
@@ -222,6 +255,9 @@ pub async fn run(mut sock: CryptStream<TcpStream>, st: Arc<ServerState>, profile
     let result = s.run(in_rx).await;
 
     // ---- leave
+    if let Err(e) = crate::game::playerdata::save(&st.world_dir, &me) {
+        tracing::error!("saving player {}: {e:#}", me.name);
+    }
     st.game.leave(me.eid);
     st.online.store(st.game.count() as u32, Ordering::Relaxed);
     for c in &s.sent {
@@ -1506,6 +1542,19 @@ impl Session {
         for t in outcome.thrown {
             self.throw(t, false);
         }
+        let open = {
+            let inv = self.me.inv.lock();
+            match inv.window {
+                crate::game::inventory::Window::Container(_, _, p) => Some((p, inv.ext.clone())),
+                _ => None,
+            }
+        };
+        if let Some((p, ext)) = open {
+            let stored = self.st.game.world.block_entity(p).map(|t| crate::game::blockentity::items(&t, ext.len()));
+            if stored.as_ref() != Some(&ext) {
+                self.st.game.container_changed(p, &ext, self.me.eid);
+            }
+        }
         if matches {
             self.st.game.flush_inventory(&self.me);
         } else {
@@ -1627,6 +1676,51 @@ impl Session {
         self.st.game.send_inventory(&self.me);
     }
 
+    fn open_container(&mut self, p: [i32; 3], screen: crate::game::blockentity::Screen, title: &str) {
+        use crate::game::blockentity as be;
+        let game = &self.st.game;
+        let mut t = match game.world.block_entity(p) {
+            Some(t) => t,
+            None => {
+                let Some(id) = game.world.get_block(p[0], p[1], p[2]).and_then(|b| be::be_id(b.name())) else { return };
+                be::new_tag(id, p)
+            }
+        };
+        // a chest with a solid block on top does not open
+        if matches!(screen, be::Screen::Rows(_)) && t.get("id").and_then(|v| v.as_str()).is_some_and(|i| i.ends_with("chest")) {
+            if game.world.get_block(p[0], p[1] + 1, p[2]).is_some_and(|b| b.is_opaque()) {
+                return;
+            }
+        }
+        if be::unpack_loot(&mut t, screen.size(), &game.data) || game.world.block_entity(p).is_none() {
+            game.world.set_block_entity(p, Some(t.clone()), false);
+        }
+        self.next_window = self.next_window % 100 + 1;
+        let id = self.next_window;
+        {
+            let held = self.me.held.load(Ordering::Relaxed) as i16;
+            let mut inv = self.me.inv.lock();
+            let thrown = inv.close(&game.data, held);
+            inv.window = crate::game::inventory::Window::Container(id, screen, p);
+            inv.ext = be::items(&t, screen.size());
+            drop(inv);
+            for t in thrown {
+                self.throw(t, false);
+            }
+        }
+        let menu = Registries::get().id("minecraft:menu", screen.menu()).unwrap_or(2);
+        let mut b = Vec::new();
+        b.vi(id as i32).vi(menu).raw(&text_nbt(title));
+        self.send("open_screen", &b);
+        let st = self.st.clone();
+        let game = &st.game;
+        game.send_inventory(&self.me);
+        if let be::Screen::Furnace(_) = screen {
+            game.send_furnace_data(&self.me, p);
+            game.watch_furnace(p);
+        }
+    }
+
     fn on_place(&mut self, hand: i32, pos: (i32, i32, i32), face: i32, cursor: (f32, f32, f32), seq: i32) -> Flow {
         let gm = self.gamemode();
         let off = match face {
@@ -1649,6 +1743,13 @@ impl Session {
             self.ack(seq);
             self.open_crafting();
             return Flow::Continue;
+        }
+        if !self.sneaking && gm != 3 && self.within_reach(pos) {
+            if let Some((screen, title)) = crate::game::blockentity::screen_of(clicked.name()) {
+                self.ack(seq);
+                self.open_container([pos.0, pos.1, pos.2], screen, title);
+                return Flow::Continue;
+            }
         }
         if gm == 2 || gm == 3 {
             self.ack(seq);

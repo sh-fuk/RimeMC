@@ -329,14 +329,20 @@ impl TPiece {
         match self.kind {
             TKind::Shipwreck { .. } => {
                 if matches!(meta, "map_chest" | "treasure_chest" | "supply_chest") && randomizable(lv.get(below)) {
-                    r.next_long();
+                    let table = match meta {
+                        "map_chest" => "chests/shipwreck_map",
+                        "treasure_chest" => "chests/shipwreck_treasure",
+                        _ => "chests/shipwreck_supply",
+                    };
+                    let id = crate::game::blockentity::be_id(lv.get(below).name()).unwrap_or("minecraft:chest");
+                    piece::loot_container(lv, below, id, table, r);
                 }
             }
             TKind::Igloo(_) => {
                 if meta == "chest" {
                     lv.set(p, blocks::AIR);
                     if lv.get(below).name() == "chest" {
-                        r.next_long();
+                        piece::loot_container(lv, below, "minecraft:chest", "chests/igloo_chest", r);
                     }
                 }
             }
@@ -345,7 +351,8 @@ impl TPiece {
                     let water = vstate::is_water(lv.get(p));
                     let s = state("chest", &[("waterlogged", if water { "true" } else { "false" })]);
                     if lv.set(p, s) {
-                        r.next_long();
+                        let table = if self.t.name.contains("big") { "chests/underwater_ruin_big" } else { "chests/underwater_ruin_small" };
+                        piece::loot_container(lv, p, "minecraft:chest", table, r);
                     }
                 } else if meta == "drowned" {
                     lv.set(p, if p[1] > lv.lib.sea_level { blocks::AIR } else { state("water", &[]) });
@@ -365,7 +372,7 @@ impl TPiece {
                     if let Some(d) = d {
                         s = template::rotate_state(state("chest", &[("facing", d)]), self.rot);
                     }
-                    piece::create_chest(lv, cb, r, p, Some(s));
+                    piece::create_chest(lv, cb, r, p, Some(s), "chests/woodland_mansion");
                 } else {
                     // mobs are spawned only once, by the chunk holding the marker
                     if !bb_inside(cb, p) {
@@ -695,7 +702,7 @@ impl LPiece for Treasure {
                     }
                 }
                 *bb = (p, p);
-                piece::create_chest(lv, cb, r, p, None);
+                piece::create_chest(lv, cb, r, p, None, "chests/buried_treasure");
                 return;
             }
             p[1] -= 1;

@@ -107,6 +107,24 @@ pub struct GameData {
     pub block_tags: HashMap<String, HashSet<String>>,
     loot: HashMap<String, Value>,
     pub recipes: Vec<Recipe>,
+    /// furnace / blast furnace / smoker / campfire recipes
+    pub cooking: Vec<Cooking>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CookKind {
+    Smelting,
+    Blasting,
+    Smoking,
+    Campfire,
+}
+
+pub struct Cooking {
+    pub kind: CookKind,
+    pub input: Ingredient,
+    pub result: Stack,
+    pub time: i32,
+    pub xp: f32,
 }
 
 fn strip(s: &str) -> &str {
@@ -165,18 +183,27 @@ impl GameData {
             let json: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
             loot.insert(strip(&key).to_string(), json);
         }
-        let mut d = GameData { item_tags, block_tags, loot, recipes: Vec::new() };
+        // chest, entity, gameplay… tables keep their folder ("chests/igloo_chest")
+        for dir in ["chests", "entities", "gameplay", "archaeology", "dispensers", "spawners", "equipment", "shearing"] {
+            for (key, path) in v.entries(&format!("loot_table/{dir}")) {
+                let json: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+                loot.insert(format!("{dir}/{}", strip(&key)), json);
+            }
+        }
+        let mut d = GameData { item_tags, block_tags, loot, recipes: Vec::new(), cooking: Vec::new() };
         for (_, path) in v.entries("recipe") {
             let json: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
             if let Some(r) = d.parse_recipe(&json) {
                 d.recipes.push(r);
+            } else if let Some(c) = d.parse_cooking(&json) {
+                d.cooking.push(c);
             }
         }
         Ok(d)
     }
 
     pub fn empty() -> Self {
-        GameData { item_tags: HashMap::new(), block_tags: HashMap::new(), loot: HashMap::new(), recipes: Vec::new() }
+        GameData { item_tags: HashMap::new(), block_tags: HashMap::new(), loot: HashMap::new(), recipes: Vec::new(), cooking: Vec::new() }
     }
 
     pub fn block_in(&self, tag: &str, block: &str) -> bool {
@@ -214,6 +241,44 @@ impl GameData {
             _ => {}
         }
         (!set.is_empty()).then_some(Ingredient(set))
+    }
+
+    fn parse_cooking(&self, j: &Value) -> Option<Cooking> {
+        let kind = match j.get("type")?.as_str()? {
+            "minecraft:smelting" => CookKind::Smelting,
+            "minecraft:blasting" => CookKind::Blasting,
+            "minecraft:smoking" => CookKind::Smoking,
+            "minecraft:campfire_cooking" => CookKind::Campfire,
+            _ => return None,
+        };
+        let res = j.get("result")?;
+        let item = Items::get().id(res.get("id")?.as_str()?)?;
+        let count = res.get("count").and_then(|c| c.as_u64()).unwrap_or(1).clamp(1, 64) as u8;
+        let input = self.ingredient(j.get("ingredient")?)?;
+        let default_time = match kind {
+            CookKind::Smelting => 200,
+            CookKind::Blasting | CookKind::Smoking => 100,
+            CookKind::Campfire => 100,
+        };
+        let time = j.get("cookingtime").and_then(|t| t.as_i64()).unwrap_or(default_time) as i32;
+        let xp = j.get("experience").and_then(|t| t.as_f64()).unwrap_or(0.0) as f32;
+        Some(Cooking { kind, input, result: Stack::new(item, count), time, xp })
+    }
+
+    /// The cooking recipe of `kind` for an input item.
+    pub fn cook(&self, kind: CookKind, item: i32) -> Option<&Cooking> {
+        self.cooking.iter().find(|c| c.kind == kind && c.input.0.contains(&item))
+    }
+
+    /// Rolls a non-block loot table ("chests/simple_dungeon",
+    /// "entities/zombie"); items are merged into stacks.
+    pub fn roll_loot(&self, table: &str, rng: &mut impl Rng) -> Vec<Stack> {
+        let key = strip(table);
+        let Some(t) = self.loot.get(key) else { return Vec::new() };
+        let mut out = Vec::new();
+        let ctx = LootCtx { block: crate::registry::blocks::AIR, tool: None, data: self };
+        self.eval_table(t, &ctx, rng, &mut out, 0);
+        out
     }
 
     fn parse_recipe(&self, j: &Value) -> Option<Recipe> {
@@ -424,7 +489,7 @@ impl GameData {
                         }
                     }
                     Some("minecraft:loot_table") => {
-                        if let Some(t) = pick.get("value").and_then(|v| v.as_str()).and_then(|v| self.loot.get(strip(v).trim_start_matches("blocks/"))) {
+                        if let Some(t) = pick.get("value").and_then(|v| v.as_str()).and_then(|v| self.loot.get(strip(v).trim_start_matches("blocks/")).or_else(|| self.loot.get(strip(v)))) {
                             self.eval_table(t, ctx, rng, out, depth + 1);
                         }
                     }

@@ -77,6 +77,8 @@ pub struct Proto {
     pub ticks: Vec<[i32; 3]>,
     /// entities added during generation (`addFreshEntity`): (type, pos)
     pub entities: Vec<(&'static str, [i32; 3])>,
+    /// block entities set during generation (vanilla NBT)
+    pub block_entities: Vec<([i32; 3], crate::nbt::Tag)>,
 }
 
 #[inline]
@@ -100,7 +102,7 @@ impl Proto {
                 }
             }
         }
-        Proto { blocks, biomes, hm, post: Vec::new(), ticks: Vec::new(), entities: Vec::new() }
+        Proto { blocks, biomes, hm, post: Vec::new(), ticks: Vec::new(), entities: Vec::new(), block_entities: Vec::new() }
     }
 
     pub fn get(&self, x: i32, y: i32, z: i32) -> BlockState {
@@ -210,6 +212,15 @@ impl Region<'_> {
     pub fn mark_post(&mut self, p: [i32; 3]) {
         if let Some(i) = self.slot(p[0], p[2]) {
             self.chunks[i].post.push(p);
+        }
+    }
+
+    /// The block entity at `p` (chest loot tables, spawner data, …).
+    pub fn set_block_entity(&mut self, p: [i32; 3], tag: crate::nbt::Tag) {
+        if let Some(i) = self.slot(p[0], p[2]) {
+            let list = &mut self.chunks[i].block_entities;
+            list.retain(|(q, _)| *q != p);
+            list.push((p, tag));
         }
     }
 

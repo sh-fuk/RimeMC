@@ -774,7 +774,7 @@ fn pp_room_crossing(t: &SPiece, sp: &mut Sp, r: &mut dyn Rng, lr: &mut dyn Rng, 
     sp.place(a8_BlockState, 9, 1, 3);
     sp.place(a8_BlockState, 9, 2, 3);
     sp.place(a8_BlockState, 9, 3, 3);
-    let t1 = sp.create_chest(r, 3, 4, 8);
+    let t1 = sp.create_chest(r, 3, 4, 8, "chests/stronghold_corridor");
     pc = 1162;
     }
     1162 => {
@@ -950,7 +950,7 @@ fn pp_chest_corridor(t: &SPiece, sp: &mut Sp, r: &mut dyn Rng, lr: &mut dyn Rng,
     }
     196 => {
     t.placed.store((1 != 0), Relaxed);
-    let t3 = sp.create_chest(r, 3, 2, 3);
+    let t3 = sp.create_chest(r, 3, 2, 3, "chests/stronghold_crossing");
     pc = 217;
     }
     217 => {
@@ -1116,12 +1116,12 @@ fn pp_library(t: &SPiece, sp: &mut Sp, r: &mut dyn Rng, lr: &mut dyn Rng, a6: P)
     pc = 1651;
     }
     1651 => {
-    let t1 = sp.create_chest(r, 3, 3, 5);
+    let t1 = sp.create_chest(r, 3, 3, 5, "chests/stronghold_library");
     pc = if !(t.f[0]) { 1707 } else { 1674 };
     }
     1674 => {
     sp.place(state("cave_air", &[]), 12, 9, 1);
-    let t2 = sp.create_chest(r, 12, 8, 1);
+    let t2 = sp.create_chest(r, 12, 8, 1, "chests/stronghold_library");
     pc = 1707;
     }
     1707 => {
@@ -1285,6 +1285,7 @@ fn pp_portal_room(t: &SPiece, sp: &mut Sp, r: &mut dyn Rng, lr: &mut dyn Rng, a6
     1241 => {
     t.placed.store((1 != 0), Relaxed);
     let t4 = sp.lv.set(a18_P, state("spawner", &[]));
+    piece::spawner_entity(sp.lv, a18_P, "silverfish");
     pc = if !(false) { 1297 } else { 1280 };
     }
     1280 => {

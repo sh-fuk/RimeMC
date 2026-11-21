@@ -87,6 +87,10 @@ pub struct Generated {
     /// fill and carvers. Final chunks: fluid blocks that get a fluid tick
     /// when the chunk is loaded (world coordinates).
     pub fluid_ticks: Vec<[i32; 3]>,
+    /// block entities of the final chunk
+    pub block_entities: Vec<([i32; 3], crate::nbt::Tag)>,
+    /// entities added by generation: (type, position)
+    pub entities: Vec<(&'static str, [i32; 3])>,
 }
 
 impl VanillaGenerator {
@@ -224,6 +228,6 @@ impl VanillaGenerator {
             let mut ctx = carver::Carving { cx, cz, blocks: &mut blocks, heights: &mut heights, mask: vec![false; (16 * 16 * HEIGHT) as usize], aquifer: &mut aquifer, top: &top, marks: &mut marks };
             carver::apply(&self.carvers, self.seed, &mut ctx);
         }
-        Generated { blocks, biomes, heights, fluid_ticks: marks }
+        Generated { blocks, biomes, heights, fluid_ticks: marks, block_entities: Vec::new(), entities: Vec::new() }
     }
 }

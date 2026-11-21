@@ -778,6 +778,7 @@ impl Pp<'_, '_> {
                         if bb_inside(&self.cb, p) && self.is_interior(1, 0, zz) {
                             placed_spider.store(true, Ordering::Relaxed);
                             self.lv.set(p, t.spawner);
+                            super::piece::spawner_entity(self.lv, p, "cave_spider");
                         }
                     }
                 }

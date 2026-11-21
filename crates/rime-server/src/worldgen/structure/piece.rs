@@ -226,12 +226,12 @@ impl Sp<'_, '_> {
         }
     }
     /// `createDispenser`
-    pub fn create_dispenser(&mut self, r: &mut dyn Rng, x: i32, y: i32, z: i32, facing: u8) -> bool {
+    pub fn create_dispenser(&mut self, r: &mut dyn Rng, x: i32, y: i32, z: i32, facing: u8, loot: &str) -> bool {
         let p = self.pos(x, y, z);
         if bb_inside(&self.cb, p) && self.lv.get(p).name() != "dispenser" {
             self.place(state("dispenser", &[("facing", dir_name(facing))]), x, y, z);
             if self.lv.get(p).name() == "dispenser" {
-                r.next_long();
+                loot_container(self.lv, p, "minecraft:dispenser", loot, r);
             }
             return true;
         }
@@ -284,9 +284,9 @@ impl Sp<'_, '_> {
         }
     }
     /// `createChest(level, box, random, x, y, z, lootTable)` (local coords)
-    pub fn create_chest(&mut self, r: &mut dyn Rng, x: i32, y: i32, z: i32) -> bool {
+    pub fn create_chest(&mut self, r: &mut dyn Rng, x: i32, y: i32, z: i32, loot: &str) -> bool {
         let p = self.pos(x, y, z);
-        create_chest(self.lv, &self.cb, r, p, None)
+        create_chest(self.lv, &self.cb, r, p, None, loot)
     }
 }
 
@@ -335,13 +335,38 @@ pub fn reorient(lv: &Region, p: P, s: BlockState) -> BlockState {
 }
 
 /// `StructurePiece.createChest(level, box, random, pos, loot, state)`
-pub fn create_chest(lv: &mut Region, cb: &Bb, r: &mut dyn Rng, p: P, s: Option<BlockState>) -> bool {
+pub fn create_chest(lv: &mut Region, cb: &Bb, r: &mut dyn Rng, p: P, s: Option<BlockState>, loot: &str) -> bool {
     if !bb_inside(cb, p) || lv.get(p).name() == "chest" {
         return false;
     }
     let s = s.unwrap_or_else(|| reorient(lv, p, state("chest", &[])));
     if lv.set(p, s) && lv.get(p).name() == "chest" {
-        r.next_long();
+        loot_container(lv, p, "minecraft:chest", loot, r);
     }
     true
+}
+
+/// `RandomizableContainer.setBlockEntityLootTable`: the loot table and a
+/// seed drawn from the structure random.
+pub fn loot_container(lv: &mut Region, p: P, id: &str, loot: &str, r: &mut dyn Rng) {
+    use crate::nbt::Tag;
+    let seed = r.next_long();
+    let mut t = crate::game::blockentity::new_tag(id, p);
+    if let Tag::Compound(c) = &mut t {
+        c.push(("LootTable".into(), Tag::String(format!("minecraft:{loot}"))));
+        c.push(("LootTableSeed".into(), Tag::Long(seed)));
+    }
+    lv.set_block_entity(p, t);
+}
+
+/// A monster spawner block entity for `mob`.
+pub fn spawner_entity(lv: &mut Region, p: P, mob: &str) {
+    use crate::nbt::Tag;
+    let mut t = crate::game::blockentity::new_tag("minecraft:mob_spawner", p);
+    if let Tag::Compound(c) = &mut t {
+        let entity = Tag::Compound(vec![("id".into(), Tag::String(format!("minecraft:{mob}")))]);
+        c.push(("SpawnData".into(), Tag::Compound(vec![("entity".into(), entity)])));
+        c.push(("Delay".into(), Tag::Short(20)));
+    }
+    lv.set_block_entity(p, t);
 }

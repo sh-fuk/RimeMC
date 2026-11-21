@@ -385,7 +385,7 @@ fn m_post_process(t: &DesertPyramid, sp: &mut Sp, r: &mut dyn Rng, lr: &mut dyn 
     3600 => {
     l14 = (piece::step(a13_u8)[0] * 2);
     l15 = (piece::step(a13_u8)[2] * 2);
-    let t5 = sp.create_chest(r, (10 + l14), -11, (10 + l15));
+    let t5 = sp.create_chest(r, (10 + l14), -11, (10 + l15), "chests/desert_pyramid");
     t.placed[piece::data2d(a13_u8) as usize].store(t5, Relaxed);
     pc = 3652;
     }
@@ -880,7 +880,7 @@ fn j_post_process(t: &JungleTemple, sp: &mut Sp, r: &mut dyn Rng, lr: &mut dyn R
     pc = if t.placed_trap1.load(Relaxed) { 2064 } else { 2041 };
     }
     2041 => {
-    let t2 = sp.create_dispenser(r, 3, -2, 1, piece::dir_parse_name("north"));
+    let t2 = sp.create_dispenser(r, 3, -2, 1, piece::dir_parse_name("north"), "chests/jungle_temple_dispenser");
     t.placed_trap1.store(t2, Relaxed);
     pc = 2064;
     }
@@ -899,7 +899,7 @@ fn j_post_process(t: &JungleTemple, sp: &mut Sp, r: &mut dyn Rng, lr: &mut dyn R
     pc = if t.placed_trap2.load(Relaxed) { 2542 } else { 2518 };
     }
     2518 => {
-    let t3 = sp.create_dispenser(r, 9, -2, 3, piece::dir_parse_name("west"));
+    let t3 = sp.create_dispenser(r, 9, -2, 3, piece::dir_parse_name("west"), "chests/jungle_temple_dispenser");
     t.placed_trap2.store(t3, Relaxed);
     pc = 2542;
     }
@@ -909,7 +909,7 @@ fn j_post_process(t: &JungleTemple, sp: &mut Sp, r: &mut dyn Rng, lr: &mut dyn R
     pc = if t.placed_main_chest.load(Relaxed) { 2631 } else { 2610 };
     }
     2610 => {
-    let t4 = sp.create_chest(r, 8, -3, 3);
+    let t4 = sp.create_chest(r, 8, -3, 3, "chests/jungle_temple");
     t.placed_main_chest.store(t4, Relaxed);
     pc = 2631;
     }
@@ -945,7 +945,7 @@ fn j_post_process(t: &JungleTemple, sp: &mut Sp, r: &mut dyn Rng, lr: &mut dyn R
     pc = if t.placed_hidden_chest.load(Relaxed) { 3278 } else { 3256 };
     }
     3256 => {
-    let t5 = sp.create_chest(r, 9, -3, 10);
+    let t5 = sp.create_chest(r, 9, -3, 10, "chests/jungle_temple");
     t.placed_hidden_chest.store(t5, Relaxed);
     pc = 3278;
     }

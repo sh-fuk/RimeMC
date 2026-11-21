@@ -446,7 +446,7 @@ impl PosTest {
 impl Rule {
     /// `new ProcessorRule(input, location, output)`
     pub fn new(input: RuleTest, loc: RuleTest, output: BlockState, adds_nbt: bool) -> Rule {
-        Rule { input, loc, pos: PosTest::Always, output, adds_nbt }
+        Rule { input, loc, pos: PosTest::Always, output, adds_nbt, loot: None }
     }
 }
 
@@ -458,6 +458,8 @@ pub struct Rule {
     output: BlockState,
     /// a block entity modifier that leaves nbt behind (append_loot / append_static)
     adds_nbt: bool,
+    /// `append_loot` table
+    loot: Option<Arc<str>>,
 }
 
 #[derive(Clone)]
@@ -499,6 +501,7 @@ impl Proc {
                         },
                         output: super::super::feature::place::parse_state(&r["output_state"])?,
                         adds_nbt: matches!(bem, "append_loot" | "append_static"),
+                        loot: (bem == "append_loot").then(|| r["block_entity_modifier"]["loot_table"].as_str().unwrap_or("").into()),
                     });
                 }
                 Proc::Rule(rules)
@@ -577,6 +580,10 @@ pub struct Info {
     pub pos: P,
     pub state: BlockState,
     pub has_nbt: bool,
+    /// the template block's nbt (block entity data)
+    pub nbt: Option<Arc<Value>>,
+    /// `AppendLoot` block entity modifier: loot table to add
+    pub loot: Option<Arc<str>>,
 }
 
 const STAIRS_NON_MOSSY: [&str; 2] = ["stone_slab", "stone_brick_slab"];
@@ -667,7 +674,7 @@ fn process(p: &Proc, lv: &Region, offset: P, pos: P, orig: &BlockInfo, cur: Info
             if s.name() == "structure_void" {
                 return None;
             }
-            Some(Info { pos: cur.pos, state: s, has_nbt: false })
+            Some(Info { pos: cur.pos, state: s, has_nbt: false, nbt: None, loot: None })
         }
         Proc::Rule(rules) => {
             // RuleProcessor always seeds from the position (not settings.getRandom)
@@ -675,7 +682,7 @@ fn process(p: &Proc, lv: &Region, offset: P, pos: P, orig: &BlockInfo, cur: Info
             let existing = lv.get(cur.pos);
             for rule in rules {
                 if rule.input.test(cur.state, &mut r) && rule.loc.test(existing, &mut r) && rule.pos.test(cur.pos, pos, &mut r) {
-                    return Some(Info { pos: cur.pos, state: rule.output, has_nbt: cur.has_nbt || rule.adds_nbt });
+                    return Some(Info { pos: cur.pos, state: rule.output, has_nbt: cur.has_nbt || rule.adds_nbt, nbt: cur.nbt.clone(), loot: rule.loot.clone().or(cur.loot.clone()) });
                 }
             }
             Some(cur)
@@ -752,7 +759,7 @@ pub fn process_blocks(lv: &Region, seed: i64, offset: P, pos: P, settings: &Sett
     let mut out: Vec<Info> = Vec::new();
     'b: for b in blocks {
         let wp = add(transform(b.pos, settings.mirror, settings.rot, settings.pivot), offset);
-        let mut cur = Info { pos: wp, state: b.state, has_nbt: b.nbt.is_some() };
+        let mut cur = Info { pos: wp, state: b.state, has_nbt: b.nbt.is_some(), nbt: b.nbt.clone(), loot: None };
         for p in &settings.processors {
             match process(p, lv, offset, pos, b, cur, settings, shared) {
                 Some(c) => cur = c,
@@ -799,6 +806,44 @@ pub fn process_blocks(lv: &Region, seed: i64, offset: P, pos: P, settings: &Sett
     out
 }
 
+/// The block entity of a placed template block: the template's nbt with
+/// the world position, a loot table seed for randomizable containers
+/// (`RandomizableContainer.setBlockEntityLootTable`) and appended loot.
+fn store_block_entity(lv: &mut Region, b: &Info, s: BlockState, random: &mut dyn Rng) {
+    use crate::nbt::Tag;
+    let Some(id) = crate::game::blockentity::be_id(s.name()) else {
+        if b.has_nbt && randomizable(s) {
+            random.next_long();
+        }
+        return;
+    };
+    let mut tag = b.nbt.as_deref().map(Tag::from_json).unwrap_or(Tag::Compound(Vec::new()));
+    if !matches!(tag, Tag::Compound(_)) {
+        tag = Tag::Compound(Vec::new());
+    }
+    if let Tag::Compound(c) = &mut tag {
+        c.retain(|(k, _)| !matches!(k.as_str(), "x" | "y" | "z" | "id"));
+        c.insert(0, ("id".into(), Tag::String(id.into())));
+        c.push(("x".into(), Tag::Int(b.pos[0])));
+        c.push(("y".into(), Tag::Int(b.pos[1])));
+        c.push(("z".into(), Tag::Int(b.pos[2])));
+        if let Some(l) = &b.loot {
+            c.retain(|(k, _)| k != "LootTable" && k != "LootTableSeed");
+            c.push(("LootTable".into(), Tag::String(l.to_string())));
+        }
+    }
+    if b.has_nbt && randomizable(s) {
+        let seed = random.next_long();
+        if let Tag::Compound(c) = &mut tag {
+            if c.iter().any(|(k, _)| k == "LootTable") {
+                c.retain(|(k, _)| k != "LootTableSeed");
+                c.push(("LootTableSeed".into(), Tag::Long(seed)));
+            }
+        }
+    }
+    lv.set_block_entity(b.pos, tag);
+}
+
 /// `StructureTemplate.placeInWorld`. `random` is the structure / feature
 /// random (loot table seeds draw from it). Returns false if nothing placed.
 pub fn place_in_world(lv: &mut Region, seed: i64, t: &Template, offset: P, pos: P, settings: &Settings, random: &mut dyn Rng) -> bool {
@@ -835,8 +880,8 @@ pub fn place_in_world(lv: &mut Region, seed: i64, t: &Template, offset: P, pos: 
             continue;
         }
         placed.push(b.pos);
-        if b.has_nbt && randomizable(s) {
-            random.next_long();
+        if b.has_nbt || b.loot.is_some() {
+            store_block_entity(lv, &b, s, random);
         }
         if let Some(f) = fluid {
             if vstate::fluid_source(s) {

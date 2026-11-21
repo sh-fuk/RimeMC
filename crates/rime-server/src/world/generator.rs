@@ -285,6 +285,8 @@ fn vanilla_chunk(g: crate::worldgen::Generated, cx: i32, cz: i32) -> Chunk {
         s.optimize();
     }
     c.fluid_ticks = g.fluid_ticks;
+    c.block_entities = g.block_entities.into_iter().collect();
+    c.gen_entities = g.entities.into_iter().map(|(k, p)| (k.to_string(), p)).collect();
     c
 }
 
