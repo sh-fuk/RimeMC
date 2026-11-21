@@ -208,7 +208,7 @@ impl Pools {
         // a missing template is an empty one (`StructureTemplateManager.getOrCreate`)
         let t = Arc::new(Template::load(&|rel| b.load(rel), &k).unwrap_or_else(|e| {
             tracing::debug!("structure template {k}: {e:#}");
-            Template { name: k.clone(), size: [0, 0, 0], blocks: Vec::new(), jigsaws: Vec::new(), data_markers: Vec::new() }
+            Template { name: k.clone(), size: [0, 0, 0], blocks: Vec::new(), alt: Vec::new(), jigsaws: Vec::new(), data_markers: Vec::new() }
         }));
         self.templates.insert(k, t.clone());
         Ok(t)

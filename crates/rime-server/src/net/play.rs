@@ -762,6 +762,15 @@ impl Session {
 
     fn die(&mut self, cause: Cause) {
         let msg = cause.death_message(&self.me.name);
+        // ServerPlayer.die: the health packet goes first (client shows the death screen at 0)
+        let (food, sat) = {
+            let mut v = self.me.vit.lock();
+            v.dirty = false;
+            (v.food, v.saturation)
+        };
+        let mut b = Vec::new();
+        b.f32(0.0).vi(food).f32(sat);
+        self.send("set_health", &b);
         let mut b = Vec::new();
         b.vi(self.me.eid).raw(&text_nbt(&msg));
         self.send("player_combat_kill", &b);

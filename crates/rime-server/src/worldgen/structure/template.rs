@@ -171,6 +171,8 @@ pub struct Template {
     /// `Palette.blocks()` order: full blocks, other blocks, blocks with nbt,
     /// each sorted by y, x, z
     pub blocks: Vec<BlockInfo>,
+    /// the other palettes (`palettes[1..]`, e.g. shipwreck wood types)
+    pub alt: Vec<Vec<BlockInfo>>,
     /// indices of jigsaw blocks in `blocks`
     pub jigsaws: Vec<usize>,
     /// data structure blocks (`structure_block` in DATA mode): (pos, metadata)
@@ -235,42 +237,52 @@ impl Template {
         let key = name.trim_start_matches("minecraft:");
         let v = lib_load(&format!("structure/{key}"))?;
         let size = ints(&v["size"])?;
-        let pal = if v["palette"].is_array() { &v["palette"] } else { &v["palettes"][0] };
         let reg = BlockRegistry::get();
-        let mut states = Vec::new();
-        for e in pal.as_array().into_iter().flatten() {
-            let n = e["Name"].as_str().unwrap_or("").trim_start_matches("minecraft:");
-            let props: Vec<(String, String)> = e["Properties"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect();
-            let pr: Vec<(&str, &str)> = props.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-            states.push(reg.state(n, &pr).ok_or_else(|| anyhow!("unknown template block {n} in {key}"))?);
-        }
-        let (mut full, mut other, mut with_nbt) = (Vec::new(), Vec::new(), Vec::new());
-        for e in v["blocks"].as_array().into_iter().flatten() {
-            let pos = ints(&e["pos"])?;
-            let state = *states.get(e["state"].as_u64().unwrap_or(0) as usize).ok_or_else(|| anyhow!("bad palette index"))?;
-            let nbt = e.get("nbt").filter(|n| n.is_object()).map(|n| Arc::new(n.clone()));
-            let b = BlockInfo { pos, state, nbt };
-            if b.nbt.is_some() {
-                with_nbt.push(b);
-            } else if template_full(state) {
-                full.push(b);
-            } else {
-                other.push(b);
+        // `StructureTemplate.Palette.blocks()` of one palette
+        let build = |pal: &Value| -> Result<Vec<BlockInfo>> {
+            let mut states = Vec::new();
+            for e in pal.as_array().into_iter().flatten() {
+                let n = e["Name"].as_str().unwrap_or("").trim_start_matches("minecraft:");
+                let props: Vec<(String, String)> = e["Properties"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect();
+                let pr: Vec<(&str, &str)> = props.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                states.push(reg.state(n, &pr).ok_or_else(|| anyhow!("unknown template block {n} in {key}"))?);
             }
-        }
-        let key_of = |b: &BlockInfo| (b.pos[1], b.pos[0], b.pos[2]);
-        full.sort_by_key(key_of);
-        other.sort_by_key(key_of);
-        with_nbt.sort_by_key(key_of);
-        full.extend(other);
-        full.extend(with_nbt);
+            let (mut full, mut other, mut with_nbt) = (Vec::new(), Vec::new(), Vec::new());
+            for e in v["blocks"].as_array().into_iter().flatten() {
+                let pos = ints(&e["pos"])?;
+                let state = *states.get(e["state"].as_u64().unwrap_or(0) as usize).ok_or_else(|| anyhow!("bad palette index"))?;
+                let nbt = e.get("nbt").filter(|n| n.is_object()).map(|n| Arc::new(n.clone()));
+                let b = BlockInfo { pos, state, nbt };
+                if b.nbt.is_some() {
+                    with_nbt.push(b);
+                } else if template_full(state) {
+                    full.push(b);
+                } else {
+                    other.push(b);
+                }
+            }
+            let key_of = |b: &BlockInfo| (b.pos[1], b.pos[0], b.pos[2]);
+            full.sort_by_key(key_of);
+            other.sort_by_key(key_of);
+            with_nbt.sort_by_key(key_of);
+            full.extend(other);
+            full.extend(with_nbt);
+            Ok(full)
+        };
+        let (full, alt) = if v["palette"].is_array() {
+            (build(&v["palette"])?, Vec::new())
+        } else {
+            let pals: Vec<&Value> = v["palettes"].as_array().into_iter().flatten().collect();
+            let first = build(pals.first().copied().unwrap_or(&Value::Null))?;
+            (first, pals.iter().skip(1).map(|p| build(p)).collect::<Result<Vec<_>>>()?)
+        };
         let jigsaws = full.iter().enumerate().filter(|(_, b)| b.state.name() == "jigsaw").map(|(i, _)| i).collect();
         let data_markers = full
             .iter()
             .filter(|b| b.state.name() == "structure_block" && reg.property(b.state, "mode") == Some("data"))
             .map(|b| (b.pos, b.nbt.as_ref().and_then(|n| n["metadata"].as_str()).unwrap_or("").to_string()))
             .collect();
-        Ok(Template { name: key.to_string(), size, blocks: full, jigsaws, data_markers })
+        Ok(Template { name: key.to_string(), size, blocks: full, alt, jigsaws, data_markers })
     }
 
     /// `getSize(rotation)`
@@ -795,10 +807,22 @@ pub fn place_in_world(lv: &mut Region, seed: i64, t: &Template, offset: P, pos: 
     }
     let infos = {
         let mut shared: Option<&mut dyn Rng> = if settings.random_seed.is_some() { Some(&mut *random) } else { None };
-        process_blocks(lv, seed, offset, pos, settings, &t.blocks, &mut shared)
+        // StructurePlaceSettings.getRandomPalette(palettes, offset)
+        let blocks = if t.alt.is_empty() {
+            &t.blocks
+        } else {
+            let n = t.alt.len() as i32 + 1;
+            let i = match shared.as_mut() {
+                Some(r) => r.next_int_bound(n),
+                None => Legacy::new(block_seed(offset[0], offset[1], offset[2])).next_int_bound(n),
+            };
+            if i == 0 { &t.blocks } else { &t.alt[i as usize - 1] }
+        };
+        process_blocks(lv, seed, offset, pos, settings, blocks, &mut shared)
     };
     let mut flowing: Vec<P> = Vec::new();
     let mut sources: Vec<P> = Vec::new();
+    let mut placed: Vec<P> = Vec::new();
     for b in infos {
         if let Some(bb) = &settings.bb {
             if !bb_inside(bb, b.pos) {
@@ -810,6 +834,7 @@ pub fn place_in_world(lv: &mut Region, seed: i64, t: &Template, offset: P, pos: 
         if !lv.set(b.pos, s) {
             continue;
         }
+        placed.push(b.pos);
         if b.has_nbt && randomizable(s) {
             random.next_long();
         }
@@ -862,5 +887,61 @@ pub fn place_in_world(lv: &mut Region, seed: i64, t: &Template, offset: P, pos: 
             true
         });
     }
+    if !settings.known_shape && !placed.is_empty() {
+        update_placed_shapes(lv, &placed);
+    }
     true
+}
+
+/// `StructureTemplate.placeInWorld` without a known shape:
+/// `updateShapeAtEdge` around the placed blocks, then
+/// `Block.updateFromNeighbourShapes` for each of them.
+fn update_placed_shapes(lv: &mut Region, placed: &[P]) {
+    use super::super::feature::{shape_update, update_shape, UPDATE_ORDER};
+    let set: std::collections::HashSet<P> = placed.iter().copied().collect();
+    let (mut lo, mut hi) = (placed[0], placed[0]);
+    for p in placed {
+        for i in 0..3 {
+            lo[i] = lo[i].min(p[i]);
+            hi[i] = hi[i].max(p[i]);
+        }
+    }
+    // DiscreteVoxelShape.forAllFaces: axes x, y, z; each face to the outside
+    for (axis, dirs) in [(0usize, [(4u8, [-1, 0, 0]), (5u8, [1, 0, 0])]), (1, [(0, [0, -1, 0]), (1, [0, 1, 0])]), (2, [(2, [0, 0, -1]), (3, [0, 0, 1])])] {
+        let _ = axis;
+        for x in lo[0]..=hi[0] {
+            for y in lo[1]..=hi[1] {
+                for z in lo[2]..=hi[2] {
+                    let p = [x, y, z];
+                    if !set.contains(&p) {
+                        continue;
+                    }
+                    for (d, o) in dirs {
+                        let q = add(p, o);
+                        if set.contains(&q) {
+                            continue;
+                        }
+                        let a = lv.get(p);
+                        let b = lv.get(q);
+                        let a2 = update_shape(lv, a, p, d, b);
+                        if a2 != a {
+                            lv.set(p, a2);
+                        }
+                        let b2 = update_shape(lv, b, q, d ^ 1, lv.get(p));
+                        if b2 != b {
+                            lv.set(q, b2);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let _ = UPDATE_ORDER;
+    for &p in placed {
+        let s = lv.get(p);
+        let n = shape_update(lv, s, p);
+        if n != s {
+            lv.set(p, n);
+        }
+    }
 }

@@ -502,6 +502,10 @@ fn areas_match_vanilla() {
         let c = chunks.into_iter().find(|c| c.index == idx)?;
         let chunk = Chunk::from_nbt(&c.raw)?;
         let (_, root) = Tag::from_root_bytes(&c.raw).ok()?;
+        // only finished chunks are comparable (forceload leaves partial neighbours)
+        if !matches!(root.get("Status"), Some(Tag::String(s)) if s == "minecraft:full") {
+            return None;
+        }
         let mut light = vec![(None, None); 26];
         if let Some(Tag::List(secs)) = root.get("sections") {
             for s in secs {
@@ -693,7 +697,7 @@ fn areas_match_vanilla() {
                         *by_kind.entry(format!("{} -> {}", s.name(), v.name())).or_default() += 1;
                         let only = std::env::var("RIME_ONLY").ok();
                         if shown < show && show_here(cx, cz) && only.as_deref().is_none_or(|o| s.name() == o || v.name() == o) {
-                            eprintln!("  {},{y},{}: ours {} vanilla {}", cx * 16 + x as i32, cz * 16 + z as i32, s.name(), v.name());
+                            eprintln!("  {},{y},{}: ours {} {:?} vanilla {} {:?}", cx * 16 + x as i32, cz * 16 + z as i32, s.name(), reg.properties(s), v.name(), reg.properties(v));
                             shown += 1;
                         }
                     }
@@ -797,7 +801,8 @@ pub fn vanilla_starts(dir: &str, cx: i32, cz: i32) -> Option<Vec<(String, Vec<su
                 if let Some(Tag::IntArray(b)) = p.get("BB") {
                     boxes.push(([b[0], b[1], b[2]], [b[3], b[4], b[5]]));
                 }
-                let loc = p.get("pool_element").map(|e| format!("{}", e.to_json())).unwrap_or_default();
+                let loc = p.get("pool_element").or(p.get("Template")).map(|e| format!("{}", e.to_json())).unwrap_or_default();
+                if std::env::var("RIME_DUMP_PIECE").is_ok() { eprintln!("   vanilla piece {}", p.to_json()); }
                 names.push(loc);
             }
         }

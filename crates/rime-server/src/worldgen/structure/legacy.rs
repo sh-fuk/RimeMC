@@ -41,7 +41,7 @@ pub struct LLib {
 
 impl LLib {
     fn get(&self, name: &str) -> Arc<Template> {
-        self.tpl.get(name).cloned().unwrap_or_else(|| Arc::new(Template { name: name.into(), size: [0, 0, 0], blocks: Vec::new(), jigsaws: Vec::new(), data_markers: Vec::new() }))
+        self.tpl.get(name).cloned().unwrap_or_else(|| Arc::new(Template { name: name.into(), size: [0, 0, 0], blocks: Vec::new(), alt: Vec::new(), jigsaws: Vec::new(), data_markers: Vec::new() }))
     }
     fn fcr(&self, s: BlockState) -> bool {
         self.fcr.as_ref().is_some_and(|t| t.contains(s))

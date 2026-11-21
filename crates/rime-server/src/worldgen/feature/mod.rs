@@ -260,44 +260,232 @@ pub fn post_process(lv: &mut Region) {
     }
 }
 
-/// `updateShape` of fences (connections) and wall torches (support) for
-/// every neighbour, as `Block.updateFromNeighbourShapes` does.
-fn shape_update(lv: &Region, s: BlockState, p: [i32; 3]) -> BlockState {
+/// `Block.updateFromNeighbourShapes` (UPDATE_SHAPE_ORDER: west, east,
+/// north, south, down, up) for the blocks structures and features leave:
+/// fence / pane / wall connections and the support of torches and ladders.
+pub fn shape_update(lv: &Region, s: BlockState, p: [i32; 3]) -> BlockState {
+    let mut out = s;
+    for (d, o) in UPDATE_ORDER {
+        let q = [p[0] + o[0], p[1] + o[1], p[2] + o[2]];
+        out = update_shape(lv, out, p, d, lv.get(q));
+        if out.is_air() {
+            break;
+        }
+    }
+    out
+}
+
+/// direction ordinal and offset, in `Block.UPDATE_SHAPE_ORDER`
+pub const UPDATE_ORDER: [(u8, [i32; 3]); 6] = [(4, [-1, 0, 0]), (5, [1, 0, 0]), (2, [0, 0, -1]), (3, [0, 0, 1]), (0, [0, -1, 0]), (1, [0, 1, 0])];
+
+fn dir_prop(d: u8) -> &'static str {
+    ["down", "up", "north", "south", "west", "east"][d as usize]
+}
+
+/// `Block.isExceptionForConnection`
+fn connection_exception(nb: BlockState) -> bool {
+    let nn = nb.name();
+    is_leaves(nb) || matches!(nn, "barrier" | "carved_pumpkin" | "jack_o_lantern" | "melon" | "pumpkin") || nn.ends_with("shulker_box")
+}
+
+fn is_wall(n: &str) -> bool {
+    n.ends_with("_wall")
+}
+
+/// `instanceof IronBarsBlock` (iron / copper bars and glass panes)
+fn is_bars(n: &str) -> bool {
+    n.ends_with("_bars") || n.ends_with("glass_pane")
+}
+
+/// `FenceGateBlock.connectsToDirection`
+fn gate_connects(nb: BlockState, d: u8) -> bool {
+    nb.name().ends_with("_fence_gate") && {
+        let f = crate::registry::BlockRegistry::get().property(nb, "facing").unwrap_or("north");
+        matches!(f, "east" | "west") != (d >= 4)
+    }
+}
+
+/// `BlockState.updateShape` towards one neighbour (direction ordinal `d`).
+pub fn update_shape(lv: &Region, s: BlockState, p: [i32; 3], d: u8, nb: BlockState) -> BlockState {
     let reg = crate::registry::BlockRegistry::get();
     let name = s.name();
-    // north, south, west, east with vanilla direction ordinals
-    const H: [(u8, [i32; 3], &str); 4] = [(2, [0, 0, -1], "north"), (3, [0, 0, 1], "south"), (4, [-1, 0, 0], "west"), (5, [1, 0, 0], "east")];
-    if name.ends_with("_fence") {
+    let horizontal = d >= 2;
+    if name.ends_with("_fence") && horizontal {
         let wooden = name != "nether_brick_fence";
-        let mut out = s;
-        for (d, o, prop) in H {
-            let q = [p[0] + o[0], p[1], p[2] + o[2]];
-            let nb = lv.get(q);
-            let nn = nb.name();
-            let solid = vstate::sturdy(nb, d ^ 1);
-            let exception = is_leaves(nb) || matches!(nn, "barrier" | "carved_pumpkin" | "jack_o_lantern" | "melon" | "pumpkin") || nn.ends_with("shulker_box");
-            let same = nn.ends_with("_fence") && (nn != "nether_brick_fence") == wooden;
-            let gate = nn.ends_with("_fence_gate") && {
-                // facing axis == clockwise(dir) axis: the gate faces along the other axis
-                let f = reg.property(nb, "facing").unwrap_or("north");
-                let gate_x = matches!(f, "east" | "west");
-                let dir_x = d >= 4;
-                gate_x != dir_x
-            };
-            let c = (!exception && solid) || same || gate;
-            out = reg.with(out, prop, if c { "true" } else { "false" }).unwrap_or(out);
-        }
-        return out;
+        let nn = nb.name();
+        let same = nn.ends_with("_fence") && (nn != "nether_brick_fence") == wooden;
+        let c = (!connection_exception(nb) && vstate::sturdy(nb, d ^ 1)) || same || gate_connects(nb, d);
+        return reg.with(s, dir_prop(d), if c { "true" } else { "false" }).unwrap_or(s);
     }
-    if name == "wall_torch" || name == "soul_wall_torch" || name == "copper_wall_torch" || name == "redstone_wall_torch" {
+    if is_bars(name) && horizontal {
+        let nn = nb.name();
+        let c = (!connection_exception(nb) && vstate::sturdy(nb, d ^ 1)) || is_bars(nn) || is_wall(nn);
+        return reg.with(s, dir_prop(d), if c { "true" } else { "false" }).unwrap_or(s);
+    }
+    if is_wall(name) {
+        return wall_update(lv, s, p, d, nb);
+    }
+    if name.ends_with("_stairs") && horizontal {
+        return reg.with(s, "shape", stairs_shape(lv, s, p)).unwrap_or(s);
+    }
+    if matches!(name, "wall_torch" | "soul_wall_torch" | "copper_wall_torch" | "redstone_wall_torch" | "ladder") {
+        // support behind: the face pointing the way the block faces
         let f = reg.property(s, "facing").unwrap_or("north");
-        let Some(&(d, o, _)) = H.iter().find(|h| h.2 == f) else { return s };
-        let behind = [p[0] - o[0], p[1], p[2] - o[2]];
-        if !vstate::sturdy(lv.get(behind), d) {
+        if dir_prop(d ^ 1) == f && !vstate::sturdy(nb, d ^ 1) {
             return blocks::AIR;
         }
     }
     s
+}
+
+fn facing_offset(f: &str) -> [i32; 3] {
+    match f {
+        "north" => [0, 0, -1],
+        "south" => [0, 0, 1],
+        "west" => [-1, 0, 0],
+        _ => [1, 0, 0],
+    }
+}
+
+fn counter_clockwise(f: &str) -> &'static str {
+    match f {
+        "north" => "west",
+        "west" => "south",
+        "south" => "east",
+        _ => "north",
+    }
+}
+
+fn opposite_facing(f: &str) -> &'static str {
+    match f {
+        "north" => "south",
+        "south" => "north",
+        "west" => "east",
+        _ => "west",
+    }
+}
+
+/// `StairBlock.getStairsShape`
+fn stairs_shape(lv: &Region, s: BlockState, p: [i32; 3]) -> &'static str {
+    let reg = crate::registry::BlockRegistry::get();
+    let prop = |b: BlockState, k: &str| reg.property(b, k).unwrap_or("").to_string();
+    let is_stairs = |b: BlockState| b.name().ends_with("_stairs");
+    let dir = prop(s, "facing");
+    let half = prop(s, "half");
+    let x_axis = |f: &str| matches!(f, "east" | "west");
+    let at = |f: &str| {
+        let o = facing_offset(f);
+        lv.get([p[0] + o[0], p[1], p[2] + o[2]])
+    };
+    // canTakeShape: the block on that side is not the same stairs
+    let can_take = |f: &str| {
+        let b = at(f);
+        !is_stairs(b) || prop(b, "facing") != dir || prop(b, "half") != half
+    };
+    let front = at(&dir);
+    if is_stairs(front) && prop(front, "half") == half {
+        let d1 = prop(front, "facing");
+        if x_axis(&d1) != x_axis(&dir) && can_take(opposite_facing(&d1)) {
+            return if d1 == counter_clockwise(&dir) { "outer_left" } else { "outer_right" };
+        }
+    }
+    let back = at(opposite_facing(&dir));
+    if is_stairs(back) && prop(back, "half") == half {
+        let d2 = prop(back, "facing");
+        if x_axis(&d2) != x_axis(&dir) && can_take(&d2) {
+            return if d2 == counter_clockwise(&dir) { "inner_left" } else { "inner_right" };
+        }
+    }
+    "straight"
+}
+
+/// which 2D parts (x0, x1, z0, z1 in 1/16) of the bottom face of `above`
+/// are covered, for `WallBlock.isCovered`
+fn covers(above: BlockState, rect: (i32, i32, i32, i32)) -> bool {
+    let reg = crate::registry::BlockRegistry::get();
+    let n = above.name();
+    if is_wall(n) {
+        // collision shape: post (4..12) when up, arms through the centre
+        let side = |k: &str| reg.property(above, k).is_some_and(|v| v != "none");
+        let (nn, ss, ww, ee) = (side("north"), side("south"), side("west"), side("east"));
+        let up = reg.property(above, "up") == Some("true");
+        return match rect {
+            (7, 9, 0, 9) => nn,
+            (7, 9, 7, 16) => ss,
+            (0, 9, 7, 9) => ww,
+            (7, 16, 7, 9) => ee,
+            _ => up || nn || ss || ww || ee,
+        };
+    }
+    if n.ends_with("_fence") || is_bars(n) {
+        let side = |k: &str| reg.property(above, k) == Some("true");
+        return match rect {
+            (7, 9, 0, 9) => side("north"),
+            (7, 9, 7, 16) => side("south"),
+            (0, 9, 7, 9) => side("west"),
+            (7, 16, 7, 9) => side("east"),
+            _ => true,
+        };
+    }
+    vstate::sturdy(above, 0)
+}
+
+const POST: (i32, i32, i32, i32) = (7, 9, 7, 9);
+
+/// `WallBlock.updateShape`
+fn wall_update(lv: &Region, s: BlockState, p: [i32; 3], d: u8, nb: BlockState) -> BlockState {
+    let reg = crate::registry::BlockRegistry::get();
+    if d == 0 {
+        return s;
+    }
+    let connected = |k: &str| reg.property(s, k).is_some_and(|v| v != "none");
+    let mut c = [connected("north"), connected("east"), connected("south"), connected("west")];
+    let above_p = [p[0], p[1] + 1, p[2]];
+    let above = if d == 1 { nb } else { lv.get(above_p) };
+    if d >= 2 {
+        let nn = nb.name();
+        let attach = is_wall(nn) || (!connection_exception(nb) && vstate::sturdy(nb, d ^ 1)) || is_bars(nn) || gate_connects(nb, d);
+        let i = match d {
+            2 => 0,
+            5 => 1,
+            3 => 2,
+            _ => 3,
+        };
+        c[i] = attach;
+    }
+    const TESTS: [(&str, (i32, i32, i32, i32)); 4] = [("north", (7, 9, 0, 9)), ("east", (7, 16, 7, 9)), ("south", (7, 9, 7, 16)), ("west", (0, 9, 7, 9))];
+    let mut out = s;
+    let mut sides = ["none"; 4];
+    for (i, (k, rect)) in TESTS.iter().enumerate() {
+        sides[i] = if !c[i] {
+            "none"
+        } else if covers(above, *rect) {
+            "tall"
+        } else {
+            "low"
+        };
+        out = reg.with(out, k, sides[i]).unwrap_or(out);
+    }
+    // shouldRaisePost
+    let up = if is_wall(above.name()) && reg.property(above, "up") == Some("true") {
+        true
+    } else {
+        let [n, e, so, w] = sides;
+        let (nn, en, sn, wn) = (n == "none", e == "none", so == "none", w == "none");
+        if (nn && sn && wn && en) || nn != sn || wn != en {
+            true
+        } else if (n == "tall" && so == "tall") || (e == "tall" && w == "tall") {
+            false
+        } else {
+            wall_post_override(above.name()) || covers(above, POST)
+        }
+    };
+    reg.with(out, "up", if up { "true" } else { "false" }).unwrap_or(out)
+}
+
+/// `BlockTags.WALL_POST_OVERRIDE`
+fn wall_post_override(n: &str) -> bool {
+    matches!(n, "torch" | "soul_torch" | "redstone_torch" | "copper_torch" | "tripwire" | "cactus_flower") || (n.ends_with("_sign") && !n.ends_with("hanging_sign")) || n.ends_with("_banner") || n.ends_with("_pressure_plate")
 }
 
 /// A placed feature.
