@@ -392,8 +392,8 @@ impl Default for BedrockCfg {
             forward_player_ping: false,
             skins: true,
             mtu: 1400,
-            protocol_version: 766,
-            game_version: "1.21.50".into(),
+            protocol_version: 2225,
+            game_version: "1.26.60".into(),
         }
     }
 }

@@ -176,6 +176,9 @@ impl<'a> Reader<'a> {
     pub fn bool(&mut self) -> Result<bool, CodecError> {
         Ok(self.u8()? != 0)
     }
+    pub fn i32(&mut self) -> Result<i32, CodecError> {
+        Ok(i32::from_be_bytes(self.bytes(4)?.try_into().unwrap()))
+    }
     pub fn i16(&mut self) -> Result<i16, CodecError> {
         Ok(i16::from_be_bytes(self.bytes(2)?.try_into().unwrap()))
     }

@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
+/// Any byte stream a Java session can run over (TCP, or an in-process pipe
+/// for Bedrock players).
+pub trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> Io for T {}
 
 use super::crypt::{CryptStream, Profile};
 use tokio::sync::mpsc;
@@ -148,13 +151,13 @@ fn write_props(b: &mut Vec<u8>, props: &[(String, String, Option<String>)]) {
     }
 }
 
-pub async fn run(sock: CryptStream<TcpStream>, st: Arc<ServerState>, profile: Profile) -> anyhow::Result<()> {
+pub async fn run<S: Io>(sock: CryptStream<S>, st: Arc<ServerState>, profile: Profile) -> anyhow::Result<()> {
     run_with_state(sock, st, profile, None).await
 }
 
 /// `state`: player NBT forwarded by a RimeFleet router (used instead of the
 /// local player file).
-pub async fn run_with_state(mut sock: CryptStream<TcpStream>, st: Arc<ServerState>, profile: Profile, state: Option<Vec<u8>>) -> anyhow::Result<()> {
+pub async fn run_with_state<S: Io>(mut sock: CryptStream<S>, st: Arc<ServerState>, profile: Profile, state: Option<Vec<u8>>) -> anyhow::Result<()> {
     let forwarded = state.is_some() || crate::fleet_net::node_link().is_some();
     let Profile { uuid, name, properties } = profile;
     let th = st.game.threshold;
@@ -314,7 +317,7 @@ pub async fn run_with_state(mut sock: CryptStream<TcpStream>, st: Arc<ServerStat
     Ok(())
 }
 
-async fn writer_task(mut wr: tokio::io::WriteHalf<CryptStream<TcpStream>>, mut rx: mpsc::Receiver<Arc<Vec<u8>>>) {
+async fn writer_task<S: Io>(mut wr: tokio::io::WriteHalf<CryptStream<S>>, mut rx: mpsc::Receiver<Arc<Vec<u8>>>) {
     let mut buf = Vec::with_capacity(64 * 1024);
     while let Some(p) = rx.recv().await {
         buf.clear();
@@ -333,7 +336,7 @@ async fn writer_task(mut wr: tokio::io::WriteHalf<CryptStream<TcpStream>>, mut r
     let _ = wr.shutdown().await;
 }
 
-async fn reader_task(mut rd: tokio::io::ReadHalf<CryptStream<TcpStream>>, tx: mpsc::Sender<(Instant, Vec<u8>)>) {
+async fn reader_task<S: Io>(mut rd: tokio::io::ReadHalf<CryptStream<S>>, tx: mpsc::Sender<(Instant, Vec<u8>)>) {
     let mut window = Instant::now();
     let mut count = 0u32;
     loop {

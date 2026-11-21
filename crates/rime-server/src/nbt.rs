@@ -144,6 +144,60 @@ impl Tag {
 
     // ------------------------------------------------------------- reading
 
+    /// Parse a network (nameless root) tag. Returns the tag and the bytes used.
+    pub fn from_network_bytes(buf: &[u8]) -> Result<(Tag, usize), NbtError> {
+        let mut r = Reader { buf, pos: 0 };
+        let id = r.u8()?;
+        if id == 0 {
+            return Err(NbtError::BadTag(0));
+        }
+        let tag = r.payload(id, 0)?;
+        Ok((tag, r.pos))
+    }
+
+    /// Plain text of a chat component (`text`, `translate` keys and `extra`).
+    pub fn plain_text(&self) -> String {
+        let mut out = String::new();
+        fn walk(t: &Tag, out: &mut String, depth: usize) {
+            if depth > 32 || out.len() > 4096 {
+                return;
+            }
+            match t {
+                Tag::String(s) => out.push_str(s),
+                Tag::List(l) => l.iter().for_each(|c| walk(c, out, depth + 1)),
+                Tag::Compound(_) => {
+                    if let Some(s) = t.get("text").and_then(|v| v.as_str()) {
+                        out.push_str(s);
+                    } else if let Some(k) = t.get("translate").and_then(|v| v.as_str()) {
+                        let with: Vec<String> = match t.get("with") {
+                            Some(Tag::List(l)) => l
+                                .iter()
+                                .map(|c| {
+                                    let mut s = String::new();
+                                    walk(c, &mut s, depth + 1);
+                                    s
+                                })
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        let fb = t.get("fallback").and_then(|v| v.as_str()).unwrap_or(k);
+                        let mut s = fb.to_string();
+                        for w in &with {
+                            s = s.replacen("%s", w, 1);
+                        }
+                        out.push_str(&s);
+                    }
+                    if let Some(e) = t.get("extra") {
+                        walk(e, out, depth + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(self, &mut out, 0);
+        out
+    }
+
     /// Parse a named root tag. Returns (name, tag).
     pub fn from_root_bytes(buf: &[u8]) -> Result<(String, Tag), NbtError> {
         let mut r = Reader { buf, pos: 0 };

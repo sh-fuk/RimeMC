@@ -7,12 +7,15 @@ edition = "2024"
 aes = "0.8"
 airworld = { version = "0.1.0", path = "../airworld" }
 anyhow = "1.0.104"
+base64 = "0.22"
 bytemuck = { version = "1.25.2", features = ["derive"], optional = true }
 cfb8 = "0.8"
 clap = { version = "4.6.9", features = ["derive"] }
+ctr = "0.9"
 flate2 = "1.1.11"
 hex = "0.4.3"
 md-5 = "0.10"
+p384 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
 parking_lot = "0.13.0"
 pollster = { version = "1.0.3", optional = true }
 rand = "0.8"
@@ -22,7 +25,7 @@ rsa = "0.9"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha1 = "0.11.0"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["oid"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 toml = "1.2.1"
