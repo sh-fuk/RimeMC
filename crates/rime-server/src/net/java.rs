@@ -187,6 +187,9 @@ async fn login(sock: TcpStream, state: Arc<ServerState>, protocol: i32) -> anyho
     if let Some(left) = state.banned_for(&profile.name) {
         return reject(&mut sock, format!("You are temporarily banned ({} min left)", left.div_ceil(60))).await;
     }
+    if let Some(rs) = crate::fleet_net::router() {
+        return super::fleet_proxy::proxy(sock, state, profile, rs).await;
+    }
     super::play::run(sock, state, profile).await
 }
 

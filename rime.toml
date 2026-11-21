@@ -59,6 +59,8 @@ cell_shift = 5
 imbalance_threshold = 0.2
 heartbeat_timeout_ms = 3000
 rebalance_interval_ms = 1000
+# node only: where the router connects with players (keep it off the internet)
+node_game_address = "127.0.0.1:25610"
 
 [anticheat]
 enabled = true

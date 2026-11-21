@@ -201,17 +201,38 @@ pub fn load(path: &Path) -> Option<Saved> {
     from_nbt(&root)
 }
 
+/// Player NBT (uncompressed root bytes) → saved state.
+pub fn from_bytes(raw: &[u8]) -> Option<Saved> {
+    let (_, root) = Tag::from_root_bytes(raw).ok()?;
+    from_nbt(&root)
+}
+
+/// The file's NBT as uncompressed root bytes (RimeFleet forwards it).
+pub fn load_raw(path: &Path) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut raw = Vec::new();
+    flate2::read::GzDecoder::new(file).take(16 << 20).read_to_end(&mut raw).ok()?;
+    Tag::from_root_bytes(&raw).ok()?;
+    Some(raw)
+}
+
 /// Writes atomically (temp file + rename), like vanilla's `.dat_old` dance.
 pub fn save(world: &Path, p: &Player) -> anyhow::Result<()> {
+    save_raw(world, p.uuid, &to_nbt(p).to_root_bytes(""))
+}
+
+/// Saves player NBT given as uncompressed root bytes (validated first).
+pub fn save_raw(world: &Path, uuid: uuid::Uuid, bytes: &[u8]) -> anyhow::Result<()> {
+    anyhow::ensure!(bytes.len() < 16 << 20, "player data too large");
+    from_bytes(bytes).ok_or_else(|| anyhow::anyhow!("invalid player data"))?;
     let dir = world.join("playerdata");
     std::fs::create_dir_all(&dir)?;
-    let target = path(world, p.uuid);
+    let target = path(world, uuid);
     let tmp = target.with_extension("dat.tmp");
-    let bytes = to_nbt(p).to_root_bytes("");
     {
         let f = std::fs::File::create(&tmp)?;
         let mut gz = flate2::write::GzEncoder::new(f, flate2::Compression::default());
-        gz.write_all(&bytes)?;
+        gz.write_all(bytes)?;
         gz.finish()?.sync_all()?;
     }
     std::fs::rename(&tmp, &target)?;

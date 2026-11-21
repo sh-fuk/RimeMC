@@ -89,7 +89,39 @@ fn dim_of(world: u32) -> Option<Dim> {
 pub struct RouterState {
     balancer: Mutex<Balancer>,
     nodes: Mutex<HashMap<NodeId, mpsc::Sender<FleetMsg>>>,
+    /// each node's game port (players are proxied there)
+    node_addrs: Mutex<HashMap<NodeId, String>>,
+    /// proxied players: node now simulating them, and their proxy
+    players: Mutex<HashMap<u128, (NodeId, mpsc::Sender<crate::net::fleet_proxy::ProxyCmd>)>>,
     start: Instant,
+}
+
+static ROUTER: std::sync::OnceLock<Arc<RouterState>> = std::sync::OnceLock::new();
+
+/// The router's fleet state, when this process is a router with nodes.
+pub fn router() -> Option<Arc<RouterState>> {
+    ROUTER.get().filter(|r| !r.node_addrs.lock().is_empty()).cloned()
+}
+
+impl RouterState {
+    /// Node to simulate `cell` (assigning it if new) and its game address.
+    pub async fn node_for(&self, cell: CellId) -> Option<(NodeId, String)> {
+        let owner = self.balancer.lock().owner_of(cell)?;
+        let addr = self.node_addrs.lock().get(&owner).cloned()?;
+        let tx = self.nodes.lock().get(&owner).cloned();
+        if let Some(tx) = tx {
+            let _ = tx.send(FleetMsg::Assign { cells: vec![cell] }).await;
+        }
+        Some((owner, addr))
+    }
+
+    pub fn player_on(&self, player: u128, node: NodeId, tx: mpsc::Sender<crate::net::fleet_proxy::ProxyCmd>) {
+        self.players.lock().insert(player, (node, tx));
+    }
+
+    pub fn player_gone(&self, player: u128) {
+        self.players.lock().remove(&player);
+    }
 }
 
 pub async fn run_router(state: Arc<ServerState>) -> anyhow::Result<()> {
@@ -103,8 +135,11 @@ pub async fn run_router(state: Arc<ServerState>) -> anyhow::Result<()> {
             ..Default::default()
         })),
         nodes: Mutex::new(HashMap::new()),
+        node_addrs: Mutex::new(HashMap::new()),
+        players: Mutex::new(HashMap::new()),
         start: Instant::now(),
     });
+    let _ = ROUTER.set(rs.clone());
 
     // balancing loop
     {
@@ -164,8 +199,9 @@ async fn apply_moves(rs: &RouterState, moves: &[rime_fleet::balancer::Move]) {
 async fn router_conn(sock: TcpStream, state: Arc<ServerState>, rs: Arc<RouterState>) -> anyhow::Result<()> {
     let (mut rd, mut wr, node_id) = secure(sock, state.cfg.fleet.secret.as_bytes(), Role::Router, 0).await?;
     let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, rd.recv()).await??;
-    let FleetMsg::Register { cores, version } = first else { anyhow::bail!("expected Register") };
-    tracing::info!("fleet node {node_id} joined ({cores} cores, {version})");
+    let FleetMsg::Register { cores, version, game_addr } = first else { anyhow::bail!("expected Register") };
+    tracing::info!("fleet node {node_id} joined ({cores} cores, {version}, players via {game_addr})");
+    rs.node_addrs.lock().insert(node_id, game_addr);
 
     let (tx, mut rx) = mpsc::channel::<FleetMsg>(1024);
     if rs.nodes.lock().insert(node_id, tx.clone()).is_some() {
@@ -194,9 +230,14 @@ async fn router_conn(sock: TcpStream, state: Arc<ServerState>, rs: Arc<RouterSta
                 }
                 FleetMsg::ChunkRequest { world, x, z } => {
                     let Some(dim) = dim_of(world) else { continue };
-                    let st = state.clone();
-                    let nbt = tokio::task::spawn_blocking(move || st.store.load_chunk(dim, Kind::Region, x, z)).await??;
-                    let _ = tx.send(FleetMsg::ChunkData { world, x, z, nbt }).await;
+                    // answered concurrently: a node asks for hundreds at once
+                    let (st, tx) = (state.clone(), tx.clone());
+                    tokio::spawn(async move {
+                        let nbt = tokio::task::spawn_blocking(move || st.store.load_chunk(dim, Kind::Region, x, z)).await;
+                        if let Ok(Ok(nbt)) = nbt {
+                            let _ = tx.send(FleetMsg::ChunkData { world, x, z, nbt }).await;
+                        }
+                    });
                 }
                 FleetMsg::ChunkData { world, x, z, nbt: Some(nbt) } => {
                     // a node may only write chunks of cells it owns
@@ -209,7 +250,34 @@ async fn router_conn(sock: TcpStream, state: Arc<ServerState>, rs: Arc<RouterSta
                     let st = state.clone();
                     tokio::task::spawn_blocking(move || st.store.save_chunk(dim, Kind::Region, x, z, &nbt)).await??;
                 }
-                FleetMsg::ServerPacket { .. } => { /* forwarded to client sessions once play state exists */ }
+                FleetMsg::PlayerHandoff { player, cell, state: data } => {
+                    // only the node simulating the player may move them
+                    let cur = rs.players.lock().get(&player).cloned();
+                    let Some((on, proxy)) = cur else { continue };
+                    if on != node_id {
+                        continue;
+                    }
+                    if let Some((to, addr)) = rs.node_for(cell).await {
+                        if to != node_id {
+                            rs.players.lock().insert(player, (to, proxy.clone()));
+                            let _ = proxy.send(crate::net::fleet_proxy::ProxyCmd::Switch { node: to, addr, state: data }).await;
+                        }
+                    }
+                }
+                FleetMsg::PlayerData { player, state: data } => {
+                    let cur = rs.players.lock().get(&player).map(|p| p.0);
+                    // a late save from the node the player just left is stale
+                    if cur.is_some_and(|c| c != node_id) {
+                        continue;
+                    }
+                    let world = state.world_dir.clone();
+                    match tokio::task::spawn_blocking(move || crate::game::playerdata::save_raw(&world, uuid::Uuid::from_u128(player), &data)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::warn!("saving player data from node {node_id}: {e:#}"),
+                        Err(e) => tracing::warn!("saving player data from node {node_id}: {e}"),
+                    }
+                }
+                FleetMsg::ServerPacket { .. } => {}
                 other => tracing::debug!("node {node_id}: unexpected {other:?}"),
             }
         }
@@ -226,7 +294,152 @@ async fn router_conn(sock: TcpStream, state: Arc<ServerState>, rs: Arc<RouterSta
 
 // ============================================================== node
 
+/// A node's link to its router (survives reconnects).
+pub struct NodeLink {
+    tx: Mutex<Option<mpsc::Sender<FleetMsg>>>,
+    owned: Mutex<HashSet<CellId>>,
+    /// chunk requests waiting for the router's answer
+    pending: Mutex<HashMap<(u32, i32, i32), Vec<std::sync::mpsc::Sender<Option<Vec<u8>>>>>>,
+    cell_shift: u32,
+}
+
+static NODE: std::sync::OnceLock<Arc<NodeLink>> = std::sync::OnceLock::new();
+
+pub fn node_link() -> Option<Arc<NodeLink>> {
+    NODE.get().cloned()
+}
+
+fn world_id(dim: Dim) -> u32 {
+    match dim {
+        Dim::Overworld => 0,
+        Dim::Nether => 1,
+        Dim::End => 2,
+    }
+}
+
+impl NodeLink {
+    fn send(&self, m: FleetMsg) -> bool {
+        let tx = self.tx.lock().clone();
+        match tx {
+            Some(tx) => tx.try_send(m).is_ok(),
+            None => false,
+        }
+    }
+
+    pub fn owns_chunk(&self, x: i32, z: i32) -> bool {
+        self.owned.lock().contains(&CellId::of_chunk(0, x, z, self.cell_shift))
+    }
+
+    /// The player leaves this node: the router keeps their file.
+    pub fn player_left(&self, p: &crate::game::Player) {
+        let state = crate::game::playerdata::to_nbt(p).to_root_bytes("");
+        self.send(FleetMsg::PlayerData { player: p.uuid.as_u128(), state });
+    }
+}
+
+impl crate::world::storage::RemoteChunks for NodeLink {
+    fn load(&self, dim: Dim, cx: i32, cz: i32) -> Option<Option<Vec<u8>>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let key = (world_id(dim), cx, cz);
+        let first = {
+            let mut p = self.pending.lock();
+            let list = p.entry(key).or_default();
+            list.push(tx);
+            list.len() == 1
+        };
+        if first && !self.send(FleetMsg::ChunkRequest { world: key.0, x: cx, z: cz }) {
+            self.pending.lock().remove(&key);
+            return None;
+        }
+        let got = rx.recv_timeout(Duration::from_secs(10)).ok();
+        if got.is_none() {
+            tracing::warn!("RimeFleet: router did not answer for chunk {cx},{cz}; using the local copy");
+        }
+        got
+    }
+
+    fn save(&self, dim: Dim, cx: i32, cz: i32, nbt: &[u8]) {
+        // the router only accepts chunks of cells this node simulates
+        if self.owns_chunk(cx, cz) {
+            self.send(FleetMsg::ChunkData { world: world_id(dim), x: cx, z: cz, nbt: Some(nbt.to_vec()) });
+        }
+    }
+}
+
+/// Node game port: the router connects here with each player it proxies.
+pub async fn run_node_game(state: Arc<ServerState>) -> anyhow::Result<()> {
+    let addr = state.cfg.fleet.node_game_address.clone();
+    let listener = TcpListener::bind(&addr).await?;
+    tracing::info!("RimeFleet node: players arrive from the router on {addr}");
+    loop {
+        let (sock, peer) = listener.accept().await?;
+        let st = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = node_game_conn(sock, st).await {
+                tracing::warn!("fleet player connection from {peer}: {e:#}");
+            }
+        });
+    }
+}
+
+async fn node_game_conn(mut sock: TcpStream, st: Arc<ServerState>) -> anyhow::Result<()> {
+    sock.set_nodelay(true)?;
+    let len = tokio::time::timeout(HANDSHAKE_TIMEOUT, sock.read_u32_le()).await?? as usize;
+    anyhow::ensure!((32..=4 << 20).contains(&len), "bad forward length");
+    let mut buf = vec![0u8; len];
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, sock.read_exact(&mut buf)).await??;
+    let (payload, tag) = buf.split_at(len - 32);
+    anyhow::ensure!(rime_fleet::crypto::verify_forward(st.cfg.fleet.secret.as_bytes(), payload, tag), "forward not signed by the router");
+    let fwd = rime_fleet::proto::PlayerForward::decode(payload)?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    anyhow::ensure!(fwd.time_ms.abs_diff(now) < 30_000, "stale forward");
+    let profile = crate::net::crypt::Profile { uuid: uuid::Uuid::from_u128(fwd.uuid), name: fwd.name, properties: fwd.props };
+    crate::net::play::run_with_state(crate::net::crypt::CryptStream::new(sock), st, profile, fwd.state).await
+}
+
+/// Players standing in cells this node does not simulate are handed to the
+/// router, which moves them to the owner.
+fn check_handoffs(state: &ServerState, link: &NodeLink, recent: &mut HashMap<u128, Instant>) {
+    recent.retain(|_, t| t.elapsed() < Duration::from_secs(5));
+    if link.owned.lock().is_empty() {
+        return;
+    }
+    for p in state.game.players() {
+        let pos = p.pose.lock().pos;
+        let cell = CellId::of_chunk(0, (pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4, link.cell_shift);
+        if link.owned.lock().contains(&cell) || recent.contains_key(&p.uuid.as_u128()) || p.vit.lock().dead {
+            continue;
+        }
+        recent.insert(p.uuid.as_u128(), Instant::now());
+        let st = crate::game::playerdata::to_nbt(&p).to_root_bytes("");
+        link.send(FleetMsg::PlayerHandoff { player: p.uuid.as_u128(), cell, state: st });
+    }
+}
+
 pub async fn run_node(state: Arc<ServerState>) -> anyhow::Result<()> {
+    let link = NODE
+        .get_or_init(|| Arc::new(NodeLink { tx: Mutex::new(None), owned: Mutex::new(HashSet::new()), pending: Mutex::new(HashMap::new()), cell_shift: state.cfg.fleet.cell_shift }))
+        .clone();
+    state.store.set_remote(link.clone());
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_node_game(st).await {
+                tracing::error!("RimeFleet node game port: {e:#}");
+            }
+        });
+    }
+    {
+        let (st, link) = (state.clone(), link.clone());
+        tokio::spawn(async move {
+            let mut recent = HashMap::new();
+            let mut t = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                t.tick().await;
+                check_handoffs(&st, &link, &mut recent);
+            }
+        });
+    }
     let mut backoff = Duration::from_millis(250);
     loop {
         match node_session(state.clone()).await {
@@ -242,18 +455,20 @@ async fn node_session(state: Arc<ServerState>) -> anyhow::Result<()> {
     let f = &state.cfg.fleet;
     let sock = TcpStream::connect(&f.router_address).await?;
     let (mut rd, mut wr, _) = secure(sock, f.secret.as_bytes(), Role::Node, f.node_id).await?;
-    wr.send(&FleetMsg::Register { cores: state.cfg.worker_threads() as u32, version: env!("CARGO_PKG_VERSION").into() }).await?;
+    wr.send(&FleetMsg::Register { cores: state.cfg.worker_threads() as u32, version: env!("CARGO_PKG_VERSION").into(), game_addr: f.node_game_address.clone() }).await?;
     tracing::info!("RimeFleet: connected to router {} as node {}", f.router_address, f.node_id);
 
-    let owned: Arc<Mutex<HashSet<CellId>>> = Arc::new(Mutex::new(HashSet::new()));
+    let link = node_link().expect("node link");
+    link.owned.lock().clear();
     let (tx, mut rx) = mpsc::channel::<FleetMsg>(1024);
+    *link.tx.lock() = Some(tx.clone());
     let hb = {
-        let (tx, owned, st) = (tx.clone(), owned.clone(), state.clone());
+        let (tx, link, st) = (tx.clone(), link.clone(), state.clone());
         tokio::spawn(async move {
             let mut t = tokio::time::interval(Duration::from_millis(1000));
             loop {
                 t.tick().await;
-                let cells = owned.lock().iter().map(|c| CellLoad { cell: *c, cost: st.cell_cost(c), redstone: false }).collect();
+                let cells = link.owned.lock().iter().map(|c| CellLoad { cell: *c, cost: st.cell_cost(c), redstone: false }).collect();
                 if tx.send(FleetMsg::Heartbeat { mspt: st.mspt(), cells }).await.is_err() {
                     break;
                 }
@@ -272,16 +487,21 @@ async fn node_session(state: Arc<ServerState>) -> anyhow::Result<()> {
             match rd.recv().await? {
                 FleetMsg::Assign { cells } => {
                     tracing::info!("RimeFleet: now simulating {} more cell(s)", cells.len());
-                    owned.lock().extend(cells);
+                    link.owned.lock().extend(cells);
                 }
                 FleetMsg::Revoke { cells } => {
-                    let mut o = owned.lock();
+                    let mut o = link.owned.lock();
                     for c in cells {
                         o.remove(&c);
                     }
                 }
                 FleetMsg::RedstoneRole { active } => state.set_redstone_role(active),
-                FleetMsg::ChunkData { .. } | FleetMsg::ClientPacket { .. } | FleetMsg::PlayerHandoff { .. } => {}
+                FleetMsg::ChunkData { world, x, z, nbt } => {
+                    for w in link.pending.lock().remove(&(world, x, z)).unwrap_or_default() {
+                        let _ = w.send(nbt.clone());
+                    }
+                }
+                FleetMsg::ClientPacket { .. } | FleetMsg::PlayerHandoff { .. } => {}
                 FleetMsg::Shutdown => return Ok(()),
                 other => tracing::debug!("router sent unexpected {other:?}"),
             }
@@ -290,6 +510,9 @@ async fn node_session(state: Arc<ServerState>) -> anyhow::Result<()> {
     .await;
     hb.abort();
     writer.abort();
+    *link.tx.lock() = None;
+    // wake chunk loads waiting for this connection (they fall back to local)
+    link.pending.lock().clear();
     res
 }
 

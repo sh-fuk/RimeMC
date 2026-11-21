@@ -148,7 +148,14 @@ fn write_props(b: &mut Vec<u8>, props: &[(String, String, Option<String>)]) {
     }
 }
 
-pub async fn run(mut sock: CryptStream<TcpStream>, st: Arc<ServerState>, profile: Profile) -> anyhow::Result<()> {
+pub async fn run(sock: CryptStream<TcpStream>, st: Arc<ServerState>, profile: Profile) -> anyhow::Result<()> {
+    run_with_state(sock, st, profile, None).await
+}
+
+/// `state`: player NBT forwarded by a RimeFleet router (used instead of the
+/// local player file).
+pub async fn run_with_state(mut sock: CryptStream<TcpStream>, st: Arc<ServerState>, profile: Profile, state: Option<Vec<u8>>) -> anyhow::Result<()> {
+    let forwarded = state.is_some() || crate::fleet_net::node_link().is_some();
     let Profile { uuid, name, properties } = profile;
     let th = st.game.threshold;
     // ---- login
@@ -222,13 +229,21 @@ pub async fn run(mut sock: CryptStream<TcpStream>, st: Arc<ServerState>, profile
     // ---- play
     let view = client_view.min(st.cfg.server.view_distance as i32).max(2);
     let spawn = st.spawn;
-    let saved = crate::game::playerdata::load(&crate::game::playerdata::path(&st.world_dir, uuid)).filter(|s| !s.dead);
+    let saved = match &state {
+        Some(raw) => crate::game::playerdata::from_bytes(raw),
+        None if forwarded => None,
+        None => crate::game::playerdata::load(&crate::game::playerdata::path(&st.world_dir, uuid)),
+    }
+    .filter(|s| !s.dead);
     let gamemode = saved.as_ref().map(|s| s.gamemode).filter(|g| *g >= 0).unwrap_or(st.cfg.server.default_gamemode.id());
     let (tx, rx) = mpsc::channel::<Arc<Vec<u8>>>(OUT_QUEUE);
     let pose = match &saved {
         Some(s) => Pose { pos: s.pos, yaw: s.yaw, pitch: s.pitch, on_ground: false },
         None => Pose { pos: spawn, yaw: 0.0, pitch: 0.0, on_ground: false },
     };
+    if forwarded && st.game.take_over(uuid) {
+        tracing::info!("{name}: replacing the previous session on this node");
+    }
     let Some(me) = st.game.join(uuid, name.clone(), properties, pose, gamemode, view, tx) else {
         let b = text_nbt("You are already logged in from another location.");
         sock.write_all(&conn::encode(id("play", "clientbound", "disconnect"), &b, th)).await?;
@@ -256,13 +271,29 @@ pub async fn run(mut sock: CryptStream<TcpStream>, st: Arc<ServerState>, profile
     let result = s.run(in_rx).await;
 
     // ---- leave
-    if let Err(e) = crate::game::playerdata::save(&st.world_dir, &me) {
-        tracing::error!("saving player {}: {e:#}", me.name);
+    let replaced = me.kicked.load(Ordering::Relaxed);
+    match crate::fleet_net::node_link() {
+        // replaced by a newer login: that session owns the player now
+        _ if replaced => {}
+        // a RimeFleet node: the router keeps player files
+        Some(link) => link.player_left(&me),
+        None => {
+            if let Err(e) = crate::game::playerdata::save(&st.world_dir, &me) {
+                tracing::error!("saving player {}: {e:#}", me.name);
+            }
+        }
     }
     st.game.leave(me.eid);
     st.online.store(st.game.count() as u32, Ordering::Relaxed);
     for c in &s.sent {
         st.game.world.remove_viewer(c.0, c.1);
+    }
+    if replaced {
+        let mut b = Vec::new();
+        b.vi(1).vi(me.eid);
+        st.game.broadcast(st.game.encode("remove_entities", &b));
+        reader.abort();
+        return Ok(());
     }
     let mut b = Vec::new();
     b.vi(1).uuid(me.uuid);
@@ -437,7 +468,12 @@ impl Session {
                     }
                     None => return Ok(()),
                 },
-                _ = ticker.tick() => self.on_tick().await,
+                _ = ticker.tick() => {
+                    if self.me.kicked.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    self.on_tick().await
+                }
             };
             if let Flow::Disconnect(reason) = flow {
                 self.send("disconnect", &text_nbt(&reason));

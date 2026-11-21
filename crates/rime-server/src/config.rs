@@ -224,6 +224,8 @@ pub struct FleetCfg {
     pub imbalance_threshold: f64,
     pub heartbeat_timeout_ms: u64,
     pub rebalance_interval_ms: u64,
+    /// Node: address the router connects to with players (keep it private).
+    pub node_game_address: String,
 }
 
 impl Default for FleetCfg {
@@ -237,6 +239,7 @@ impl Default for FleetCfg {
             imbalance_threshold: 0.2,
             heartbeat_timeout_ms: 3000,
             rebalance_interval_ms: 1000,
+            node_game_address: "127.0.0.1:25610".into(),
         }
     }
 }

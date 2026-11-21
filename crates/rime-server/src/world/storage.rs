@@ -88,7 +88,17 @@ pub struct FlushReport {
     pub millis: u128,
 }
 
+/// Chunk source of a RimeFleet node: the router owns the world.
+pub trait RemoteChunks: Send + Sync {
+    /// The router's copy: `Some(None)` = not generated yet, `None` = the
+    /// router could not be asked (use the local copy).
+    fn load(&self, dim: Dim, cx: i32, cz: i32) -> Option<Option<Vec<u8>>>;
+    fn save(&self, dim: Dim, cx: i32, cz: i32, nbt: &[u8]);
+}
+
 pub struct WorldStore {
+    /// RimeFleet node: chunks come from / go to the router
+    remote: std::sync::OnceLock<std::sync::Arc<dyn RemoteChunks>>,
     root: PathBuf,
     format: WorldFormat,
     level: i32,
@@ -109,6 +119,7 @@ impl WorldStore {
     pub fn open(root: &Path, format: WorldFormat, level: i32, ram_mode: bool, budget_mb: u64) -> anyhow::Result<Self> {
         fs::create_dir_all(root)?;
         let store = Self {
+            remote: std::sync::OnceLock::new(),
             root: root.to_path_buf(),
             format,
             level,
@@ -227,7 +238,18 @@ impl WorldStore {
     }
 
     /// Raw chunk NBT, or `None` if never generated.
+    pub fn set_remote(&self, r: std::sync::Arc<dyn RemoteChunks>) {
+        let _ = self.remote.set(r);
+    }
+
     pub fn load_chunk(&self, dim: Dim, kind: Kind, cx: i32, cz: i32) -> anyhow::Result<Option<Vec<u8>>> {
+        if kind == Kind::Region {
+            if let Some(r) = self.remote.get() {
+                if let Some(v) = r.load(dim, cx, cz) {
+                    return Ok(v);
+                }
+            }
+        }
         let k = RegionKey { dim, kind, x: region_coord(cx), z: region_coord(cz) };
         let e = self.entry(k)?;
         let g = e.lock();
@@ -241,6 +263,11 @@ impl WorldStore {
 
     /// Store raw chunk NBT (compression happens here, outside of any global lock).
     pub fn save_chunk(&self, dim: Dim, kind: Kind, cx: i32, cz: i32, nbt: &[u8]) -> anyhow::Result<()> {
+        if kind == Kind::Region {
+            if let Some(r) = self.remote.get() {
+                r.save(dim, cx, cz, nbt);
+            }
+        }
         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0);
         let slot = airworld::ChunkSlot::from_raw(nbt, ts, self.level)?;
         let k = RegionKey { dim, kind, x: region_coord(cx), z: region_coord(cz) };

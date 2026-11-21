@@ -357,6 +357,8 @@ pub struct Player {
     pub view: Mutex<(i32, i32, i32)>,
     /// damage from mobs / other players, applied by the player's session
     pub hits: Mutex<Vec<Hit>>,
+    /// set when a newer login of the same player replaced this one
+    pub kicked: std::sync::atomic::AtomicBool,
 }
 
 /// Damage queued for a player.
@@ -505,6 +507,7 @@ impl Game {
             tx,
             view: Mutex::new((cx, cz, view)),
             hits: Mutex::new(Vec::new()),
+            kicked: std::sync::atomic::AtomicBool::new(false),
         });
         m.insert(eid, p.clone());
         Some(p)
@@ -512,6 +515,24 @@ impl Game {
 
     pub fn leave(&self, eid: i32) {
         self.players.write().remove(&eid);
+    }
+
+    /// A newer login takes over (RimeFleet hand-offs): the old session is
+    /// told to end and leaves the game now. Returns false if nobody was online.
+    pub fn take_over(&self, uuid: uuid::Uuid) -> bool {
+        let mut m = self.players.write();
+        let old: Vec<i32> = m.values().filter(|p| p.uuid == uuid).map(|p| p.eid).collect();
+        for eid in &old {
+            if let Some(p) = m.remove(eid) {
+                p.kicked.store(true, Ordering::Relaxed);
+            }
+        }
+        !old.is_empty()
+    }
+
+    /// Is this player (the session's own `Player`) still the one in the game?
+    pub fn is_current(&self, eid: i32) -> bool {
+        self.players.read().contains_key(&eid)
     }
 
     pub fn broadcast(&self, pkt: Arc<Vec<u8>>) {

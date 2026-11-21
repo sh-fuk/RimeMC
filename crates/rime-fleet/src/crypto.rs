@@ -165,6 +165,26 @@ fn auth_tag(key: &[u8; 32], role: u8, transcript: &[u8]) -> [u8; AUTH_LEN] {
     mac.finalize().into_bytes().into()
 }
 
+/// MAC for a router → node player forward (`PlayerForward` on the game port).
+pub fn forward_mac(secret: &[u8], payload: &[u8]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(b"rime-fleet-forward"), secret);
+    let mut key = [0u8; 32];
+    hk.expand(b"player forward v1", &mut key).expect("hkdf length");
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key).expect("hmac key");
+    mac.update(payload);
+    mac.finalize().into_bytes().into()
+}
+
+/// Constant-time check of a forward MAC.
+pub fn verify_forward(secret: &[u8], payload: &[u8], tag: &[u8]) -> bool {
+    let hk = Hkdf::<Sha256>::new(Some(b"rime-fleet-forward"), secret);
+    let mut key = [0u8; 32];
+    hk.expand(b"player forward v1", &mut key).expect("hkdf length");
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key).expect("hmac key");
+    mac.update(payload);
+    mac.verify_slice(tag).is_ok()
+}
+
 /// Established channel. `seal`/`open` must be called in stream order.
 pub struct SecureChannel {
     send: ChaCha20Poly1305,
