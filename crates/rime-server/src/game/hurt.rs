@@ -146,6 +146,9 @@ impl Game {
             EKind::Lightning { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "lightning_bolt", ..Default::default() } },
             EKind::Fangs { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "evoker_fangs", ..Default::default() } },
             EKind::Tnt { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "tnt", ..Default::default() } },
+            EKind::Knot => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "leash_knot", ..Default::default() } },
+            EKind::Boat { ty, .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: ty, ..Default::default() } },
+            EKind::Minecart(c) => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: c.ty, ..Default::default() } },
             EKind::Frame { glow, .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: if *glow { "glow_item_frame" } else { "item_frame" }, ..Default::default() } },
             EKind::Crystal { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "end_crystal", ..Default::default() } },
         })
@@ -489,6 +492,15 @@ impl Game {
             },
         };
         let Some(tref) = self.entity_ref(target) else { return false };
+        if tref.info.type_name == "leash_knot" {
+            return self.use_knot(attacker, target);
+        }
+        if crate::game::ride::is_boat_type(tref.info.type_name) {
+            return self.hit_boat(Some(attacker), target, 1.0);
+        }
+        if crate::game::minecart::is_cart_item(tref.info.type_name) {
+            return self.hit_minecart(Some(attacker), target, 1.0);
+        }
         if matches!(tref.info.type_name, "item_frame" | "glow_item_frame") {
             return self.hit_frame(Some(attacker), target);
         }

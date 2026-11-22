@@ -1005,13 +1005,13 @@ impl Game {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::world::generator::Generator;
     use crate::world::storage::WorldStore;
 
     /// Needs the server directory with the vanilla cache: RIME_SERVER_DIR.
-    fn end_game() -> Option<(Game, Generator, WorldStore, std::path::PathBuf)> {
+    pub(crate) fn end_game() -> Option<(Game, Generator, WorldStore, std::path::PathBuf)> {
         let dir = std::path::PathBuf::from(std::env::var("RIME_SERVER_DIR").ok()?);
         let vanilla = crate::vanilla::VanillaData::ensure(&dir).ok()?;
         let cd = crate::net::config_data::ConfigData::build(&vanilla).ok()?;

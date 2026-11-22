@@ -38,6 +38,27 @@ impl Game {
         if p.gamemode.load(Ordering::Relaxed) == 3 {
             return false;
         }
+        let vehicle = self.entities.lock().get(&eid).map(|e| match &e.kind {
+            EKind::Boat { .. } => 1,
+            EKind::Minecart(_) => 2,
+            _ => 0,
+        });
+        match vehicle {
+            Some(1) => return hand == 0 && p.flags.load(Ordering::Relaxed) & super::hurt::F_SNEAKING == 0 && self.mount(p.eid, eid),
+            Some(2) => return hand == 0 && self.use_minecart(p, eid, held, slot),
+            _ => {}
+        }
+        if self.entities.lock().get(&eid).is_some_and(|e| matches!(e.kind, EKind::Knot)) {
+            return hand == 0 && self.use_knot(p, eid);
+        }
+        if let Some(r) = self.leash_interact(p, eid, held, slot) {
+            return r;
+        }
+        if hand == 0 {
+            if let Some(r) = self.ride_interact(p, eid, held, slot) {
+                return r;
+            }
+        }
         if self.is_frame(eid) {
             return hand == 0 && self.use_frame(p, eid, slot) || hand == 1 && held.is_some() && self.use_frame(p, eid, slot);
         }

@@ -84,10 +84,6 @@ impl Game {
         n
     }
 
-    /// minecarts touching `area` (detector rails)
-    pub fn minecarts_in(&self, _area: &Aabb) -> usize {
-        0
-    }
 
     /// item entities touching `area`, as (eid, stack)
     pub fn items_in(&self, area: &Aabb) -> Vec<(i32, Stack)> {

@@ -32,6 +32,9 @@ pub mod portal;
 pub mod endfight;
 pub mod frame;
 pub mod persist;
+pub mod ride;
+pub mod leash;
+pub mod minecart;
 pub mod survival;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -466,6 +469,8 @@ pub struct Player {
     pub requests: Mutex<Vec<Request>>,
     /// the dimension the player is in (`Dim::index`)
     pub dim: std::sync::atomic::AtomicU8,
+    /// last `player_input` flags (forward 1, back 2, left 4, right 8, jump 16, shift 32, sprint 64)
+    pub input: std::sync::atomic::AtomicU8,
 }
 
 /// Something another part of the server asks a player's session to do.
@@ -569,6 +574,10 @@ pub struct Game {
     pub transfers: Mutex<Vec<(Entity, [i32; 3], &'static str)>>,
     /// entity portal cooldowns (eid -> tick it ends)
     pub(crate) portal_cd: Mutex<HashMap<i32, u64>>,
+    /// who rides what
+    pub(crate) rides: Mutex<ride::Rides>,
+    /// who is on a lead
+    pub(crate) leashes: Mutex<leash::Leashes>,
 }
 
 pub(crate) struct GW<'a>(pub(crate) &'a Game);
@@ -609,6 +618,8 @@ impl Game {
             fight: Mutex::new(endfight::Fight::default()),
             transfers: Mutex::new(Vec::new()),
             portal_cd: Mutex::new(HashMap::new()),
+            rides: Mutex::new(ride::Rides::default()),
+            leashes: Mutex::new(leash::Leashes::default()),
         }
     }
 
@@ -669,6 +680,7 @@ impl Game {
             kicked: std::sync::atomic::AtomicBool::new(false),
             requests: Mutex::new(Vec::new()),
             dim: std::sync::atomic::AtomicU8::new(self.dim.index()),
+            input: std::sync::atomic::AtomicU8::new(0),
         });
         m.insert(eid, p.clone());
         Some(p)
@@ -681,6 +693,8 @@ impl Game {
     }
 
     pub fn leave(&self, eid: i32) {
+        self.dismount(eid);
+        self.eject_all(eid);
         let p = self.players.write().remove(&eid);
         if let Some(p) = p {
             self.fight_player_left(&p);
@@ -984,11 +998,19 @@ impl Game {
             EKind::Falling { state } => (regs.id("minecraft:entity_type", "minecraft:falling_block").unwrap_or(0), state.0 as i32),
             EKind::Tnt { .. } => (regs.id("minecraft:entity_type", "minecraft:tnt").unwrap_or(0), 0),
             EKind::Crystal { .. } => (regs.id("minecraft:entity_type", "minecraft:end_crystal").unwrap_or(0), 0),
+            EKind::Boat { ty, .. } => (regs.id("minecraft:entity_type", &format!("minecraft:{ty}")).unwrap_or(0), 0),
+            EKind::Minecart(c) => (regs.id("minecraft:entity_type", &format!("minecraft:{}", c.ty)).unwrap_or(0), 0),
+            EKind::Knot => (regs.id("minecraft:entity_type", "minecraft:leash_knot").unwrap_or(0), 0),
             EKind::Frame { glow, facing, .. } => (regs.id("minecraft:entity_type", if *glow { "minecraft:glow_item_frame" } else { "minecraft:item_frame" }).unwrap_or(0), *facing as i32),
             _ => unreachable!(),
         };
+        let yaw = match &e.kind {
+            EKind::Boat { yaw, .. } => *yaw,
+            EKind::Minecart(c) => c.yaw,
+            _ => 0.0,
+        };
         let mut b = Vec::new();
-        b.vi(e.eid).uuid(e.uuid).vi(ty).f64(e.pos[0]).f64(e.pos[1]).f64(e.pos[2]).u8(0).u8(0).u8(0).u8(0).vi(data);
+        b.vi(e.eid).uuid(e.uuid).vi(ty).f64(e.pos[0]).f64(e.pos[1]).f64(e.pos[2]).u8(0).u8(0).u8(mob::angle_byte(yaw)).u8(mob::angle_byte(yaw)).vi(data);
         let mut out = vec![self.encode("add_entity", &b)];
         if let EKind::Tnt { fuse, .. } = e.kind {
             let mut m = Vec::new();
@@ -1003,6 +1025,12 @@ impl Game {
         }
         if let EKind::Frame { item, rotation, .. } = e.kind {
             out.push(self.frame_meta(e.eid, item, rotation));
+        }
+        if let EKind::Minecart(c) = &e.kind {
+            out.push(self.cart_meta(e.eid, c));
+        }
+        if !self.passengers_of(e.eid).is_empty() {
+            out.push(self.passengers_packet(e.eid));
         }
         out
     }
@@ -1222,13 +1250,34 @@ impl Game {
         let mut landed: Vec<([i32; 3], BlockState)> = Vec::new();
         let mut inv_changed: Vec<Arc<Player>> = Vec::new();
         let mut booms: Vec<([f64; 3], Option<i32>)> = Vec::new();
+        // vehicles: who steers (client-moved) and riders' push intents
+        let ridden: Vec<i32> = self.rides.lock().passengers.keys().copied().collect();
+        let steered: std::collections::HashSet<i32> = ridden.iter().copied().filter(|v| self.controller(*v).is_some()).collect();
+        let intents: HashMap<i32, [f64; 2]> = ridden
+            .iter()
+            .filter_map(|v| {
+                let first = *self.passengers_of(*v).first()?;
+                let p = players.iter().find(|p| p.eid == first)?;
+                let inp = p.input.load(Ordering::Relaxed);
+                let (f, s) = ((inp & 1 != 0) as i32 - (inp & 2 != 0) as i32, (inp & 4 != 0) as i32 - (inp & 8 != 0) as i32);
+                if f == 0 && s == 0 {
+                    return None;
+                }
+                let yaw = (p.pose.lock().yaw as f64).to_radians();
+                let (sn, cs) = (yaw.sin(), yaw.cos());
+                let (fx, fz) = (s as f64, f as f64);
+                let l = (fx * fx + fz * fz).sqrt();
+                Some((*v, [(fx * cs - fz * sn) / l, (fz * cs + fx * sn) / l]))
+            })
+            .collect();
+        let mut cart_evs: Vec<minecart::CartEv> = Vec::new();
         {
             let mut ents = self.entities.lock();
             for e in ents.values_mut() {
                 if matches!(e.kind, EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. } | EKind::Fangs { .. }) {
                     continue;
                 }
-                if let EKind::Frame { .. } = e.kind {
+                if let EKind::Frame { .. } | EKind::Knot = e.kind {
                     continue;
                 }
                 if let EKind::Crystal { .. } = e.kind {
@@ -1253,7 +1302,22 @@ impl Game {
                     "slime_block" => 0.8,
                     _ => 0.6,
                 };
-                let ground = entity::physics(e, &|x, y, z| self.cell(x, y, z), friction);
+                let ground = match e.kind {
+                    EKind::Boat { .. } => {
+                        if !steered.contains(&e.eid) {
+                            self.boat_physics(e);
+                        }
+                        e.on_ground
+                    }
+                    EKind::Minecart(_) => {
+                        if self.cart_tick(e, intents.get(&e.eid).copied(), ridden.contains(&e.eid), &mut cart_evs) {
+                            removed.push((e.eid, old_chunk));
+                            continue;
+                        }
+                        e.on_ground
+                    }
+                    _ => entity::physics(e, &|x, y, z| self.cell(x, y, z), friction),
+                };
                 e.age += 1;
                 match &mut e.kind {
                     EKind::Item { pickup_delay, .. } => {
@@ -1263,7 +1327,7 @@ impl Game {
                             continue;
                         }
                     }
-                    EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. } | EKind::Fangs { .. } | EKind::Crystal { .. } | EKind::Frame { .. } => {}
+                    EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. } | EKind::Fangs { .. } | EKind::Crystal { .. } | EKind::Frame { .. } | EKind::Boat { .. } | EKind::Minecart(_) | EKind::Knot => {}
                     EKind::Tnt { fuse, owner } => {
                         *fuse -= 1;
                         if *fuse <= 0 {
@@ -1300,7 +1364,12 @@ impl Game {
                 if moved {
                     e.synced = e.pos;
                     let mut b = Vec::new();
-                    b.vi(e.eid).f64(e.pos[0]).f64(e.pos[1]).f64(e.pos[2]).f64(e.vel[0]).f64(e.vel[1]).f64(e.vel[2]).f32(0.0).f32(0.0).bool(e.on_ground);
+                    let (yaw, pitch) = match &e.kind {
+                        EKind::Boat { yaw, .. } => (*yaw, 0.0),
+                        EKind::Minecart(c) => (c.yaw, c.pitch),
+                        _ => (0.0, 0.0),
+                    };
+                    b.vi(e.eid).f64(e.pos[0]).f64(e.pos[1]).f64(e.pos[2]).f64(e.vel[0]).f64(e.vel[1]).f64(e.vel[2]).f32(yaw).f32(pitch).bool(e.on_ground);
                     sends.push((new_chunk, self.encode("entity_position_sync", &b)));
                 }
             }
@@ -1355,6 +1424,15 @@ impl Game {
         for p in inv_changed {
             self.flush_inventory(&p);
         }
+        for ev in cart_evs {
+            match ev {
+                minecart::CartEv::Explode(pos, speed) => self.cart_explode(pos, speed),
+                minecart::CartEv::Eject(v) => self.eject_all(v),
+                minecart::CartEv::Primed(pos) => self.play_sound("minecraft:entity.tnt.primed", 4, pos, 1.0, 1.0),
+            }
+        }
+        self.tick_rides();
+        self.tick_leashes();
         for (c, owner) in booms {
             // PrimedTnt.explode: power 4 at y + height / 16
             self.explode_full([c[0], c[1] + 0.98 / 16.0, c[2]], 4.0, false, owner, Some(false));

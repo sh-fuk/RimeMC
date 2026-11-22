@@ -20,6 +20,12 @@ pub enum EKind {
     Tnt { fuse: i32, owner: Option<i32> },
     /// `EndCrystal`
     Crystal { show_bottom: bool, beam: Option<[i32; 3]>, invulnerable: bool },
+    /// boats and rafts (`ty` is the entity type, e.g. `oak_chest_boat`)
+    Boat { ty: &'static str, yaw: f32, damage: f32, hurt: i32, hurt_dir: i32 },
+    /// minecarts (`ty`: minecart, chest_minecart, furnace_minecart, tnt_minecart, hopper_minecart)
+    Minecart(Box<super::minecart::Cart>),
+    /// `LeashFenceKnotEntity`
+    Knot,
     /// `ItemFrame` / `GlowItemFrame` (pos is the frame's centre)
     Frame { item: Option<Stack>, rotation: u8, facing: u8, glow: bool, fixed: bool },
 }
@@ -61,6 +67,9 @@ impl Entity {
             EKind::Tnt { .. } => (0.49, 0.98),
             EKind::Crystal { .. } => (1.0, 2.0),
             EKind::Frame { .. } => (0.375, 0.75),
+            EKind::Boat { .. } => (0.6875, 0.5625),
+            EKind::Minecart(_) => (0.49, 0.7),
+            EKind::Knot => (0.1875, 0.5),
         }
     }
 }

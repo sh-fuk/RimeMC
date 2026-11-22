@@ -112,6 +112,19 @@ pub fn use_block(g: &Game, p: [i32; 3], s: BlockState, cx: &Ctx) -> Use {
         }
     }
     let secondary = cx.sneaking && cx.held.is_some();
+    // LeadItem.useOn: tie the player's mobs to a fence
+    if s.name().ends_with("_fence") && !s.name().ends_with("_gate") && g.tie_to_fence(cx.player, p) {
+        return Use::Consumed;
+    }
+    // MinecartItem.useOn
+    if crate::game::minecart::is_cart_item(item) && item != "command_block_minecart" {
+        if g.place_minecart(item, p) {
+            if !cx.creative {
+                consume_held(g, cx.player, item);
+            }
+            return Use::Consumed;
+        }
+    }
     // HangingEntityItem.useOn (item frames)
     if matches!(item, "item_frame" | "glow_item_frame") {
         if g.place_frame(p, cx.face, item == "glow_item_frame") {

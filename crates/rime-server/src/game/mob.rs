@@ -383,6 +383,8 @@ pub struct Vars {
     pub bound: Option<[i32; 3]>,
     /// dragon: the crystal healing it, damage taken while perched, time in phase
     pub dragon_crystal: Option<i32>,
+    /// pig / strider: total ticks of the last carrot / fungus boost
+    pub boost: i32,
     pub sit_damage: f32,
     pub phase_time: i32,
     // shulker

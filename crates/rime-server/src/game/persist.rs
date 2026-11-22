@@ -210,6 +210,16 @@ impl Game {
                         f.push(s("beam_target", Tag::IntArray(b.to_vec())));
                     }
                 }
+                EKind::Boat { ty, yaw, .. } => {
+                    f.push(s("id", Tag::String(format!("minecraft:{ty}"))));
+                    f.push(s("Yaw", Tag::Float(*yaw)));
+                }
+                EKind::Minecart(c) => {
+                    f.push(s("id", Tag::String(format!("minecraft:{}", c.ty))));
+                    f.push(s("Fuel", Tag::Int(c.fuel)));
+                    f.push(s("Push", Tag::List(vec![Tag::Double(c.push[0]), Tag::Double(c.push[1])])));
+                    f.push(s("Yaw", Tag::Float(c.yaw)));
+                }
                 EKind::Frame { item, rotation, facing, glow, fixed } => {
                     f.push(s("id", Tag::String(if *glow { "minecraft:glow_item_frame" } else { "minecraft:item_frame" }.into())));
                     if let Some(i) = item {
@@ -259,6 +269,18 @@ impl Game {
                 "item" => {
                     let Some(st) = t.get("Item").and_then(stack_from) else { continue };
                     EKind::Item { stack: st, pickup_delay: num(t, "PickupDelay").unwrap_or(0).max(0) as u32 }
+                }
+                b if super::ride::is_boat_type(b) => EKind::Boat { ty: Box::leak(b.to_string().into_boxed_str()), yaw: float(t, "Yaw").unwrap_or(0.0), damage: 0.0, hurt: 0, hurt_dir: 1 },
+                c if super::minecart::is_cart_item(c) => {
+                    let mut cart = super::minecart::Cart::new(Box::leak(c.to_string().into_boxed_str()));
+                    cart.fuel = num(t, "Fuel").unwrap_or(0) as i32;
+                    cart.yaw = float(t, "Yaw").unwrap_or(0.0);
+                    if let Some(Tag::List(l)) = t.get("Push") {
+                        if let (Some(Tag::Double(a)), Some(Tag::Double(b))) = (l.first(), l.get(1)) {
+                            cart.push = [*a, *b];
+                        }
+                    }
+                    EKind::Minecart(Box::new(cart))
                 }
                 "end_crystal" => EKind::Crystal { show_bottom: num(t, "ShowBottom").unwrap_or(1) != 0, beam: ints(t.get("beam_target")), invulnerable: num(t, "Invulnerable").unwrap_or(0) != 0 },
                 "item_frame" | "glow_item_frame" => EKind::Frame {

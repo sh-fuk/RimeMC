@@ -1664,7 +1664,23 @@ impl Session {
             }
             self.game.send_inventory(&self.me);
         } else if pid == sb("player_input") {
-            self.sneaking = r.u8()? & 0x20 != 0;
+            let flags = r.u8()?;
+            self.sneaking = flags & 0x20 != 0;
+            self.me.input.store(flags, Ordering::Relaxed);
+            // ServerPlayer: shift gets off whatever the player rides
+            if self.sneaking && self.game.vehicle_of(self.me.eid).is_some() {
+                self.game.dismount(self.me.eid);
+            }
+        } else if pid == sb("move_vehicle") {
+            let (x, y, z) = (r.f64()?, r.f64()?, r.f64()?);
+            let (yaw, pitch) = (r.f32()?, r.f32()?);
+            let on_ground = r.u8()? != 0;
+            self.game.move_vehicle(&self.me, [x, y, z], yaw, pitch, on_ground);
+        } else if pid == sb("paddle_boat") {
+            let (left, right) = (r.u8()? != 0, r.u8()? != 0);
+            if let Some(v) = self.game.vehicle_of(self.me.eid) {
+                self.game.paddle(v, left, right);
+            }
         } else if pid == sb("interact") {
             let target = r.varint()?;
             let hand = r.varint()?;
@@ -2460,6 +2476,41 @@ impl Session {
         let name = items.name(held.item).to_string();
         let gm = self.gamemode();
         let game = &*self.game.clone();
+        // BoatItem.use: on the water or ground looked at
+        if crate::game::ride::is_boat_type(&name) {
+            let hit = self.raycast(yaw, pitch, &|b| fluid::fluid_state(b).fluid().is_some() || b.is_solid());
+            if let Some((_, c)) = hit {
+                let b = game.world.get_block(c.0, c.1, c.2).unwrap_or(blocks::AIR);
+                let y = if fluid::fluid_state(b).fluid().is_some() { c.1 as f64 + 0.9 } else { c.1 as f64 + 1.0 };
+                if game.place_boat(&name, [c.0 as f64 + 0.5, y, c.2 as f64 + 0.5], yaw) && gm != 1 {
+                    self.me.inv.lock().consume(slot, 1);
+                    game.flush_inventory(&self.me);
+                }
+            }
+            return;
+        }
+        // ItemSteerable.boost: carrot / warped fungus on a stick
+        if matches!(name.as_str(), "carrot_on_a_stick" | "warped_fungus_on_a_stick") {
+            if let Some(v) = game.vehicle_of(self.me.eid) {
+                if game.boost(v, &name) && gm != 1 {
+                    let cost = if name == "carrot_on_a_stick" { 7 } else { 1 };
+                    let mut inv = self.me.inv.lock();
+                    if let Some(mut s) = inv.slots[slot] {
+                        let dmg = s.patch().damage.unwrap_or(0) + cost;
+                        if dmg >= s.max_damage() {
+                            // hurtAndConvertOnBreak: back to a fishing rod
+                            inv.set(slot, items.id("fishing_rod").map(|i| Stack::new(i, 1)));
+                        } else {
+                            s.with_patch(|p| p.damage = Some(dmg));
+                            inv.set(slot, Some(s));
+                        }
+                    }
+                    drop(inv);
+                    game.flush_inventory(&self.me);
+                }
+            }
+            return;
+        }
         match name.as_str() {
             "bucket" => {
                 let hit = self.raycast(yaw, pitch, &|b| fluid::fluid_state(b).is_source() || b.is_solid());

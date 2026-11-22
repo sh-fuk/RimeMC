@@ -1128,7 +1128,12 @@ pub fn ranged_attack(m: &mut Mob, cx: &mut Ctx, t: &Seen, power: f32) {
 
 /// `TemptGoal` / food checks: is `item` breeding food for this type?
 pub fn is_food(m: &Mob, item: i32, cx: &Ctx) -> bool {
-    let tag = match m.ty.name() {
+    food_tag(m.ty.name()).is_some_and(|tag| cx.game.data.item_in(tag, item))
+}
+
+/// The breeding food item tag of a type.
+pub fn food_tag(name: &str) -> Option<&'static str> {
+    Some(match name {
         "cow" | "mooshroom" => "cow_food",
         "sheep" => "sheep_food",
         "pig" => "pig_food",
@@ -1156,9 +1161,8 @@ pub fn is_food(m: &Mob, item: i32, cx: &Ctx) -> bool {
         "nautilus" => "nautilus_food",
         "zombie_horse" => "zombie_horse_food",
         "happy_ghast" => "happy_ghast_food",
-        _ => return false,
-    };
-    cx.game.data.item_in(tag, item)
+        _ => return None,
+    })
 }
 
 /// `Animal.canMate`
@@ -1713,8 +1717,9 @@ pub fn meta(m: &Mob, now: i64, b: &mut Vec<u8>) {
             }
         }
         "tadpole" => d_bool(b, 16, m.v.from_bucket),
+        "pig" => d_int(b, 18, m.v.boost),
         "strider" => {
-            d_int(b, 18, 0);
+            d_int(b, 18, m.v.boost);
             d_bool(b, 19, m.v.suffocating);
         }
         "bee" => {

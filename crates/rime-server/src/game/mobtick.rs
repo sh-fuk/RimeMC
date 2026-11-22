@@ -82,6 +82,8 @@ struct Env {
     difficulty: i32,
     /// (eid, pos, gamemode) of the players
     players: Vec<(i32, [f64; 3], i32)>,
+    /// mobs steered by a player or riding something: no AI of their own
+    held: std::collections::HashSet<i32>,
 }
 
 impl Game {
@@ -130,7 +132,7 @@ impl Game {
         self.encode("set_entity_data", &b)
     }
 
-    fn mob_equipment(&self, eid: i32, m: &Mob) -> Arc<Vec<u8>> {
+    pub(crate) fn mob_equipment(&self, eid: i32, m: &Mob) -> Arc<Vec<u8>> {
         let mut b = Vec::new();
         b.vi(eid);
         for slot in 0..8 {
@@ -152,6 +154,12 @@ impl Game {
                 let mut out = vec![self.encode("add_entity", &b), self.mob_meta(e.eid, m)];
                 if m.eq.iter().any(|s| s.is_some()) {
                     out.push(self.mob_equipment(e.eid, m));
+                }
+                if !self.passengers_of(e.eid).is_empty() {
+                    out.push(self.passengers_packet(e.eid));
+                }
+                if let Some(l) = self.leash_spawn_packet(e.eid) {
+                    out.push(l);
                 }
                 out
             }
@@ -333,6 +341,13 @@ impl Game {
             thundering,
             difficulty: self.difficulty(),
             players: players.iter().filter(|p| !p.vit.lock().dead()).map(|p| (p.eid, p.pose.lock().pos, p.gamemode.load(Ordering::Relaxed))).collect(),
+            held: {
+                let (vehicles, riders): (Vec<i32>, Vec<i32>) = {
+                    let r = self.rides.lock();
+                    (r.passengers.keys().copied().collect(), r.vehicle_of.keys().copied().collect())
+                };
+                vehicles.into_iter().filter(|v| self.controller(*v).is_some()).chain(riders).collect()
+            },
         };
         let mut seen: Vec<Seen> = players.iter().filter(|p| !p.vit.lock().dead()).map(|p| self.seen_player(p, night)).collect();
         // for the projectiles
@@ -515,6 +530,11 @@ impl Game {
         }
         if e.pos[1] < (MIN_Y - 64) as f64 {
             return true;
+        }
+        if env.held.contains(&eid) {
+            // moved by its rider (or its vehicle); keeps ticking timers only
+            m.tick_count += 1;
+            return false;
         }
         // Mob.checkDespawn
         let nearest = env.players.iter().filter(|p| p.2 != 3).map(|p| dist2(p.1, e.pos)).fold(f64::INFINITY, f64::min);
