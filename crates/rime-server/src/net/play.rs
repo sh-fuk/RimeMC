@@ -843,6 +843,7 @@ impl Session {
                 crate::game::Request::Kick(reason) => return Flow::Disconnect(reason),
                 crate::game::Request::StopUsingItem => self.stop_using_item(),
                 crate::game::Request::OpenEntity(eid, screen, title) => self.open_entity_container(eid, screen, title),
+                crate::game::Request::OpenMerchant(eid) => self.open_merchant(eid),
                 crate::game::Request::Died(src) => self.die(*src),
                 crate::game::Request::Chat(m) => {
                     if let Flow::Disconnect(r) = self.on_chat(&m) {
@@ -1612,6 +1613,9 @@ impl Session {
             let window = r.varint()?;
             let id = r.varint()?;
             self.menu_button(window, id);
+        } else if pid == sb("select_trade") {
+            let idx = r.varint()?;
+            self.select_trade(idx);
         } else if pid == sb("rename_item") {
             let name = r.string(32767)?.to_string();
             self.rename_item(name);
@@ -2702,6 +2706,53 @@ impl Session {
         game.send_inventory(&self.me);
     }
 
+    /// `Merchant.openTradingScreen`: the merchant menu and its offers.
+    fn open_merchant(&mut self, eid: i32) {
+        use crate::game::blockentity::Screen;
+        let game = &*self.game.clone();
+        let Some((offers, level, xp, villager, title)) = game.start_trading(&self.me, eid) else { return };
+        self.next_window = self.next_window % 100 + 1;
+        let id = self.next_window;
+        {
+            let held = self.me.held.load(Ordering::Relaxed) as i16;
+            let mut inv = self.me.inv.lock();
+            let thrown = inv.close(&game.data, held);
+            let key = [crate::game::block::container::ENTITY_KEY, eid, 1];
+            inv.window = crate::game::inventory::Window::Container(id, Screen::Merchant, key);
+            inv.ext = vec![None; 3];
+            inv.menu = crate::game::menu::MenuState { pos: key, creative: self.gamemode() == 1, selected: -1, offers: offers.clone(), merchant: eid, ..Default::default() };
+            drop(inv);
+            for t in thrown {
+                self.throw(t, false);
+            }
+        }
+        let menu = Registries::get().id("minecraft:menu", Screen::Merchant.menu()).unwrap_or(2);
+        let mut b = Vec::new();
+        let name = if title.starts_with("entity.") { Tag::Compound(vec![("translate".into(), Tag::String(title.clone()))]).to_network_bytes() } else { text_nbt(&title) };
+        b.vi(id as i32).vi(menu).raw(&name);
+        self.send("open_screen", &b);
+        let pkt = crate::game::merchant::offers_packet(&offers, level, xp, villager, id as i32);
+        self.send("merchant_offers", &pkt);
+        game.send_inventory(&self.me);
+    }
+
+    fn select_trade(&mut self, idx: i32) {
+        let game = &*self.game.clone();
+        let thrown = {
+            let held = self.me.held.load(Ordering::Relaxed) as i16;
+            let mut inv = self.me.inv.lock();
+            if !matches!(inv.window, crate::game::inventory::Window::Container(_, crate::game::blockentity::Screen::Merchant, _)) {
+                return;
+            }
+            crate::game::menu::select_trade(&mut inv, idx, held)
+        };
+        for t in thrown {
+            self.throw(t, false);
+        }
+        self.menu_events();
+        game.send_inventory(&self.me);
+    }
+
     /// Open a workstation menu (its slots live in the menu only).
     fn open_menu(&mut self, p: [i32; 3], screen: crate::game::blockentity::Screen, title: &str) {
         use crate::game::blockentity::Screen;
@@ -2767,6 +2818,14 @@ impl Session {
                 MenuEvent::XpOrbs(n) => game.award_xp_orbs(centre, n),
                 MenuEvent::AnvilUsed => crate::game::workstation::anvil_used(game, pos, creative),
                 MenuEvent::Stat(_) => {}
+                MenuEvent::Trade(i) => {
+                    let eid = self.me.inv.lock().menu.merchant;
+                    game.merchant_traded(&self.me, eid, i);
+                }
+                MenuEvent::TradeHint(ok) => {
+                    let eid = self.me.inv.lock().menu.merchant;
+                    game.merchant_hint_sound(eid, ok);
+                }
             }
         }
         let props = {

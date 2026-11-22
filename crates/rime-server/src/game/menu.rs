@@ -25,6 +25,10 @@ pub enum MenuEvent {
     /// anvil used: may get damaged
     AnvilUsed,
     Stat(&'static str),
+    /// a merchant trade was taken: offer index
+    Trade(usize),
+    /// the merchant result appeared (true) or a payment did not fit (false)
+    TradeHint(bool),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -47,6 +51,9 @@ pub struct MenuState {
     pub last_input: Option<i32>,
     pub list: Vec<usize>,
     pub patterns: Vec<String>,
+    // merchant
+    pub offers: Vec<super::merchant::Offer>,
+    pub merchant: i32,
 }
 
 /// window slot of a screen's result
@@ -55,12 +62,13 @@ pub fn result_slot(sc: Screen) -> Option<usize> {
         Screen::Anvil | Screen::Grindstone | Screen::Cartography => Some(2),
         Screen::Smithing | Screen::Loom => Some(3),
         Screen::Stonecutter => Some(1),
+        Screen::Merchant => Some(2),
         _ => None,
     }
 }
 
 pub fn is_menu(sc: Screen) -> bool {
-    matches!(sc, Screen::Enchanting | Screen::Anvil | Screen::Smithing | Screen::Grindstone | Screen::Stonecutter | Screen::Loom | Screen::Cartography | Screen::Beacon)
+    matches!(sc, Screen::Enchanting | Screen::Anvil | Screen::Smithing | Screen::Grindstone | Screen::Stonecutter | Screen::Loom | Screen::Cartography | Screen::Beacon | Screen::Merchant)
 }
 
 fn screen(inv: &Inventory) -> Option<Screen> {
@@ -231,7 +239,153 @@ pub fn slots_changed(inv: &mut Inventory, data: &GameData) {
         Screen::Loom => loom_changed(inv, data),
         Screen::Cartography => cartography_result(inv),
         Screen::Enchanting => enchant_changed(inv, data),
+        Screen::Merchant => merchant_result(inv),
         _ => {}
+    }
+}
+
+// ------------------------------------------------------------ merchant
+
+/// `MerchantContainer.updateSellItem`: the selected offer first, then any.
+fn merchant_result(inv: &mut Inventory) {
+    let (a, b) = (get(inv, 0), get(inv, 1));
+    let (a, b) = if a.is_none() { (b, None) } else { (a, b) };
+    let sel = inv.menu.selected;
+    let pick = |o: &super::merchant::Offer| !o.out_of_stock() && o.satisfied(a, b);
+    let idx = if sel >= 0 && inv.menu.offers.get(sel as usize).is_some_and(|o| pick(o)) {
+        Some(sel as usize)
+    } else {
+        inv.menu.offers.iter().position(|o| pick(o))
+    };
+    let before = get(inv, 2).is_some();
+    match idx {
+        Some(i) => {
+            let r = inv.menu.offers[i].result;
+            set(inv, 2, Some(r));
+            inv.menu.list = vec![i];
+            if !before {
+                inv.menu.events.push(MenuEvent::TradeHint(true));
+            }
+        }
+        None => {
+            set(inv, 2, None);
+            inv.menu.list.clear();
+        }
+    }
+}
+
+/// `MerchantResultSlot.onTake`: pay for offer `i`.
+fn merchant_take(inv: &mut Inventory) -> bool {
+    let Some(&i) = inv.menu.list.first() else { return false };
+    let Some(o) = inv.menu.offers.get(i).cloned() else { return false };
+    let (mut a, mut b) = (get(inv, 0), get(inv, 1));
+    let swapped = a.is_none();
+    if swapped {
+        a = b;
+        b = None;
+    }
+    if !o.satisfied(a, b) {
+        return false;
+    }
+    let ca = o.cost_a().count;
+    let (sa, sb) = if swapped { (1, 0) } else { (0, 1) };
+    shrink(inv, sa, ca);
+    if let Some(cb) = o.b {
+        shrink(inv, sb, cb.count);
+    }
+    inv.menu.offers[i].uses += 1;
+    inv.menu.events.push(MenuEvent::Trade(i));
+    true
+}
+
+/// `MerchantMenu.tryMoveItems` after `select_trade`: payments go back to
+/// the inventory, then the offer's costs are taken from it.
+pub fn select_trade(inv: &mut Inventory, idx: i32, selected: i16) -> Vec<Stack> {
+    let mut thrown = Vec::new();
+    if idx < 0 || idx as usize >= inv.menu.offers.len() {
+        return thrown;
+    }
+    inv.menu.selected = idx;
+    for s in 0..2 {
+        if let Some(st) = get(inv, s) {
+            set(inv, s, None);
+            let left = inv.add(st, selected);
+            if left > 0 {
+                thrown.push(Stack { count: left, ..st });
+            }
+        }
+    }
+    let o = inv.menu.offers[idx as usize].clone();
+    let costs = [Some(o.cost_a()), o.b];
+    for (s, cost) in costs.iter().enumerate() {
+        let Some(c) = cost else { continue };
+        let max = c.max();
+        let mut have: Option<Stack> = None;
+        for i in 9..45 {
+            let Some(st) = inv.slots[i] else { continue };
+            if st.item != c.item || (s == 0 && o.a_exact && st.comp != c.comp) {
+                continue;
+            }
+            if have.is_some_and(|h| h.comp != st.comp) {
+                continue;
+            }
+            let room = max - have.map(|h| h.count).unwrap_or(0);
+            if room == 0 {
+                break;
+            }
+            let n = room.min(st.count);
+            have = Some(Stack { count: have.map(|h| h.count).unwrap_or(0) + n, ..st });
+            inv.slots[i] = if st.count > n { Some(Stack { count: st.count - n, ..st }) } else { None };
+        }
+        if have.is_some() {
+            set(inv, s, have);
+        }
+    }
+    merchant_result(inv);
+    thrown
+}
+
+/// `EnchantWithLevelsFunction` for trades
+pub fn enchant_with_levels(st: Stack, levels: i32, options: &str, data: &GameData, seed: i64) -> Stack {
+    let mut rng = Legacy::new(seed);
+    let possible = tag_list(data, "enchantment", options);
+    let list = select_enchantment(&mut rng, &st, levels, possible, data);
+    if list.is_empty() {
+        return st;
+    }
+    let mut out = st;
+    if name(&st) == "book" {
+        if let Some(b) = Items::get().id("enchanted_book") {
+            out = Stack { item: b, ..st };
+        }
+        with(out, |p| {
+            for (n, l) in &list {
+                p.stored_enchantments.push((n.clone(), *l as u8));
+            }
+        })
+    } else {
+        with(out, |p| {
+            for (n, l) in &list {
+                p.enchantments.push((n.clone(), *l as u8));
+            }
+        })
+    }
+}
+
+/// `EnchantRandomlyFunction` for trades: (stack, chosen level)
+pub fn enchant_randomly(st: Stack, options: &str, only_compatible: bool, data: &GameData, rng: &mut impl rand::Rng) -> Option<(Stack, i32)> {
+    let book = name(&st) == "book";
+    let list: Vec<&String> = tag_list(data, "enchantment", options).iter().filter(|e| !only_compatible || book || can_enchant(e, &st, data)).collect();
+    if list.is_empty() {
+        return None;
+    }
+    let e = list[rng.gen_range(0..list.len())].clone();
+    let lvl = rng.gen_range(1..=ench_max(&e).max(1));
+    if book {
+        let b = Items::get().id("enchanted_book")?;
+        Some((with(Stack { item: b, ..st }, |p| p.stored_enchantments.push((e, lvl as u8))), lvl))
+    } else {
+        Some((with(st, |p| p.enchantments.push((e, lvl as u8))), lvl))
     }
 }
 
@@ -328,6 +482,11 @@ pub fn take(inv: &mut Inventory, data: &GameData) -> Option<Stack> {
             shrink(inv, 0, 1);
             shrink(inv, 1, 1);
             inv.menu.events.push(MenuEvent::Sound("minecraft:ui.cartography_table.take_result"));
+        }
+        Screen::Merchant => {
+            if !merchant_take(inv) {
+                return None;
+            }
         }
         _ => return None,
     }

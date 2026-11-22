@@ -62,6 +62,14 @@ impl Game {
         if self.entities.lock().get(&eid).is_some_and(|e| matches!(e.kind, EKind::Knot)) {
             return hand == 0 && self.use_knot(p, eid);
         }
+        if hand == 0 {
+            if let Some(r) = self.cure_interact(p, eid, held, slot) {
+                return r;
+            }
+            if let Some(r) = self.merchant_interact(p, eid, held) {
+                return r;
+            }
+        }
         if let Some(r) = self.leash_interact(p, eid, held, slot) {
             return r;
         }

@@ -145,6 +145,12 @@ fn mob_nbt(m: &Mob) -> Vec<(String, Tag)> {
     if let Some(c) = v.carry {
         f.push(s("CarriedState", Tag::Int(c.0 as i32)));
     }
+    if let Some(mer) = &m.merchant {
+        f.push(s("Merchant", super::merchant::to_nbt(mer)));
+    }
+    if v.conversion > 0 {
+        f.push(s("ConversionTime", Tag::Int(v.conversion)));
+    }
     f
 }
 
@@ -168,6 +174,12 @@ fn mob_from(ty: MobType, t: &Tag) -> Mob {
     m.no_ai = num(t, "NoAI").unwrap_or(0) != 0;
     m.left_handed = num(t, "LeftHanded").unwrap_or(0) != 0;
     m.can_pick_up = num(t, "CanPickUpLoot").unwrap_or(0) != 0;
+    if let Some(mt) = t.get("Merchant") {
+        m.merchant = Some(Box::new(super::merchant::from_nbt(mt)));
+    }
+    if let Some(c) = num(t, "ConversionTime") {
+        m.v.conversion = c as i32;
+    }
     m.fire = num(t, "Fire").unwrap_or(0) as i32;
     if let Some(Tag::List(l)) = t.get("DropChances") {
         for (i, c) in l.iter().enumerate().take(m.drop_chance.len()) {

@@ -192,7 +192,18 @@ impl Game {
             // anything but a direct hit lands on the body part
             return self.hurt_dragon(eid, 3, src, amount);
         }
-        self.with_mob(eid, |l, eq, body| l.hurt(eq, body, src, amount, &mut rand::thread_rng())).unwrap_or(false)
+        let hit = self.with_mob(eid, |l, eq, body| l.hurt(eq, body, src, amount, &mut rand::thread_rng())).unwrap_or(false);
+        if hit {
+            if let Some(c) = src.causing.as_ref().filter(|c| c.player) {
+                let villager = matches!(self.entities.lock().get(&eid).map(|e| &e.kind), Some(EKind::Mob(m)) if m.ty.is("villager"));
+                if villager {
+                    if let Some(u) = self.players().iter().find(|p| p.eid == c.eid).map(|p| p.uuid) {
+                        self.villager_hurt_by(eid, u, false);
+                    }
+                }
+            }
+        }
+        hit
     }
 
     /// `hurtServer` on any living entity.

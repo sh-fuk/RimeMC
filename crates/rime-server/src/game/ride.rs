@@ -51,7 +51,7 @@ impl Game {
         self.encode("set_passengers", &b)
     }
 
-    fn entity_chunk(&self, eid: i32) -> Option<(i32, i32)> {
+    pub(crate) fn entity_chunk(&self, eid: i32) -> Option<(i32, i32)> {
         if let Some(e) = self.entities.lock().get(&eid) {
             return Some(e.chunk());
         }

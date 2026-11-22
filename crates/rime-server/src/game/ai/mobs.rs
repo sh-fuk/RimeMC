@@ -642,6 +642,7 @@ pub fn setup(m: &mut Mob) {
             g(m, 0, mk::float());
             g(m, 1, mk::avoid(zombies_and_raiders, 8.0, 0.5, 0.5));
             g(m, 1, mk::panic(0.5));
+            g(m, 4, mk::towards_restriction(0.5));
             g(m, 5, mk::wander_p(0.5, 0.001));
             g(m, 9, mk::look_player_p(3.0, 1.0));
             g(m, 10, mk::look_mob(8.0, non_players));
@@ -1565,6 +1566,7 @@ pub fn meta(m: &Mob, now: i64, b: &mut Vec<u8>) {
             d_bool(b, 18, m.v.conversion > 0 && n != "zombie_villager");
             if n == "zombie_villager" {
                 d_bool(b, 19, m.v.conversion > 0);
+                crate::game::merchant::villager_data(b, 20, m.merchant.as_deref());
             }
         }
         "zoglin" => d_bool(b, 16, m.baby),
@@ -1574,6 +1576,12 @@ pub fn meta(m: &Mob, now: i64, b: &mut Vec<u8>) {
             d_bool(b, 19, m.v.t2 > 0);
         }
         "skeleton" => d_bool(b, 16, m.v.conversion > 0),
+        // AbstractVillager.DATA_UNHAPPY_COUNTER, Villager.DATA_VILLAGER_DATA
+        "villager" => {
+            d_int(b, 17, m.v.trade_unhappy);
+            crate::game::merchant::villager_data(b, 18, m.merchant.as_deref());
+        }
+        "wandering_trader" => d_int(b, 17, m.v.trade_unhappy),
         "bogged" => d_bool(b, 16, m.v.sheared),
         "slime" | "magma_cube" => d_int(b, 16, m.size),
         "phantom" => d_int(b, 16, m.size),

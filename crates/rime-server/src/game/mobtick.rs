@@ -191,6 +191,7 @@ impl Game {
         m.mo.head_yaw = m.mo.yaw;
         m.mo.body_yaw = m.mo.yaw;
         f(&mut m, &mut rng);
+        self.init_merchant(&mut m, pos);
         let eid = if m.ty.is("ender_dragon") { self.next_eids(9) } else { self.next_eid() };
         let e = Entity { eid, uuid: uuid::Uuid::new_v4(), kind: EKind::Mob(Box::new(m)), pos, vel: [0.0; 3], on_ground: false, age: 0, synced: pos };
         self.add_entity(e);
@@ -346,7 +347,8 @@ impl Game {
                     let r = self.rides.lock();
                     (r.passengers.keys().copied().collect(), r.vehicle_of.keys().copied().collect())
                 };
-                vehicles.into_iter().filter(|v| self.controller(*v).is_some()).chain(riders).collect()
+                let trading: Vec<i32> = self.entities.lock().values().filter(|e| matches!(&e.kind, EKind::Mob(m) if m.merchant.as_ref().is_some_and(|x| x.customer.is_some()))).map(|e| e.eid).collect();
+                vehicles.into_iter().filter(|v| self.controller(*v).is_some()).chain(riders).chain(trading).collect()
             },
         };
         let mut seen: Vec<Seen> = players.iter().filter(|p| !p.vit.lock().dead()).map(|p| self.seen_player(p, night)).collect();
@@ -1254,6 +1256,10 @@ impl Game {
                 m.set_baby(true);
             }
             m.no_ai = om.no_ai;
+            // villager <-> zombie villager keep their trades and reputation
+            m.merchant = om.merchant.clone();
+            m.v.custom_name = om.v.custom_name.clone();
+            m.persistent = om.persistent || m.persistent;
             if let Some((e, d)) = effect {
                 if let Some(ef) = Effect::from_name(e) {
                     let info = super::hurt::mob_info(m, false);
@@ -1265,6 +1271,22 @@ impl Game {
 
     /// Death of a mob: loot, equipment, experience, slime splits.
     pub(super) fn mob_died(&self, eid: i32, src: &DamageSource) {
+        let villager = matches!(self.entities.lock().get(&eid).map(|e| &e.kind), Some(EKind::Mob(m)) if m.ty.is("villager"));
+        if villager {
+            match src.causing.as_ref() {
+                Some(c) if matches!(c.info.type_name, "zombie" | "husk" | "drowned" | "zombie_villager") => {
+                    if self.zombify_villager(eid) {
+                        return;
+                    }
+                }
+                Some(c) if c.player => {
+                    if let Some(u) = self.players().iter().find(|p| p.eid == c.eid).map(|p| p.uuid) {
+                        self.villager_hurt_by(eid, u, true);
+                    }
+                }
+                _ => {}
+            }
+        }
         let mut rng = rand::thread_rng();
         let (m, pos) = {
             let ents = self.entities.lock();

@@ -135,6 +135,10 @@ pub struct MenuData {
     pub smithing: Vec<Smithing>,
     /// tags in file order (`#` references expanded): "banner_pattern/no_item_required"…
     pub ordered_tags: HashMap<String, Vec<String>>,
+    /// `villager_trade` entries by key ("armorer/1/emerald_iron_boots")
+    pub trades: HashMap<String, Value>,
+    /// `trade_set` entries by key ("armorer/level_1")
+    pub trade_sets: HashMap<String, Value>,
 }
 
 /// A tag's entries in declaration order, nested tags expanded.
@@ -283,7 +287,13 @@ impl GameData {
                 d.parse_menu_recipe(&json);
             }
         }
-        for (reg, dir) in [("banner_pattern", "banner_pattern"), ("enchantment", "enchantment")] {
+        for (dir, map) in [("villager_trade", &mut d.menus.trades), ("trade_set", &mut d.menus.trade_sets)] {
+            for (key, path) in v.entries(dir) {
+                let json: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+                map.insert(strip(&key).to_string(), json);
+            }
+        }
+        for (reg, dir) in [("banner_pattern", "banner_pattern"), ("enchantment", "enchantment"), ("villager_trade", "villager_trade"), ("potion", "potion")] {
             let base = v.path(&format!("minecraft/tags/{dir}"));
             let mut files = Vec::new();
             fn walk(base: &std::path::Path, cur: &std::path::Path, out: &mut Vec<String>) {

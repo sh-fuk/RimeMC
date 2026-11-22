@@ -40,6 +40,8 @@ pub struct Patch {
     pub trim: Option<(String, String)>,
     /// `banner_patterns`: (pattern, dye colour id), bottom layer first
     pub banner: Vec<(String, u8)>,
+    /// `dyed_color` (RGB)
+    pub dyed_color: Option<i32>,
 }
 
 /// Network ids of the synchronized data-driven registries (trim materials,
@@ -268,6 +270,10 @@ impl crate::data::Stack {
 
 // ------------------------------------------------------------------ network
 
+pub fn type_id_pub(name: &str) -> i32 {
+    type_id(name)
+}
+
 fn type_id(name: &str) -> i32 {
     Registries::get().id("minecraft:data_component_type", name).unwrap_or(-1)
 }
@@ -344,6 +350,11 @@ pub fn write_patch(b: &mut Vec<u8>, comp: u32) {
             x.vi(id + 1).vi(c as i32);
         }
         added.push((type_id("minecraft:banner_patterns"), x));
+    }
+    if let Some(rgb) = p.dyed_color {
+        let mut x = Vec::new();
+        x.i32(rgb);
+        added.push((type_id("minecraft:dyed_color"), x));
     }
     added.retain(|(id, _)| *id >= 0);
     b.vi(added.len() as i32).vi(0);
@@ -462,6 +473,9 @@ pub fn to_nbt(comp: u32) -> Option<Tag> {
     if p.intangible {
         c.push(("minecraft:intangible_projectile".into(), Tag::Compound(vec![])));
     }
+    if let Some(rgb) = p.dyed_color {
+        c.push(("minecraft:dyed_color".into(), Tag::Int(rgb)));
+    }
     if let Some((m, pt)) = &p.trim {
         c.push(("minecraft:trim".into(), Tag::Compound(vec![("material".into(), Tag::String(format!("minecraft:{m}"))), ("pattern".into(), Tag::String(format!("minecraft:{pt}")))])));
     }
@@ -509,6 +523,7 @@ pub fn from_nbt(t: &Tag) -> u32 {
     p.repair_cost = t.get("minecraft:repair_cost").and_then(|d| d.as_i64()).map(|d| d as i32);
     p.potion = t.get("minecraft:potion_contents").and_then(|pc| pc.get("potion").or(Some(pc))).and_then(|x| x.as_str()).map(|s| s.trim_start_matches("minecraft:").to_string());
     p.intangible = t.get("minecraft:intangible_projectile").is_some();
+    p.dyed_color = t.get("minecraft:dyed_color").and_then(|d| d.as_i64().or_else(|| d.get("rgb").and_then(|x| x.as_i64()))).map(|d| d as i32);
     if let Some(tr) = t.get("minecraft:trim") {
         let s = |k: &str| tr.get(k).and_then(|v| v.as_str()).map(|x| x.trim_start_matches("minecraft:").to_string());
         if let (Some(m), Some(pt)) = (s("material"), s("pattern")) {

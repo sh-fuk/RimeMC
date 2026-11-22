@@ -537,6 +537,8 @@ pub struct Mob {
     pub rot_sent: (f32, f32),
     pub meta_sent: u64,
     pub v: Vars,
+    /// villagers, zombie villagers and wandering traders
+    pub merchant: Option<Box<super::merchant::Merchant>>,
 }
 
 impl Mob {
@@ -586,6 +588,7 @@ impl Mob {
             rot_sent: (0.0, 0.0),
             meta_sent: 0,
             v: Vars { swell_dir: -1, can_move: true, moistness: 2400, collar: 14, ..Default::default() },
+            merchant: None,
         };
         if ty.water_breather() {
             m.air = 300;

@@ -10,6 +10,7 @@ pub mod blockhelp;
 pub use blockhelp::chunk_min_max_y;
 pub mod level;
 pub mod blockentity;
+pub mod merchant;
 pub mod combat;
 pub mod consume;
 pub mod hazards;
@@ -489,6 +490,8 @@ pub enum Request {
     Died(Box<combat::damage::DamageSource>),
     /// open an entity's inventory (chest minecart / boat): eid, screen, title
     OpenEntity(i32, blockentity::Screen, &'static str),
+    /// trade with a villager / wandering trader
+    OpenMerchant(i32),
 }
 
 impl Player {
@@ -1447,6 +1450,7 @@ impl Game {
         }
         self.tick_rides();
         self.tick_leashes();
+        self.tick_merchants();
         for (c, owner) in booms {
             // PrimedTnt.explode: power 4 at y + height / 16
             self.explode_full([c[0], c[1] + 0.98 / 16.0, c[2]], 4.0, false, owner, Some(false));

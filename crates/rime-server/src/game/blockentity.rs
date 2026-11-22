@@ -72,6 +72,8 @@ pub enum Screen {
     Loom,
     Cartography,
     Beacon,
+    /// villager / wandering trader trading (keyed `[MERCHANT_KEY, eid, 0]`)
+    Merchant,
 }
 
 impl Screen {
@@ -86,12 +88,13 @@ impl Screen {
             Screen::Anvil | Screen::Grindstone | Screen::Cartography => 3,
             Screen::Smithing | Screen::Loom => 4,
             Screen::Beacon => 1,
+            Screen::Merchant => 3,
         }
     }
 
     /// Menus whose slots are not stored in a block entity.
     pub fn transient(self) -> bool {
-        matches!(self, Screen::Enchanting | Screen::Anvil | Screen::Smithing | Screen::Grindstone | Screen::Stonecutter | Screen::Loom | Screen::Cartography | Screen::Beacon)
+        matches!(self, Screen::Enchanting | Screen::Anvil | Screen::Smithing | Screen::Grindstone | Screen::Stonecutter | Screen::Loom | Screen::Cartography | Screen::Beacon | Screen::Merchant)
     }
 
     /// `minecraft:menu` registry key
@@ -117,6 +120,7 @@ impl Screen {
             Screen::Loom => "minecraft:loom",
             Screen::Cartography => "minecraft:cartography_table",
             Screen::Beacon => "minecraft:beacon",
+            Screen::Merchant => "minecraft:merchant",
         }
     }
 }
