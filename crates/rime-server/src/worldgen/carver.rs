@@ -77,10 +77,10 @@ pub fn anchor(v: &Value) -> Result<i32> {
         return Ok(a as i32);
     }
     if let Some(a) = v["above_bottom"].as_i64() {
-        return Ok(MIN_Y + a as i32);
+        return Ok(super::gen_min_y() + a as i32);
     }
     if let Some(a) = v["below_top"].as_i64() {
-        return Ok(MIN_Y + HEIGHT - 1 - a as i32);
+        return Ok(super::gen_min_y() + super::gen_height() - 1 - a as i32);
     }
     Err(anyhow!("bad vertical anchor {v}"))
 }
@@ -143,7 +143,7 @@ pub fn block_tag(load: &Loader, tag: &str) -> Result<Vec<bool>> {
 
 #[derive(Clone, Debug)]
 pub enum Kind {
-    Cave { horizontal: FloatP, vertical: FloatP, floor: FloatP },
+    Cave { horizontal: FloatP, vertical: FloatP, floor: FloatP, nether: bool },
     Canyon { vertical_rotation: FloatP, distance_factor: FloatP, thickness: FloatP, width_smoothness: i32, horizontal_radius_factor: FloatP, vertical_center: f32, vertical_default: f32 },
 }
 
@@ -156,6 +156,9 @@ pub struct Carver {
     pub y_scale: FloatP,
     pub lava_level: i32,
     pub replaceable: Vec<bool>,
+    /// `CarvingContext.getMinGenY` / `getGenDepth` of the owning generator.
+    pub gen_min: i32,
+    pub gen_depth: i32,
 }
 
 impl Carver {
@@ -163,7 +166,12 @@ impl Carver {
         let v = load(&format!("worldgen/configured_carver/{}", name.trim_start_matches("minecraft:")))?;
         let c = &v["config"];
         let kind = match v["type"].as_str().unwrap_or("") {
-            "minecraft:cave" => Kind::Cave { horizontal: FloatP::parse(&c["horizontal_radius_multiplier"])?, vertical: FloatP::parse(&c["vertical_radius_multiplier"])?, floor: FloatP::parse(&c["floor_level"])? },
+            t @ ("minecraft:cave" | "minecraft:nether_cave") => Kind::Cave {
+                horizontal: FloatP::parse(&c["horizontal_radius_multiplier"])?,
+                vertical: FloatP::parse(&c["vertical_radius_multiplier"])?,
+                floor: FloatP::parse(&c["floor_level"])?,
+                nether: t == "minecraft:nether_cave",
+            },
             "minecraft:canyon" => {
                 let s = &c["shape"];
                 Kind::Canyon {
@@ -196,6 +204,8 @@ impl Carver {
             y_scale: FloatP::parse(&c["yScale"])?,
             lava_level: anchor(&c["lava_level"])?,
             replaceable,
+            gen_min: super::gen_min_y(),
+            gen_depth: super::gen_height(),
         })
     }
 
@@ -207,9 +217,10 @@ impl Carver {
         }
         const RANGE_BLOCKS: i32 = (4 * 2 - 1) * 16;
         match &self.kind {
-            Kind::Cave { horizontal, vertical, floor } => {
+            Kind::Cave { horizontal, vertical, floor, nether } => {
+                let nether = *nether;
                 let n = {
-                    let a = r.next_int_bound(15) + 1;
+                    let a = r.next_int_bound(if nether { 10 } else { 15 }) + 1;
                     let b = r.next_int_bound(a) + 1;
                     r.next_int_bound(b)
                 };
@@ -232,7 +243,9 @@ impl Carver {
                     for _ in 0..count {
                         let yaw = r.next_float() * 6.2831855;
                         let pitch = (r.next_float() - 0.5) / 4.0;
-                        let thickness = {
+                        let thickness = if nether {
+                            (r.next_float() * 2.0 + r.next_float()) * 2.0
+                        } else {
                             let mut f = r.next_float() * 2.0 + r.next_float();
                             if r.next_int_bound(10) == 0 {
                                 f *= r.next_float() * r.next_float() * 3.0 + 1.0;
@@ -241,7 +254,8 @@ impl Carver {
                         };
                         let dist = RANGE_BLOCKS - r.next_int_bound(RANGE_BLOCKS / 4);
                         let seed = r.next_long();
-                        self.tunnel(ctx, seed, [x, y, z], hm, vm, thickness, yaw, pitch, 0, dist, 1.0, &skip);
+                        let ys = if nether { 5.0 } else { 1.0 };
+                        self.tunnel(ctx, seed, [x, y, z], hm, vm, thickness, yaw, pitch, 0, dist, ys, &skip);
                     }
                 }
             }
@@ -355,8 +369,8 @@ impl Carver {
         }
         let x0 = ((x - hr).floor() as i32 - min_x - 1).max(0);
         let x1 = ((x + hr).floor() as i32 - min_x).min(15);
-        let y0 = ((y - vr).floor() as i32 - 1).max(MIN_Y + 1);
-        let y1 = ((y + vr).floor() as i32 + 1).min(MIN_Y + HEIGHT - 1 - 7);
+        let y0 = ((y - vr).floor() as i32 - 1).max(self.gen_min + 1);
+        let y1 = ((y + vr).floor() as i32 + 1).min(self.gen_min + self.gen_depth - 1 - 7);
         let z0 = ((z - hr).floor() as i32 - min_z - 1).max(0);
         let z1 = ((z + hr).floor() as i32 - min_z).min(15);
         for lx in x0..=x1 {
@@ -397,6 +411,10 @@ impl Carver {
             return;
         }
         let (wx, wz) = (ctx.cx * 16 + lx, ctx.cz * 16 + lz);
+        if let Kind::Cave { nether: true, .. } = self.kind {
+            ctx.blocks[i] = if y <= self.gen_min + 31 { blocks::LAVA } else { blocks::CAVE_AIR };
+            return;
+        }
         let state = if y <= self.lava_level {
             blocks::LAVA
         } else {

@@ -74,6 +74,8 @@ struct Entry {
 }
 
 pub struct World {
+    /// which dimension's region files this world reads and writes
+    pub dim: Dim,
     shards: Vec<Mutex<HashMap<(i32, i32), Entry>>>,
     /// fluid ticks of freshly generated chunks, scheduled by the next game tick
     pending_fluid: Mutex<Vec<[i32; 3]>>,
@@ -91,7 +93,11 @@ fn now_ms() -> i64 {
 
 impl World {
     pub fn new() -> Self {
-        Self { shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(), pending_fluid: Mutex::new(Vec::new()), light_dirty: Mutex::new(HashSet::new()) }
+        Self::with_dim(Dim::Overworld)
+    }
+
+    pub fn with_dim(dim: Dim) -> Self {
+        Self { dim, shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(), pending_fluid: Mutex::new(Vec::new()), light_dirty: Mutex::new(HashSet::new()) }
     }
 
     pub fn is_loaded(&self, x: i32, z: i32) -> bool {
@@ -113,7 +119,7 @@ impl World {
         let loaded: Vec<((i32, i32), Option<Chunk>)> = missing
             .par_iter()
             .map(|&(x, z)| {
-                let c = match store.load_chunk(Dim::Overworld, Kind::Region, x, z) {
+                let c = match store.load_chunk(self.dim, Kind::Region, x, z) {
                     // chunks from another generator are generated again unless players changed them
                     Ok(Some(b)) => Chunk::from_nbt(&b).filter(|c| c.x == x && c.z == z && (c.edited || c.gen_id == generator.gen_id())),
                     Ok(None) => None,
@@ -397,7 +403,7 @@ impl World {
         for sh in &self.shards {
             let mut s = sh.lock();
             for e in s.values_mut().filter(|e| e.dirty) {
-                match store.save_chunk(Dim::Overworld, Kind::Region, e.chunk.x, e.chunk.z, &e.chunk.to_nbt(now_ms())) {
+                match store.save_chunk(self.dim, Kind::Region, e.chunk.x, e.chunk.z, &e.chunk.to_nbt(now_ms())) {
                     Ok(()) => {
                         e.dirty = false;
                         saved += 1;
@@ -530,8 +536,10 @@ pub fn is_gravity_block(name: &str) -> bool {
 }
 
 pub struct Game {
+    /// the dimension this game state simulates
+    pub dim: Dim,
     pub world: World,
-    pub data: GameData,
+    pub data: Arc<GameData>,
     players: RwLock<HashMap<i32, Arc<Player>>>,
     entities: Mutex<HashMap<i32, Entity>>,
     ticks: Mutex<Ticks>,
@@ -564,8 +572,13 @@ impl FluidWorld for GW<'_> {
 
 impl Game {
     pub fn new(compression_threshold: i32, data: GameData) -> Self {
+        Self::new_dim(compression_threshold, Arc::new(data), Dim::Overworld)
+    }
+
+    pub fn new_dim(compression_threshold: i32, data: Arc<GameData>, dim: Dim) -> Self {
         Self {
-            world: World::new(),
+            dim,
+            world: World::with_dim(dim),
             data,
             players: RwLock::new(HashMap::new()),
             entities: Mutex::new(HashMap::new()),

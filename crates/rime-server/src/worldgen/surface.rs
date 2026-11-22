@@ -119,9 +119,9 @@ fn anchor(v: &Value) -> Result<i32> {
     if let Some(a) = v.get("absolute").and_then(Value::as_i64) {
         Ok(a as i32)
     } else if let Some(a) = v.get("above_bottom").and_then(Value::as_i64) {
-        Ok(MIN_Y + a as i32)
+        Ok(super::gen_min_y() + a as i32)
     } else if let Some(a) = v.get("below_top").and_then(Value::as_i64) {
-        Ok(MIN_Y + HEIGHT - 1 - a as i32)
+        Ok(super::gen_min_y() + super::gen_height() - 1 - a as i32)
     } else {
         bail!("bad vertical anchor {v}")
     }

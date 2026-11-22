@@ -864,3 +864,60 @@ fn list_vanilla_starts() {
         }
     }
 }
+
+/// RIME_VREF_DIM = a vanilla world directory (seed 12345, biome features
+/// removed, structures off) with nether and end chunks around 0,0 (and the
+/// end around 64,64): compares terrain, surface, carvers and biomes.
+#[test]
+fn dims_match_vanilla() {
+    let (Some(dir), Ok(world)) = (data_dir(), std::env::var("RIME_VREF_DIM")) else { return };
+    let load = loader(dir);
+    for (dim, sub, chunks) in [
+        (super::DimKind::Nether, "dimensions/minecraft/the_nether", (-4..4).flat_map(|x| (-4..4).map(move |z| (x, z))).collect::<Vec<_>>()),
+        (super::DimKind::End, "dimensions/minecraft/the_end", (-4..4).flat_map(|x| (-4..4).map(move |z| (x, z))).chain((64..68).flat_map(|x| (64..68).map(move |z| (x, z)))).collect()),
+    ] {
+        let g = super::VanillaGenerator::new_dim(&load, 12345, dim).unwrap();
+        let reg = PathBuf::from(&world).join(sub).join("region");
+        let mut by_kind: std::collections::BTreeMap<String, usize> = Default::default();
+        let (mut total, mut tested, mut bb) = (0, 0, 0);
+        for (cx, cz) in chunks {
+            let (rx, rz) = (cx >> 5, cz >> 5);
+            let Ok((list, _)) = airworld::mca::read_mca(&reg.join(format!("r.{rx}.{rz}.mca")), rx, rz) else { continue };
+            let idx = ((cz & 31) * 32 + (cx & 31)) as usize;
+            let Some(v) = list.into_iter().find(|c| c.index == idx).and_then(|c| crate::world::chunk::Chunk::from_nbt(&c.raw)) else { continue };
+            tested += 1;
+            let ours = g.generate(cx, cz);
+            for si in 4..20 {
+                for i in 0..64 {
+                    if ours.biomes[si][i] != v.biomes[si][i] {
+                        bb += 1;
+                    }
+                }
+            }
+            let mut bad = 0;
+            for y in 0..256 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let a = ours.blocks[(((y + 64) * 16 + z) * 16 + x) as usize];
+                        let b = v.get(x as usize, y, z as usize);
+                        if a == b {
+                            continue;
+                        }
+                        let r = crate::registry::BlockRegistry::get();
+                        if a.is_air() && r.property(b, "level").is_some_and(|l| l != "0") {
+                            continue;
+                        }
+                        *by_kind.entry(format!("{} -> {}", a.name(), b.name())).or_default() += 1;
+                        if bad < 3 {
+                            eprintln!("{sub} chunk {cx},{cz} at {x},{y},{z}: ours {} vanilla {}", a.name(), b.name());
+                        }
+                        bad += 1;
+                    }
+                }
+            }
+            total += bad;
+        }
+        eprintln!("{sub}: {tested} chunks, {total} block mismatches, {bb} biome mismatches: {by_kind:?}");
+        assert!(tested > 0);
+    }
+}

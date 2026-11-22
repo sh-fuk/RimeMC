@@ -385,6 +385,25 @@ impl Builder {
 }
 
 /// The overworld parameter list, in vanilla order.
+/// `MultiNoiseBiomeSourceParameterList.Preset.NETHER`
+pub fn nether() -> Vec<(Point, &'static str)> {
+    let pt = |t: f32, h: f32, off: f32| Point { p: [point(t), point(h), point(0.0), point(0.0), point(0.0), point(0.0)], offset: q(off) };
+    vec![
+        (pt(0.0, 0.0, 0.0), "nether_wastes"),
+        (pt(0.0, -0.5, 0.0), "soul_sand_valley"),
+        (pt(0.4, 0.0, 0.0), "crimson_forest"),
+        (pt(0.0, 0.5, 0.375), "warped_forest"),
+        (pt(-0.5, 0.0, 0.175), "basalt_deltas"),
+    ]
+}
+
+/// `TheEndBiomeSource` biomes in `collectPossibleBiomes` order (picked by
+/// `BiomeTree::end`, not by parameters).
+pub fn end() -> Vec<(Point, &'static str)> {
+    let pt = Point { p: [point(0.0); 6], offset: 0 };
+    vec![(pt, "the_end"), (pt, "end_highlands"), (pt, "end_midlands"), (pt, "small_end_islands"), (pt, "end_barrens")]
+}
+
 pub fn overworld() -> Vec<(Point, &'static str)> {
     let mut b = Builder::new();
     b.off_coast();

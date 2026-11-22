@@ -13,8 +13,6 @@ pub const MIN_Y: i32 = -64;
 pub const HEIGHT: i32 = 384;
 pub const CELL_W: i32 = 4;
 pub const CELL_H: i32 = 8;
-const CELLS_Y: i32 = HEIGHT / CELL_H;
-const CORNERS_Y: usize = CELLS_Y as usize + 1;
 
 /// Router indices (see density::ROUTER).
 pub mod r {
@@ -77,17 +75,20 @@ impl Cache for AtPoint<'_, '_> {
 
 impl<'a> NoiseChunk<'a> {
     pub fn new(g: &'a Graph, cx: i32, cz: i32) -> Self {
-        Self::with_cells(g, cx * 16, cz * 16, 4)
+        Self::with_cells(g, cx * 16, cz * 16, (16 / g.shape.cell_w) as usize)
     }
 
     /// `NoiseChunk.forColumn` (as used by `iterateNoiseColumn`): one cell
     /// starting at the cell that holds block (x, z).
     pub fn column(g: &'a Graph, x: i32, z: i32) -> Self {
-        Self::with_cells(g, x.div_euclid(CELL_W) * CELL_W, z.div_euclid(CELL_W) * CELL_W, 1)
+        let w = g.shape.cell_w;
+        Self::with_cells(g, x.div_euclid(w) * w, z.div_euclid(w) * w, 1)
     }
 
     fn with_cells(g: &'a Graph, min_x: i32, min_z: i32, cells: usize) -> Self {
         let n = cells + 1;
+        let sh = g.shape;
+        let corners_y = sh.cells_y() as usize + 1;
         let mut nc = NoiseChunk {
             g,
             min_x,
@@ -102,12 +103,12 @@ impl<'a> NoiseChunk<'a> {
         let mut corners = Vec::with_capacity(g.interpolated.len());
         for &id in &g.interpolated {
             let Node::Marker(_, arg) = g.nodes[id as usize] else { unreachable!() };
-            let mut v = vec![0.0; n * n * CORNERS_Y];
+            let mut v = vec![0.0; n * n * corners_y];
             for cx in 0..n {
                 for cz in 0..n {
-                    for cy in 0..CORNERS_Y {
-                        let (x, y, z) = (min_x + cx as i32 * CELL_W, MIN_Y + cy as i32 * CELL_H, min_z + cz as i32 * CELL_W);
-                        v[(cx * n + cz) * CORNERS_Y + cy] = g.eval(arg, x, y, z, &AtPoint(&nc));
+                    for cy in 0..corners_y {
+                        let (x, y, z) = (min_x + cx as i32 * sh.cell_w, sh.min_y + cy as i32 * sh.cell_h, min_z + cz as i32 * sh.cell_w);
+                        v[(cx * n + cz) * corners_y + cy] = g.eval(arg, x, y, z, &AtPoint(&nc));
                     }
                 }
             }
@@ -137,18 +138,21 @@ impl<'a> NoiseChunk<'a> {
 
     /// Vanilla interpolation order: y, then x, then z.
     fn interpolate(&self, slot: u32, x: i32, y: i32, z: i32) -> Option<f64> {
-        let (lx, ly, lz) = (x - self.min_x, y - MIN_Y, z - self.min_z);
-        let w = self.cells as i32 * CELL_W;
-        if !(0..w).contains(&lx) || !(0..w).contains(&lz) || !(0..HEIGHT).contains(&ly) {
+        let sh = self.g.shape;
+        let (lx, ly, lz) = (x - self.min_x, y - sh.min_y, z - self.min_z);
+        let w = self.cells as i32 * sh.cell_w;
+        if !(0..w).contains(&lx) || !(0..w).contains(&lz) || !(0..sh.height).contains(&ly) {
             return None;
         }
-        let (cx, cy, cz) = ((lx / CELL_W) as usize, (ly / CELL_H) as usize, (lz / CELL_W) as usize);
-        let fx = (lx % CELL_W) as f64 / CELL_W as f64;
-        let fy = (ly % CELL_H) as f64 / CELL_H as f64;
-        let fz = (lz % CELL_W) as f64 / CELL_W as f64;
+        let (cw, ch) = (sh.cell_w, sh.cell_h);
+        let corners_y = sh.cells_y() as usize + 1;
+        let (cx, cy, cz) = ((lx / cw) as usize, (ly / ch) as usize, (lz / cw) as usize);
+        let fx = (lx % cw) as f64 / cw as f64;
+        let fy = (ly % ch) as f64 / ch as f64;
+        let fz = (lz % cw) as f64 / cw as f64;
         let v = &self.corners[slot as usize];
         let n = self.cells + 1;
-        let at = |dx: usize, dy: usize, dz: usize| v[((cx + dx) * n + cz + dz) * CORNERS_Y + cy + dy];
+        let at = |dx: usize, dy: usize, dz: usize| v[((cx + dx) * n + cz + dz) * corners_y + cy + dy];
         let xz00 = lerp(fy, at(0, 0, 0), at(0, 1, 0));
         let xz10 = lerp(fy, at(1, 0, 0), at(1, 1, 0));
         let xz01 = lerp(fy, at(0, 0, 1), at(0, 1, 1));
@@ -256,6 +260,8 @@ pub struct Aquifer<'n, 'a> {
     skip_sampling_above_y: i32,
     /// `shouldScheduleFluidUpdate` after the last `compute_substance`
     pub schedule: bool,
+    /// `Aquifer.createDisabled` (noise settings without aquifers)
+    pub disabled: bool,
 }
 
 impl<'n, 'a> Aquifer<'n, 'a> {
@@ -288,6 +294,7 @@ impl<'n, 'a> Aquifer<'n, 'a> {
             size_z,
             skip_sampling_above_y: from_grid_y(gy, 11) - 1,
             schedule: false,
+            disabled: false,
         }
     }
 
@@ -302,6 +309,9 @@ impl<'n, 'a> Aquifer<'n, 'a> {
             return None;
         }
         let global = self.picker.compute(x, y, z);
+        if self.disabled {
+            return Some(global.at(y));
+        }
         if y > self.skip_sampling_above_y {
             return Some(global.at(y));
         }
@@ -575,10 +585,11 @@ pub fn fill(router: &Router, settings: &Settings, aquifer_random: XoroshiroFacto
 /// `beard`: the chunk's `Beardifier`, added to the final density.
 pub fn fill_with(nc: &NoiseChunk, router: &Router, settings: &Settings, aquifer_random: XoroshiroFactory, ore_random: XoroshiroFactory, marks: &mut Vec<[i32; 3]>, beard: Option<&dyn Fn(i32, i32, i32) -> f64>) -> Vec<BlockState> {
     let picker = FluidPicker::overworld(settings.sea_level, settings.default_fluid);
-    let mut aq = Aquifer::new(nc, router, aquifer_random, &picker, MIN_Y, HEIGHT);
+    let sh = router.graph.shape;
+    let mut aq = Aquifer::new(nc, router, aquifer_random, &picker, sh.min_y, sh.height);
     let fd = router.ids[r::FINAL_DENSITY];
     let mut out = vec![blocks::AIR; (16 * 16 * HEIGHT) as usize];
-    for y in MIN_Y..MIN_Y + HEIGHT {
+    for y in sh.min_y.max(MIN_Y)..(sh.min_y + sh.height).min(MIN_Y + HEIGHT) {
         for z in 0..16 {
             for x in 0..16 {
                 let (bx, bz) = (nc.min_x + x, nc.min_z + z);
@@ -630,9 +641,10 @@ pub fn base_height_stop(router: &Router, settings: &Settings, aquifer_random: Xo
 fn base_height(router: &Router, settings: &Settings, aquifer_random: XoroshiroFactory, ore_random: XoroshiroFactory, x: i32, z: i32, stop: &mut dyn FnMut(i32, BlockState) -> bool) -> i32 {
     let nc = NoiseChunk::column(&router.graph, x, z);
     let picker = FluidPicker::overworld(settings.sea_level, settings.default_fluid);
-    let mut aq = Aquifer::new(&nc, router, aquifer_random, &picker, MIN_Y, HEIGHT);
+    let sh = router.graph.shape;
+    let mut aq = Aquifer::new(&nc, router, aquifer_random, &picker, sh.min_y, sh.height);
     let fd = router.ids[r::FINAL_DENSITY];
-    for y in (MIN_Y..MIN_Y + HEIGHT).rev() {
+    for y in (sh.min_y.max(MIN_Y)..(sh.min_y + sh.height).min(MIN_Y + HEIGHT)).rev() {
         let density = nc.in_chunk(fd, x, y, z);
         let state = if settings.aquifers {
             aq.compute_substance(x, y, z, density)
@@ -651,5 +663,5 @@ fn base_height(router: &Router, settings: &Settings, aquifer_random: XoroshiroFa
             return y + 1;
         }
     }
-    MIN_Y
+    sh.min_y.max(MIN_Y)
 }

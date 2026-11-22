@@ -67,8 +67,14 @@ pub struct ServerState {
     pub cfg: Config,
     pub store: WorldStore,
     pub generator: Arc<Generator>,
+    /// generators of the nether and the end
+    pub nether_gen: Arc<Generator>,
+    pub end_gen: Arc<Generator>,
     pub ops: Ops,
-    pub game: game::Game,
+    /// the overworld
+    pub game: Arc<game::Game>,
+    pub nether: Arc<game::Game>,
+    pub end: Arc<game::Game>,
     pub config_data: net::config_data::ConfigData,
     pub seed: i64,
     /// where new players appear (feet position)
@@ -87,9 +93,45 @@ pub struct ServerState {
 }
 
 impl ServerState {
+    /// The game state of a dimension.
+    pub fn level(&self, d: Dim) -> &Arc<game::Game> {
+        match d {
+            Dim::Overworld => &self.game,
+            Dim::Nether => &self.nether,
+            Dim::End => &self.end,
+        }
+    }
+    pub fn generator_of(&self, d: Dim) -> &Arc<Generator> {
+        match d {
+            Dim::Overworld => &self.generator,
+            Dim::Nether => &self.nether_gen,
+            Dim::End => &self.end_gen,
+        }
+    }
+    pub fn levels(&self) -> [&Arc<game::Game>; 3] {
+        [&self.game, &self.nether, &self.end]
+    }
+    /// Everyone online, in any dimension.
+    pub fn all_players(&self) -> Vec<Arc<game::Player>> {
+        self.levels().iter().flat_map(|g| g.players()).collect()
+    }
+    pub fn find_player(&self, name: &str) -> Option<Arc<game::Player>> {
+        self.levels().iter().find_map(|g| g.find(name))
+    }
+    /// The dimension a player is in.
+    pub fn level_of(&self, p: &game::Player) -> &Arc<game::Game> {
+        self.levels().into_iter().find(|g| g.players().iter().any(|q| q.eid == p.eid)).unwrap_or(&self.game)
+    }
+    /// A packet to every player in every dimension.
+    pub fn broadcast_all(&self, pkt: Arc<Vec<u8>>) {
+        for p in self.all_players() {
+            p.send(pkt.clone());
+        }
+    }
+
     /// Writes every online player's file (autosave, sync, shutdown).
     pub fn save_players(&self) {
-        for p in self.game.players() {
+        for p in self.all_players() {
             if let Err(e) = game::playerdata::save(&self.world_dir, &p) {
                 tracing::error!("saving player {}: {e:#}", p.name);
             }
@@ -136,8 +178,10 @@ impl ServerState {
         let st = self.clone();
         match tokio::task::spawn_blocking(move || {
             st.save_players();
-            st.game.stash_mobs(false);
-            st.game.world.save(&st.store, true);
+            for g in st.levels() {
+                g.stash_mobs(false);
+                g.world.save(&st.store, true);
+            }
             st.store.flush()
         })
         .await
@@ -158,7 +202,7 @@ impl ServerState {
             self.mspt(),
             self.store.memory_used() as f64 / 1048576.0,
             self.store.dirty_regions(),
-            self.game.world.loaded(),
+            self.levels().iter().map(|g| g.world.loaded()).sum::<usize>(),
             if self.generator.is_vanilla() { "vanilla" } else if self.generator.gpu_active() { "on" } else { "off" },
             self.cfg.fleet.mode
         )
@@ -262,6 +306,19 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
         tracing::info!("vanilla 26.1 world generation ready (seed {seed}, {} ms); runs on all CPU cores", t.elapsed().as_millis());
     }
     let generator = Arc::new(generator);
+    // the nether and the end always use the vanilla generator
+    let dim_gen = |d: worldgen::DimKind| -> anyhow::Result<Arc<Generator>> {
+        let load = |rel: &str| match rel.strip_prefix("structure/") {
+            Some(_) => crate::nbt::gz_file_json(&vanilla.path(&format!("minecraft/{rel}.nbt"))),
+            None => vanilla.read_json(&format!("minecraft/{rel}.json")),
+        };
+        let t = std::time::Instant::now();
+        let g = Generator::new(seed, false, cfg.gpu.min_batch).with_vanilla(worldgen::VanillaGenerator::new_dim(&load, seed, d)?);
+        tracing::info!("{d:?} generation ready ({} ms)", t.elapsed().as_millis());
+        Ok(Arc::new(g))
+    };
+    let nether_gen = dim_gen(worldgen::DimKind::Nether)?;
+    let end_gen = dim_gen(worldgen::DimKind::End)?;
     // compute the stronghold rings (vanilla's slow first-chunk step) in the
     // background instead of on the first player's chunk request
     // (cached in the world folder: it takes vanilla's biome search ~30 s)
@@ -290,7 +347,10 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
     game::combat::load(&vanilla)?;
     let game_data = data::GameData::load(&vanilla)?;
     tracing::info!("loaded {} crafting recipes and vanilla loot tables", game_data.recipes.len());
-    let game = game::Game::new(cfg.server.compression_threshold, game_data);
+    let game_data = Arc::new(game_data);
+    let game = Arc::new(game::Game::new_dim(cfg.server.compression_threshold, game_data.clone(), Dim::Overworld));
+    let nether = Arc::new(game::Game::new_dim(cfg.server.compression_threshold, game_data.clone(), Dim::Nether));
+    let end = Arc::new(game::Game::new_dim(cfg.server.compression_threshold, game_data, Dim::End));
     let spawn = load_or_find_spawn(&world_dir, &game, &store, &generator)?;
     tracing::info!("world spawn at {:.0} {:.0} {:.0}", spawn[0], spawn[1], spawn[2]);
 
@@ -298,8 +358,12 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
         cfg,
         store,
         generator,
+        nether_gen,
+        end_gen,
         ops,
         game,
+        nether,
+        end,
         config_data,
         seed,
         spawn,
@@ -433,8 +497,11 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
         p.shutdown();
     }
     state.save_players();
-    state.game.stash_mobs(true);
-    let saved = state.game.world.save(&state.store, false);
+    let mut saved = 0;
+    for g in state.levels() {
+        g.stash_mobs(true);
+        saved += g.world.save(&state.store, false);
+    }
     tracing::info!("saved {saved} modified chunk(s)");
     let r = state.store.flush();
     tracing::info!("saved {} region(s) on shutdown ({} failed)", r.regions_written, r.failures);
@@ -460,7 +527,9 @@ fn tick_loop(state: Arc<ServerState>) {
     while !state.stopping.load(Ordering::Relaxed) {
         let stats = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let t = Instant::now();
-            state.game.tick();
+            for g in state.levels() {
+                g.tick();
+            }
             if plugins::active() {
                 plugins::tick();
             }

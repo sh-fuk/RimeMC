@@ -555,6 +555,8 @@ pub enum Modifier {
     NoiseBased { ratio: i32, factor: f64, offset: f64 },
     SurfaceRelative { hm: Hm, min: i32, max: i32 },
     Fixed(Vec<[i32; 3]>),
+    /// `CountOnEveryLayerPlacement`
+    EveryLayer(IntP),
 }
 
 impl Modifier {
@@ -580,6 +582,7 @@ impl Modifier {
             "minecraft:noise_based_count" => Modifier::NoiseBased { ratio: i("noise_to_count_ratio"), factor: v["noise_factor"].as_f64().unwrap_or(1.0), offset: v["noise_offset"].as_f64().unwrap_or(0.0) },
             "minecraft:surface_relative_threshold_filter" => Modifier::SurfaceRelative { hm: Hm::parse(v["heightmap"].as_str().unwrap_or("")), min: v["min_inclusive"].as_i64().map_or(i32::MIN, |x| x as i32), max: v["max_inclusive"].as_i64().map_or(i32::MAX, |x| x as i32) },
             "minecraft:fixed_placement" => Modifier::Fixed(v["positions"].as_array().into_iter().flatten().map(ints).collect()),
+            "minecraft:count_on_every_layer" => Modifier::EveryLayer(IntP::parse(&v["count"])?),
             t => return Err(anyhow!("unsupported placement modifier {t}")),
         })
     }
@@ -598,6 +601,48 @@ impl Modifier {
                 vec![[x, p[1], z]]
             }
             Modifier::Count(c) => vec![p; c.sample(r).max(0) as usize],
+            Modifier::EveryLayer(c) => {
+                let empty = |s: BlockState| s.is_air() || matches!(s.name(), "water" | "lava");
+                let min_y = super::super::gen_min_y();
+                let mut out = Vec::new();
+                let mut layer = 0;
+                loop {
+                    let mut found = false;
+                    let mut j = 0;
+                    while j < c.sample(r) {
+                        let x = r.next_int_bound(16) + p[0];
+                        let z = r.next_int_bound(16) + p[2];
+                        let top = lv.height(Hm::MotionFluid, x, z);
+                        // findOnGroundYPosition
+                        let mut n = 0;
+                        let mut above = lv.get([x, top, z]);
+                        let mut y = top;
+                        let mut hit = None;
+                        while y >= min_y + 1 {
+                            let below = lv.get([x, y - 1, z]);
+                            if !empty(below) && empty(above) && below.name() != "bedrock" {
+                                if n == layer {
+                                    hit = Some(y);
+                                    break;
+                                }
+                                n += 1;
+                            }
+                            above = below;
+                            y -= 1;
+                        }
+                        if let Some(y) = hit {
+                            out.push([x, y, z]);
+                            found = true;
+                        }
+                        j += 1;
+                    }
+                    layer += 1;
+                    if !found {
+                        break;
+                    }
+                }
+                out
+            }
             Modifier::Heightmap(hm) => {
                 let y = lv.height(*hm, p[0], p[2]);
                 if y > MIN_Y {

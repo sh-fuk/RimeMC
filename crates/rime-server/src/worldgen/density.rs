@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 use super::noise::{clamped_map, floor, AnyRng, BlendedNoise, NormalNoise};
-use super::random::XoroshiroFactory;
+use super::random::{Rng, XoroshiroFactory};
 
 pub type Loader<'a> = dyn Fn(&str) -> Result<Value> + 'a;
 
@@ -91,6 +91,61 @@ pub struct Graph {
     pub flat_caches: Vec<Id>,
     /// node -> index in `interpolated` / `flat_caches`
     pub slot: Vec<u32>,
+    /// noise cell layout of the dimension
+    pub shape: Shape,
+    /// `EndIslandDensityFunction` noise
+    pub end_islands: Option<crate::worldgen::noise::SimplexNoise>,
+}
+
+/// `NoiseSettings`: the vertical noise range and the cell size.
+#[derive(Clone, Copy, Debug)]
+pub struct Shape {
+    pub min_y: i32,
+    pub height: i32,
+    pub cell_w: i32,
+    pub cell_h: i32,
+}
+
+impl Default for Shape {
+    fn default() -> Self {
+        Shape { min_y: -64, height: 384, cell_w: 4, cell_h: 8 }
+    }
+}
+
+impl Shape {
+    pub fn parse(v: &Value) -> Shape {
+        let n = &v["noise"];
+        Shape {
+            min_y: n["min_y"].as_i64().unwrap_or(-64) as i32,
+            height: n["height"].as_i64().unwrap_or(384) as i32,
+            cell_w: n["size_horizontal"].as_i64().unwrap_or(1) as i32 * 4,
+            cell_h: n["size_vertical"].as_i64().unwrap_or(2) as i32 * 4,
+        }
+    }
+    pub fn cells_y(&self) -> i32 {
+        self.height / self.cell_h
+    }
+}
+
+/// `EndIslandDensityFunction.getHeightValue`
+fn end_height(noise: &crate::worldgen::noise::SimplexNoise, x: i32, z: i32) -> f32 {
+    let (i, j, k, l) = (x / 2, z / 2, x % 2, z % 2);
+    let mut f = 100.0f32 - ((x * x + z * z) as f32).sqrt() * 8.0;
+    f = f.clamp(-100.0, 80.0);
+    for i1 in -12..=12i32 {
+        for j1 in -12..=12i32 {
+            let k1 = (i + i1) as i64;
+            let l1 = (j + j1) as i64;
+            if k1 * k1 + l1 * l1 > 4096 && noise.value_2d(k1 as f64, l1 as f64) < -0.8999999761581421 {
+                let f1 = ((k1 as f32).abs() * 3439.0 + (l1 as f32).abs() * 147.0) % 13.0 + 9.0;
+                let f2 = (k - i1 * 2) as f32;
+                let f3 = (l - j1 * 2) as f32;
+                let f4 = (100.0 - (f2 * f2 + f3 * f3).sqrt() * f1).clamp(-100.0, 80.0);
+                f = f.max(f4);
+            }
+        }
+    }
+    f
 }
 
 /// `RandomState.getOrCreateNoise(key)`
@@ -109,6 +164,8 @@ pub struct Builder<'a> {
     pub g: Graph,
     refs: HashMap<String, Id>,
     noise_ids: HashMap<String, usize>,
+    /// world seed when the settings use `legacy_random_source`
+    pub legacy: Option<i64>,
 }
 
 fn f(v: &Value, k: &str) -> Result<f64> {
@@ -120,7 +177,8 @@ impl<'a> Builder<'a> {
         Self {
             load,
             factory,
-            g: Graph { nodes: Vec::new(), noises: Vec::new(), noise_names: Vec::new(), blended: Vec::new(), interpolated: Vec::new(), flat_caches: Vec::new(), slot: Vec::new() },
+            g: Graph { nodes: Vec::new(), noises: Vec::new(), noise_names: Vec::new(), blended: Vec::new(), interpolated: Vec::new(), flat_caches: Vec::new(), slot: Vec::new(), shape: Shape::default(), end_islands: None },
+            legacy: None,
             refs: HashMap::new(),
             noise_ids: HashMap::new(),
         }
@@ -148,7 +206,18 @@ impl<'a> Builder<'a> {
         if let Some(&i) = self.noise_ids.get(&name) {
             return Ok(i);
         }
-        let n = make_noise(self.load, &self.factory, &name)?;
+        let n = match (self.legacy, name.as_str()) {
+            // RandomState's NoiseWiringHelper: the nether biome noises keep the old initialization
+            (Some(seed), "minecraft:nether/temperature" | "minecraft:nether/vegetation") => {
+                let key = name.trim_start_matches("minecraft:");
+                let p = (self.load)(&format!("worldgen/noise/{key}"))?;
+                let first = p["firstOctave"].as_i64().context("firstOctave")? as i32;
+                let amps: Vec<f64> = p["amplitudes"].as_array().context("amplitudes")?.iter().filter_map(Value::as_f64).collect();
+                let off = if key.ends_with("temperature") { 0 } else { 1 };
+                NormalNoise::legacy_nether_biome(seed.wrapping_add(off), first, &amps)
+            }
+            _ => make_noise(self.load, &self.factory, &name)?,
+        };
         let i = self.g.noises.len();
         self.g.noises.push(Arc::new(n));
         self.g.noise_names.push(name.clone());
@@ -233,7 +302,11 @@ impl<'a> Builder<'a> {
             "old_blended_noise" => {
                 // RandomState wires a fresh BlendedNoise from `fromHashOf("minecraft:terrain")`
                 // (legacy worlds: LegacyRandomSource(seed)); see Graph::new.
-                let b = BlendedNoise::new(&mut AnyRng::X(&mut self.factory.from_hash_of("minecraft:terrain")), f(v, "xz_scale")?, f(v, "y_scale")?, f(v, "xz_factor")?, f(v, "y_factor")?, f(v, "smear_scale_multiplier")?);
+                let (xz, ys, xf, yf, sm) = (f(v, "xz_scale")?, f(v, "y_scale")?, f(v, "xz_factor")?, f(v, "y_factor")?, f(v, "smear_scale_multiplier")?);
+                let b = match self.legacy {
+                    Some(seed) => BlendedNoise::new(&mut AnyRng::L(&mut crate::worldgen::random::Legacy::new(seed)), xz, ys, xf, yf, sm),
+                    None => BlendedNoise::new(&mut AnyRng::X(&mut self.factory.from_hash_of("minecraft:terrain")), xz, ys, xf, yf, sm),
+                };
                 self.g.blended.push(b);
                 Node::Blended(self.g.blended.len() - 1)
             }
@@ -247,7 +320,14 @@ impl<'a> Builder<'a> {
             "blend_density" => Node::BlendDensity(arg(self, "argument")?),
             "beardifier" => Node::Beardifier,
             "find_top_surface" => Node::FindTopSurface { density: arg(self, "density")?, upper: arg(self, "upper_bound")?, lower: f(v, "lower_bound")? as i32, cell: f(v, "cell_height")? as i32 },
-            "end_islands" => Node::EndIslands,
+            "end_islands" => {
+                if self.g.end_islands.is_none() {
+                    let mut r = crate::worldgen::random::Legacy::new(self.legacy.unwrap_or(0));
+                    r.consume(17292);
+                    self.g.end_islands = Some(crate::worldgen::noise::SimplexNoise::new(&mut r));
+                }
+                Node::EndIslands
+            }
             other => bail!("unsupported density function type {other}"),
         };
         Ok(self.push(node))
@@ -430,7 +510,10 @@ impl Graph {
                 }
                 *lower as f64
             }
-            Node::EndIslands => 0.0,
+            Node::EndIslands => match &self.end_islands {
+                Some(n) => (end_height(n, x / 8, z / 8) as f64 - 8.0) / 128.0,
+                None => 0.0,
+            },
         }
     }
 
@@ -520,7 +603,14 @@ pub struct Router {
 
 impl Router {
     pub fn new(load: &Loader, settings: &Value, factory: XoroshiroFactory) -> Result<Router> {
+        Self::new_dim(load, settings, factory, None)
+    }
+
+    /// `legacy`: the world seed when the settings use `legacy_random_source`.
+    pub fn new_dim(load: &Loader, settings: &Value, factory: XoroshiroFactory, legacy: Option<i64>) -> Result<Router> {
         let mut b = Builder::new(load, factory);
+        b.legacy = legacy;
+        b.g.shape = Shape::parse(settings);
         let r = &settings["noise_router"];
         let mut ids = [0; 15];
         for (i, k) in ROUTER.iter().enumerate() {

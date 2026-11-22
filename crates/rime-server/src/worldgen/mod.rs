@@ -30,7 +30,30 @@ use density::{Loader, Router};
 use random::{Xoroshiro, XoroshiroFactory};
 use surface::{BiomeCache, BiomeSource, ChunkBiomes, SurfaceSystem};
 
+thread_local! {
+    /// `WorldGenerationContext` (min y, height) while a generator's data is
+    /// loaded: vertical anchors resolve against it.
+    static GEN_CTX: std::cell::Cell<(i32, i32)> = const { std::cell::Cell::new((MIN_Y, HEIGHT)) };
+}
+
+pub fn gen_min_y() -> i32 {
+    GEN_CTX.with(|c| c.get().0)
+}
+
+pub fn gen_height() -> i32 {
+    GEN_CTX.with(|c| c.get().1)
+}
+
+/// Which dimension a generator makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DimKind {
+    Overworld,
+    Nether,
+    End,
+}
+
 pub struct VanillaGenerator {
+    pub dim: DimKind,
     pub seed: i64,
     pub router: Router,
     pub settings: Settings,
@@ -117,9 +140,35 @@ pub struct Generated {
 
 impl VanillaGenerator {
     pub fn new(load: &Loader, seed: i64) -> Result<Self> {
-        let ns: Value = load("worldgen/noise_settings/overworld")?;
-        let factory = Xoroshiro::new(seed).fork_positional();
-        let router = Router::new(load, &ns, factory)?;
+        Self::new_dim(load, seed, DimKind::Overworld)
+    }
+
+    pub fn new_dim(load: &Loader, seed: i64, dim: DimKind) -> Result<Self> {
+        let key = match dim {
+            DimKind::Overworld => "overworld",
+            DimKind::Nether => "nether",
+            DimKind::End => "end",
+        };
+        let ns: Value = load(&format!("worldgen/noise_settings/{key}"))?;
+        let legacy = ns["legacy_random_source"].as_bool().unwrap_or(false);
+        let factory = if legacy { random::XoroshiroFactory::legacy_root(seed) } else { Xoroshiro::new(seed).fork_positional() };
+        let shape = density::Shape::parse(&ns);
+        // WorldGenerationContext: the dimension's build range clipped to the noise range
+        let (dim_min, dim_h) = match dim {
+            DimKind::Overworld => (MIN_Y, HEIGHT),
+            _ => (0, 256),
+        };
+        let ctx_min = shape.min_y.max(dim_min);
+        let ctx_h = (shape.min_y + shape.height).min(dim_min + dim_h) - ctx_min;
+        GEN_CTX.with(|c| c.set((ctx_min, ctx_h)));
+        let r = Self::build(load, seed, dim, &ns, factory, legacy);
+        GEN_CTX.with(|c| c.set((MIN_Y, HEIGHT)));
+        r
+    }
+
+    fn build(load: &Loader, seed: i64, dim: DimKind, ns: &Value, factory: random::XoroshiroFactory, legacy: bool) -> Result<Self> {
+        let ns = ns.clone();
+        let router = Router::new_dim(load, &ns, factory, legacy.then_some(seed))?;
         let surface = SurfaceSystem::new(load, &ns, factory, seed)?;
         let settings = Settings {
             sea_level: ns["sea_level"].as_i64().unwrap_or(63) as i32,
@@ -128,21 +177,29 @@ impl VanillaGenerator {
             aquifers: ns["aquifers_enabled"].as_bool().unwrap_or(true),
             ore_veins: ns["ore_veins_enabled"].as_bool().unwrap_or(true),
         };
-        // every overworld biome uses the same carver list
-        let plains: Value = load("worldgen/biome/plains")?;
-        let carvers = plains["carvers"]
-            .as_array()
+        let params = match dim {
+            DimKind::Overworld => biome_builder::overworld(),
+            DimKind::Nether => biome_builder::nether(),
+            DimKind::End => biome_builder::end(),
+        };
+        // every biome of a dimension uses the same carver list
+        let first: Value = load(&format!("worldgen/biome/{}", params[0].1))?;
+        let carver_names: Vec<&str> = match &first["carvers"] {
+            Value::String(s) => vec![s.as_str()],
+            Value::Array(a) => a.iter().filter_map(|c| c.as_str()).collect(),
+            _ => Vec::new(),
+        };
+        let carvers = carver_names
             .into_iter()
-            .flatten()
-            .filter_map(|c| c.as_str())
             .map(|c| carver::Carver::load(load, c))
             .collect::<Result<Vec<_>>>()?;
-        let tree = BiomeTree::new(&biome_builder::overworld());
+        let mut tree = BiomeTree::new(&params);
+        tree.end = dim == DimKind::End;
         let names = crate::world::chunk::Biomes::get();
         let tree_ids = tree.values.iter().map(|b| names.id(&format!("minecraft:{b}")).unwrap_or(0)).collect();
         // possibleBiomes(): distinct biomes in parameter list order
         let mut possible: Vec<String> = Vec::new();
-        for (_, b) in biome_builder::overworld() {
+        for (_, b) in &params {
             let n = format!("minecraft:{b}");
             if !possible.contains(&n) {
                 possible.push(n);
@@ -162,6 +219,7 @@ impl VanillaGenerator {
             tracing::info!("feature types not ported yet (skipped): {}", list.join(", "));
         }
         Ok(VanillaGenerator {
+            dim,
             seed,
             router,
             settings,
@@ -246,6 +304,7 @@ impl VanillaGenerator {
         if !self.carvers.is_empty() {
             let picker = FluidPicker::overworld(self.settings.sea_level, self.settings.default_fluid);
             let mut aquifer = Aquifer::new(&nc, &self.router, self.aquifer_random, &picker, MIN_Y, HEIGHT);
+            aquifer.disabled = !self.settings.aquifers;
             let top = |x: i32, y: i32, z: i32, fluid: bool, h: &[i32; 256]| self.surface.top_material(&self.router, &bs, h, x, y, z, fluid);
             let mut ctx = carver::Carving { cx, cz, blocks: &mut blocks, heights: &mut heights, mask: vec![false; (16 * 16 * HEIGHT) as usize], aquifer: &mut aquifer, top: &top, marks: &mut marks };
             carver::apply(&self.carvers, self.seed, &mut ctx);

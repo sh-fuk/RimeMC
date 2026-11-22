@@ -39,6 +39,8 @@ pub struct BiomeTree {
     nodes: Vec<Node>,
     root: usize,
     pub values: Vec<&'static str>,
+    /// `TheEndBiomeSource` (values from `biome_builder::end`)
+    pub end: bool,
 }
 
 thread_local! {
@@ -51,7 +53,7 @@ fn mid(s: &Span) -> i64 {
 
 impl BiomeTree {
     pub fn new(list: &[(Point, &'static str)]) -> Self {
-        let mut t = BiomeTree { nodes: Vec::new(), root: 0, values: Vec::new() };
+        let mut t = BiomeTree { nodes: Vec::new(), root: 0, values: Vec::new(), end: false };
         let leaves: Vec<usize> = list
             .iter()
             .enumerate()
@@ -206,6 +208,24 @@ use super::density::Router;
 
 /// Biome indices (into `tree.values`) of one chunk, vanilla fill order;
 /// `[section][(qy << 4) | (qz << 2) | qx]`.
+/// `TheEndBiomeSource.getNoiseBiome` (index into `biome_builder::end`)
+pub fn end_biome(router: &Router, x: i32, y: i32, z: i32) -> u16 {
+    let (i, j) = (x >> 4, z >> 4);
+    if (i as i64) * (i as i64) + (j as i64) * (j as i64) <= 4096 {
+        return 0;
+    }
+    let d = router.eval(r::EROSION, (i * 2 + 1) * 8, y, (j * 2 + 1) * 8);
+    if d > 0.25 {
+        1
+    } else if d >= -0.0625 {
+        2
+    } else if d < -0.21875 {
+        3
+    } else {
+        4
+    }
+}
+
 pub fn chunk_biomes(router: &Router, nc: &NoiseChunk, tree: &BiomeTree, cx: i32, cz: i32) -> Vec<[u16; 64]> {
     let ids = &router.ids;
     let fns = [ids[r::TEMPERATURE], ids[r::VEGETATION], ids[r::CONTINENTS], ids[r::EROSION], ids[r::DEPTH], ids[r::RIDGES]];
@@ -217,8 +237,12 @@ pub fn chunk_biomes(router: &Router, nc: &NoiseChunk, tree: &BiomeTree, cx: i32,
             for qy in 0..4 {
                 for qz in 0..4 {
                     let (x, y, z) = ((cx * 4 + qx) << 2, (qy0 + qy) << 2, (cz * 4 + qz) << 2);
-                    let t = fns.map(|f| quantize(nc.at_point(f, x, y, z)));
-                    sec[((qy << 4) | (qz << 2) | qx) as usize] = tree.find(t) as u16;
+                    sec[((qy << 4) | (qz << 2) | qx) as usize] = if tree.end {
+                        end_biome(router, x, y, z)
+                    } else {
+                        let t = fns.map(|f| quantize(nc.at_point(f, x, y, z)));
+                        tree.find(t) as u16
+                    };
                 }
             }
         }

@@ -208,6 +208,27 @@ impl PerlinNoise {
         Self::finish(levels, first_octave, amplitudes)
     }
 
+    /// `PerlinNoise.createLegacyForLegacyNetherBiome` (old initialization,
+    /// any amplitudes).
+    pub fn legacy_nether_biome(r: &mut Legacy, first_octave: i32, amplitudes: &[f64]) -> Self {
+        let i = amplitudes.len() as i32;
+        let j = -first_octave;
+        let mut levels: Vec<Option<ImprovedNoise>> = vec![None; i as usize];
+        let first = ImprovedNoise::new(r);
+        if j >= 0 && j < i && amplitudes[j as usize] != 0.0 {
+            levels[j as usize] = Some(first);
+        }
+        for k in (0..j).rev() {
+            if k < i && amplitudes[k as usize] != 0.0 {
+                levels[k as usize] = Some(ImprovedNoise::new(r));
+            } else {
+                // skipOctave
+                r.consume(262);
+            }
+        }
+        Self::finish(levels, first_octave, amplitudes.to_vec())
+    }
+
     fn finish(levels: Vec<Option<ImprovedNoise>>, first_octave: i32, amplitudes: Vec<f64>) -> Self {
         let i = amplitudes.len() as i32;
         let j = -first_octave;
@@ -270,6 +291,14 @@ impl NormalNoise {
     pub fn new(r: &mut Xoroshiro, first_octave: i32, amplitudes: &[f64]) -> Self {
         let first = PerlinNoise::new(r, first_octave, amplitudes);
         let second = PerlinNoise::new(r, first_octave, amplitudes);
+        Self::finish(first, second, amplitudes)
+    }
+
+    /// `NormalNoise.createLegacyNetherBiome(new LegacyRandomSource(seed), ...)`
+    pub fn legacy_nether_biome(seed: i64, first_octave: i32, amplitudes: &[f64]) -> Self {
+        let mut r = Legacy::new(seed);
+        let first = PerlinNoise::legacy_nether_biome(&mut r, first_octave, amplitudes);
+        let second = PerlinNoise::legacy_nether_biome(&mut r, first_octave, amplitudes);
         Self::finish(first, second, amplitudes)
     }
 

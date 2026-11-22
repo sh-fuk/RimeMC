@@ -50,10 +50,14 @@ pub trait Rng {
     }
 }
 
+/// `XoroshiroRandomSource`; with `leg` set it behaves as the
+/// `LegacyRandomSource` of a dimension whose noise settings use
+/// `legacy_random_source` (nether, end).
 #[derive(Clone, Debug)]
 pub struct Xoroshiro {
     lo: i64,
     hi: i64,
+    leg: Option<Legacy>,
 }
 
 impl Xoroshiro {
@@ -62,25 +66,43 @@ impl Xoroshiro {
         Self::from_parts(lo, hi)
     }
     pub fn from_parts(lo: i64, hi: i64) -> Self {
-        if lo == 0 && hi == 0 { Self { lo: GOLDEN_RATIO_64, hi: SILVER_RATIO_64 } } else { Self { lo, hi } }
+        if lo == 0 && hi == 0 { Self { lo: GOLDEN_RATIO_64, hi: SILVER_RATIO_64, leg: None } } else { Self { lo, hi, leg: None } }
+    }
+    pub fn from_legacy(l: Legacy) -> Self {
+        Self { lo: 0, hi: 0, leg: Some(l) }
     }
     fn bits(&mut self, n: u32) -> u64 {
         (self.next_long() as u64) >> (64 - n)
     }
     pub fn fork(&mut self) -> Xoroshiro {
+        if let Some(l) = &mut self.leg {
+            return Xoroshiro::from_legacy(Legacy::new(l.next_long()));
+        }
         let a = self.next_long();
         let b = self.next_long();
         Xoroshiro::from_parts(a, b)
     }
     pub fn fork_positional(&mut self) -> XoroshiroFactory {
+        if let Some(l) = &mut self.leg {
+            return XoroshiroFactory { lo: l.next_long(), hi: 0, leg: true };
+        }
         let a = self.next_long();
         let b = self.next_long();
-        XoroshiroFactory { lo: a, hi: b }
+        XoroshiroFactory { lo: a, hi: b, leg: false }
     }
 }
 
 impl Rng for Xoroshiro {
+    fn next_gaussian(&mut self) -> f64 {
+        match &mut self.leg {
+            Some(l) => l.next_gaussian(),
+            None => unimplemented!("gaussian on this random source"),
+        }
+    }
     fn next_long(&mut self) -> i64 {
+        if let Some(l) = &mut self.leg {
+            return l.next_long();
+        }
         let (l, mut m) = (self.lo, self.hi);
         let n = l.wrapping_add(m).rotate_left(17).wrapping_add(l);
         m ^= l;
@@ -89,9 +111,15 @@ impl Rng for Xoroshiro {
         n
     }
     fn next_int(&mut self) -> i32 {
+        if let Some(l) = &mut self.leg {
+            return l.next_int();
+        }
         self.next_long() as i32
     }
     fn next_int_bound(&mut self, bound: i32) -> i32 {
+        if let Some(l) = &mut self.leg {
+            return l.next_int_bound(bound);
+        }
         assert!(bound > 0);
         let b = bound as u64;
         let mut l = self.next_int() as u32 as u64;
@@ -108,36 +136,63 @@ impl Rng for Xoroshiro {
         (m >> 32) as i32
     }
     fn next_double(&mut self) -> f64 {
+        if let Some(l) = &mut self.leg {
+            return l.next_double();
+        }
         self.bits(53) as f64 * 1.1102230246251565E-16
     }
     fn next_float(&mut self) -> f32 {
+        if let Some(l) = &mut self.leg {
+            return l.next_float();
+        }
         self.bits(24) as f32 * 5.9604645E-8
     }
     fn next_bool(&mut self) -> bool {
+        if let Some(l) = &mut self.leg {
+            return l.next_bool();
+        }
         self.next_long() & 1 != 0
     }
     fn consume(&mut self, n: usize) {
+        if let Some(l) = &mut self.leg {
+            return l.consume(n);
+        }
         for _ in 0..n {
             self.next_long();
         }
     }
 }
 
+/// `PositionalRandomFactory` (xoroshiro, or legacy when `leg`).
 #[derive(Clone, Copy, Debug)]
 pub struct XoroshiroFactory {
     pub lo: i64,
     pub hi: i64,
+    pub leg: bool,
 }
 
 impl XoroshiroFactory {
+    /// `LegacyRandomSource(seed).forkPositional()`
+    pub fn legacy_root(seed: i64) -> Self {
+        XoroshiroFactory { lo: Legacy::new(seed).next_long(), hi: 0, leg: true }
+    }
     pub fn at(&self, x: i32, y: i32, z: i32) -> Xoroshiro {
+        if self.leg {
+            return Xoroshiro::from_legacy(Legacy::new(block_seed(x, y, z) ^ self.lo));
+        }
         Xoroshiro::from_parts(block_seed(x, y, z) ^ self.lo, self.hi)
     }
     pub fn from_hash_of(&self, s: &str) -> Xoroshiro {
+        if self.leg {
+            return Xoroshiro::from_legacy(Legacy::new(java_string_hash(s) as i64 ^ self.lo));
+        }
         let (a, b) = seed_from_hash_of(s);
         Xoroshiro::from_parts(a ^ self.lo, b ^ self.hi)
     }
     pub fn from_seed(&self, seed: i64) -> Xoroshiro {
+        if self.leg {
+            return Xoroshiro::from_legacy(Legacy::new(seed ^ self.lo));
+        }
         Xoroshiro::from_parts(seed ^ self.lo, seed ^ self.hi)
     }
 }
