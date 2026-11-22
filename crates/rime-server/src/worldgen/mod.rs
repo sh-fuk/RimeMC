@@ -205,7 +205,12 @@ impl VanillaGenerator {
                 possible.push(n);
             }
         }
-        let (lib, missing) = feature::Lib::new(load, &possible, surface::BiomeTemps::new(), surface.climates.clone(), settings.sea_level)?;
+        let (mut lib, missing) = feature::Lib::new(load, &possible, surface::BiomeTemps::new(), surface.climates.clone(), settings.sea_level)?;
+        if dim != DimKind::Overworld {
+            lib.dim_min = 0;
+            lib.dim_height = 256;
+            lib.gen_depth = 128;
+        }
         let possible_ids: Vec<u8> = possible.iter().filter_map(|b| names.id(b)).collect();
         let mut sb = feature::Builder::new(load);
         let (structures, unported) = structure::Structures::new(&mut sb, seed, &STRUCTURES.map(String::from), &STRUCTURE_SETS.map(String::from), &possible_ids)?;

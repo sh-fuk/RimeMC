@@ -324,7 +324,7 @@ impl Pred {
             Pred::WouldSurvive(o, s) => super::survive::can_survive(lv, *s, at(o)),
             Pred::InsideWorld(o) => {
                 let y = p[1] + o[1];
-                (MIN_Y..MIN_Y + HEIGHT).contains(&y)
+                !lv.outside_build(y)
             }
             Pred::Sturdy(o, d) => super::survive::face_sturdy(lv.get(at(o)), *d),
             Pred::AllOf(l) => l.iter().all(|x| x.test(lv, p)),
@@ -603,7 +603,7 @@ impl Modifier {
             Modifier::Count(c) => vec![p; c.sample(r).max(0) as usize],
             Modifier::EveryLayer(c) => {
                 let empty = |s: BlockState| s.is_air() || matches!(s.name(), "water" | "lava");
-                let min_y = super::super::gen_min_y();
+                let min_y = lv.lib.dim_min;
                 let mut out = Vec::new();
                 let mut layer = 0;
                 loop {
@@ -645,7 +645,7 @@ impl Modifier {
             }
             Modifier::Heightmap(hm) => {
                 let y = lv.height(*hm, p[0], p[2]);
-                if y > MIN_Y {
+                if y > lv.lib.dim_min {
                     vec![[p[0], y, p[2]]]
                 } else {
                     vec![]
@@ -676,7 +676,7 @@ impl Modifier {
                         return vec![q];
                     }
                     q = [q[0] + d[0], q[1] + d[1], q[2] + d[2]];
-                    if !(MIN_Y..MIN_Y + HEIGHT).contains(&q[1]) {
+                    if lv.outside_build(q[1]) {
                         return vec![];
                     }
                     if !allowed.test(lv, q) {

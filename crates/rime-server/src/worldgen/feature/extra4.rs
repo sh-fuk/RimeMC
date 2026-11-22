@@ -28,6 +28,7 @@ pub struct SculkPatch {
 pub enum Extra4 {
     Sculk(Box<SculkPatch>),
     Fossil(Box<super::fossil::Fossil>),
+    Other(Box<super::extra5::Extra5>),
 }
 
 impl Extra4 {
@@ -44,7 +45,10 @@ impl Extra4 {
                     catalyst_chance: c["catalyst_chance"].as_f64().unwrap_or(0.0) as f32,
                 })),
                 "fossil" => Extra4::Fossil(Box::new(super::fossil::Fossil::parse(b, c)?)),
-                _ => return Ok(None),
+                _ => match super::extra5::Extra5::parse(b, ty, c) {
+                    Some(r) => Extra4::Other(Box::new(r?)),
+                    None => return Ok(None),
+                },
             }))
         })();
         match r {
@@ -58,6 +62,7 @@ impl Extra4 {
         match self {
             Extra4::Sculk(c) => sculk_patch(lv, r, o, c),
             Extra4::Fossil(f) => f.place(lv, r, o),
+            Extra4::Other(e) => e.place(lv, r, o),
         }
     }
 }

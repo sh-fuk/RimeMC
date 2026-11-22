@@ -6,6 +6,7 @@ pub mod extra;
 pub mod extra2;
 pub mod extra3;
 pub mod extra4;
+pub mod extra5;
 pub mod fossil;
 pub mod feat;
 pub mod place;
@@ -245,6 +246,11 @@ impl Region<'_> {
 
     pub fn is_empty(&self, p: [i32; 3]) -> bool {
         vstate::air(self.get(p))
+    }
+
+    /// `LevelHeightAccessor.isOutsideBuildHeight`
+    pub fn outside_build(&self, y: i32) -> bool {
+        y < self.lib.dim_min || y >= self.lib.dim_min + self.lib.dim_height
     }
 
     fn noise_biome(&self, qx: i32, qy: i32, qz: i32) -> u8 {
@@ -552,6 +558,11 @@ impl Placed {
 
 /// All features, their global order and per-biome membership.
 pub struct Lib {
+    /// the dimension's build range (`LevelHeightAccessor.getMinY` / `getHeight`)
+    pub dim_min: i32,
+    pub dim_height: i32,
+    /// `ChunkGenerator.getGenDepth`
+    pub gen_depth: i32,
     /// per step: placed features in `FeatureSorter` order
     pub steps: Vec<Vec<Arc<Placed>>>,
     /// biome id -> per step: indices into `steps[step]`
@@ -749,7 +760,7 @@ impl Lib {
             .collect();
         let extra_tags = extra::Tags::load(&mut b)?;
         let missing = std::mem::take(&mut b.missing);
-        let lib = Lib { steps, biome_steps, biome_features, info_noise: PerlinSimplexNoise::new(&mut Legacy::new(2345), &[0]), temps, climates, sea_level, tags, leaf_kind, extra_tags };
+        let lib = Lib { dim_min: MIN_Y, dim_height: HEIGHT, gen_depth: HEIGHT, steps, biome_steps, biome_features, info_noise: PerlinSimplexNoise::new(&mut Legacy::new(2345), &[0]), temps, climates, sea_level, tags, leaf_kind, extra_tags };
         Ok((lib, missing))
     }
 
