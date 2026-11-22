@@ -3,8 +3,10 @@
 //! (finding and creating exit portals), `EndPortalFrameBlock` and the end
 //! spawn platform.
 
+use super::entity::{EKind, Entity};
 use super::level::flags;
 use super::{Game, Player};
+use crate::anticheat::combat::Aabb;
 use crate::registry::{blocks, BlockRegistry, BlockState};
 use crate::world::storage::Dim;
 
@@ -604,4 +606,76 @@ pub fn portal_touched(g: &Game, p: &Player) -> Option<([i32; 3], &'static str)> 
         }
     }
     None
+}
+
+impl Game {
+    /// `Entity.handlePortal` for mobs and items: non-players go through at
+    /// once and then wait 300 ticks (`getDimensionChangingDelay`).
+    pub(crate) fn tick_entity_portals(&self) {
+        let now = self.now.load(std::sync::atomic::Ordering::Relaxed);
+        let mut going = Vec::new();
+        {
+            let ents = self.entities.lock();
+            let mut cd = self.portal_cd.lock();
+            cd.retain(|eid, until| *until > now && ents.contains_key(eid));
+            for e in ents.values() {
+                let ok = match &e.kind {
+                    EKind::Mob(m) => m.death == 0 && !matches!(m.ty.name(), "ender_dragon" | "wither"),
+                    EKind::Item { .. } | EKind::Falling { .. } => true,
+                    _ => false,
+                };
+                if !ok {
+                    continue;
+                }
+                let (half, h) = e.size();
+                let bb = Aabb::entity(e.pos, half * 2.0, h);
+                let mut hit = None;
+                'scan: for y in bb.min[1].floor() as i32..=(bb.max[1] - 1e-7).floor() as i32 {
+                    for x in bb.min[0].floor() as i32..=(bb.max[0] - 1e-7).floor() as i32 {
+                        for z in bb.min[2].floor() as i32..=(bb.max[2] - 1e-7).floor() as i32 {
+                            match self.world.get_block(x, y, z).map(|b| b.name()) {
+                                Some("nether_portal") if self.dim != Dim::End => {
+                                    hit = Some(([x, y, z], "nether_portal"));
+                                    break 'scan;
+                                }
+                                Some("end_portal") if e.pos[1] < y as f64 + 0.75 && self.dim != Dim::Nether => {
+                                    hit = Some(([x, y, z], "end_portal"));
+                                    break 'scan;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                let Some((at, kind)) = hit else { continue };
+                if cd.contains_key(&e.eid) {
+                    cd.insert(e.eid, now + 300);
+                    continue;
+                }
+                going.push((e.eid, at, kind));
+            }
+        }
+        for (eid, at, kind) in going {
+            let e = self.entities.lock().remove(&eid);
+            if let Some(e) = e {
+                self.broadcast_chunk(e.chunk(), &self.remove_packet(&[eid]));
+                self.transfers.lock().push((e, at, kind));
+            }
+        }
+    }
+
+    /// An entity arriving from another level.
+    pub fn receive_entity(&self, mut e: Entity, pos: [f64; 3], dyaw: f32) {
+        e.pos = pos;
+        e.synced = pos;
+        if let EKind::Mob(m) = &mut e.kind {
+            m.mo.yaw += dyaw;
+            m.mo.body_yaw = m.mo.yaw;
+            m.mo.head_yaw = m.mo.yaw;
+            m.target = None;
+        }
+        let now = self.now.load(std::sync::atomic::Ordering::Relaxed);
+        self.portal_cd.lock().insert(e.eid, now + 300);
+        self.add_entity(e);
+    }
 }

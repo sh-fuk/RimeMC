@@ -562,6 +562,11 @@ pub struct Game {
     pub(crate) level: parking_lot::ReentrantMutex<std::cell::RefCell<level::LevelState>>,
     /// the End's dragon fight
     pub(crate) fight: Mutex<endfight::Fight>,
+    /// entities that walked into a portal: (entity, portal block, kind),
+    /// moved to their new level by the server loop
+    pub transfers: Mutex<Vec<(Entity, [i32; 3], &'static str)>>,
+    /// entity portal cooldowns (eid -> tick it ends)
+    pub(crate) portal_cd: Mutex<HashMap<i32, u64>>,
 }
 
 pub(crate) struct GW<'a>(pub(crate) &'a Game);
@@ -600,6 +605,8 @@ impl Game {
             weather: Mutex::new(weather::Weather::default()),
             level: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(level::LevelState::default())),
             fight: Mutex::new(endfight::Fight::default()),
+            transfers: Mutex::new(Vec::new()),
+            portal_cd: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1183,6 +1190,7 @@ impl Game {
         self.tick_entities();
         self.tick_mobs();
         self.tick_end_fight();
+        self.tick_entity_portals();
         self.tick_entity_inside();
         // light changed by block updates
         let relit = self.world.relight(256);

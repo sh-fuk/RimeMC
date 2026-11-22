@@ -179,6 +179,10 @@ impl Game {
         self.broadcast_chunk(pkt.0, &pkt.1);
     }
 
+    pub fn is_crystal(&self, eid: i32) -> bool {
+        self.entities.lock().get(&eid).is_some_and(|e| matches!(e.kind, EKind::Crystal { .. }))
+    }
+
     pub fn spawn_crystal(&self, pos: [f64; 3], show_bottom: bool) -> i32 {
         let eid = self.next_eid();
         self.add_entity(Entity { eid, uuid: uuid::Uuid::new_v4(), kind: EKind::Crystal { show_bottom, beam: None, invulnerable: false }, pos, vel: [0.0; 3], on_ground: false, age: 0, synced: pos });

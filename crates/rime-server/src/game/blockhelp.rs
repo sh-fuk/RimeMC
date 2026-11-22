@@ -272,7 +272,11 @@ impl Game {
                     "powder_snow_bucket" => fs.is_air() && BlockRegistry::get().state("powder_snow", &[]).is_some_and(|b| self.set_block(front, b, flags::ALL)),
                     _ => {
                         let fluid = if name == "water_bucket" { "water" } else { "lava" };
-                        if flag_wl(fs) && fluid == "water" && !block::flag(fs, "waterlogged") {
+                        if fluid == "water" && self.dim == crate::world::storage::Dim::Nether && self.is_replaceable(fs) {
+                            // evaporates (BucketItem.emptyContents)
+                            self.play_sound("minecraft:block.fire.extinguish", 4, [front[0] as f64 + 0.5, front[1] as f64 + 0.5, front[2] as f64 + 0.5], 0.5, 2.6);
+                            true
+                        } else if flag_wl(fs) && fluid == "water" && !block::flag(fs, "waterlogged") {
                             self.set_block(front, block::with_bool(fs, "waterlogged", true), flags::ALL);
                             self.schedule(front, super::TickKind::Fluid, 5);
                             true

@@ -31,6 +31,8 @@ pub struct Vitals {
     pub frozen: i32,
     /// bed respawn point (`ServerPlayer.respawnConfig`)
     pub respawn: Option<[i32; 3]>,
+    /// the respawn point's dimension (`Dim::index`)
+    pub respawn_dim: u8,
     /// the end credits were shown (`seenCredits`)
     pub seen_credits: bool,
     /// (bed position, `sleepCounter`) while in bed
@@ -62,6 +64,7 @@ impl Default for Vitals {
             data_dirty: true,
             eating: None,
             respawn: None,
+            respawn_dim: 0,
             seen_credits: false,
             sleeping: None,
         }
@@ -347,9 +350,11 @@ impl Vitals {
 
     /// Back to full health at respawn (attributes reset, effects cleared).
     pub fn respawn(&mut self) {
-        let r = self.respawn;
+        let (r, d, c) = (self.respawn, self.respawn_dim, self.seen_credits);
         *self = Vitals::default();
         self.respawn = r;
+        self.respawn_dim = d;
+        self.seen_credits = c;
     }
 }
 

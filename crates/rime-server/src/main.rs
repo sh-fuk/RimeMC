@@ -538,6 +538,57 @@ async fn log_err<F: std::future::Future<Output = anyhow::Result<()>>>(what: &'st
     }
 }
 
+/// Entities that entered a portal this tick arrive in their new level
+/// (the destination area is loaded or generated first, like a portal ticket).
+fn move_through_portals(state: &ServerState) {
+    for g in state.levels() {
+        let list = std::mem::take(&mut *g.transfers.lock());
+        for (e, at, kind) in list {
+            let to = match (kind, g.dim) {
+                ("nether_portal", Dim::Nether) => Dim::Overworld,
+                ("nether_portal", _) => Dim::Nether,
+                ("end_portal", Dim::End) => Dim::Overworld,
+                _ => Dim::End,
+            };
+            let dest = state.level(to);
+            let load = |x: i32, z: i32, r: i32| {
+                let (cx, cz) = (x >> 4, z >> 4);
+                let all: Vec<(i32, i32)> = (-r..=r).flat_map(|dx| (-r..=r).map(move |dz| (cx + dx, cz + dz))).collect();
+                dest.world.ensure_loaded(&all, &state.store, state.generator_of(to));
+            };
+            let arrival = match kind {
+                "nether_portal" => {
+                    let scale = if to == Dim::Nether { 1.0 / 8.0 } else { 8.0 };
+                    let (x, z) = ((e.pos[0] * scale).floor() as i32, (e.pos[2] * scale).floor() as i32);
+                    load(x, z, 2);
+                    let r = if to == Dim::Nether { 16 } else { 128 };
+                    let mut near: Vec<(i32, i32)> = dest.portals.lock().iter().filter(|p| (p[0] - x).abs() <= r && (p[2] - z).abs() <= r).map(|p| (p[0] >> 4, p[2] >> 4)).collect();
+                    near.sort_unstable();
+                    near.dedup();
+                    dest.world.ensure_loaded(&near, &state.store, state.generator_of(to));
+                    game::portal::nether_destination(g, dest, at, e.pos)
+                }
+                _ if to == Dim::End => {
+                    let s = game::portal::END_SPAWN;
+                    load(s[0], s[2], 1);
+                    game::portal::end_platform(dest, [s[0], s[1] - 1, s[2]]);
+                    Some(([s[0] as f64 + 0.5, (s[1] - 1) as f64, s[2] as f64 + 0.5], 0.0))
+                }
+                _ => {
+                    let sp = state.spawn;
+                    load(sp[0] as i32, sp[2] as i32, 1);
+                    Some((sp, 0.0))
+                }
+            };
+            match arrival {
+                Some((pos, dyaw)) => dest.receive_entity(e, pos, dyaw),
+                // nowhere to go: back where it was
+                None => g.receive_entity(e.clone(), e.pos, 0.0),
+            }
+        }
+    }
+}
+
 fn tick_loop(state: Arc<ServerState>) {
     let mut sched = tick::scheduler::Scheduler::new(state.cfg.fleet.cell_shift);
     let period = Duration::from_millis(50);
@@ -549,6 +600,7 @@ fn tick_loop(state: Arc<ServerState>) {
             for g in state.levels() {
                 g.tick();
             }
+            move_through_portals(&state);
             if plugins::active() {
                 plugins::tick();
             }

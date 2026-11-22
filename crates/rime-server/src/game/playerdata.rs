@@ -34,6 +34,7 @@ pub struct Saved {
     /// (XpLevel, XpP, XpTotal)
     pub xp: (i32, f32, i32),
     pub respawn: Option<[i32; 3]>,
+    pub respawn_dim: u8,
     pub seen_credits: bool,
     pub dim: crate::world::storage::Dim,
 }
@@ -144,7 +145,7 @@ pub fn to_nbt(p: &Player) -> Tag {
         f.push((
             "respawn".into(),
             Tag::Compound(vec![
-                ("dimension".into(), Tag::String("minecraft:overworld".into())),
+                ("dimension".into(), Tag::String(crate::world::storage::Dim::from_index(v.respawn_dim).key().into())),
                 ("pos".into(), Tag::IntArray(vec![r[0], r[1], r[2]])),
                 ("yaw".into(), Tag::Float(0.0)),
                 ("pitch".into(), Tag::Float(0.0)),
@@ -233,6 +234,10 @@ pub fn from_nbt(t: &Tag) -> Option<Saved> {
             Some(Tag::IntArray(a)) if a.len() == 3 => Some([a[0], a[1], a[2]]),
             _ => None,
         },
+        respawn_dim: match t.get("respawn").and_then(|r| r.get("dimension")) {
+            Some(Tag::String(k)) => crate::world::storage::Dim::from_key(k).map(|d| d.index()).unwrap_or(0),
+            _ => 0,
+        },
         seen_credits: num("seenCredits").unwrap_or(0.0) != 0.0,
         dim: match t.get("Dimension") {
             Some(Tag::String(k)) => crate::world::storage::Dim::from_key(k).unwrap_or(crate::world::storage::Dim::Overworld),
@@ -309,6 +314,7 @@ impl Saved {
         v.fall_distance = self.fall_distance;
         (v.xp_level, v.xp_progress, v.xp_total) = self.xp;
         v.respawn = self.respawn;
+        v.respawn_dim = self.respawn_dim;
         v.seen_credits = self.seen_credits;
         if self.dead {
             v.living.health = 0.0;

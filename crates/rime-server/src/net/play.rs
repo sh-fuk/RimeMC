@@ -1292,7 +1292,10 @@ impl Session {
         self.portal_cooldown = 10;
         self.load_area(Dim::Overworld, ((self.st.spawn[0] as i32) >> 4 << 4, (self.st.spawn[2] as i32) >> 4 << 4), 1).await;
         let ow = self.st.level(Dim::Overworld).clone();
-        let bed = self.me.vit.lock().respawn;
+        let bed = {
+            let v = self.me.vit.lock();
+            v.respawn.filter(|_| v.respawn_dim == 0)
+        };
         let spawn = bed.and_then(|h| crate::game::block::use_block::stand_up_pos(&ow, h)).unwrap_or(self.st.spawn);
         self.change_dimension(Dim::Overworld, spawn, 0.0, 0.0);
     }
@@ -1334,10 +1337,31 @@ impl Session {
         }
         self.me.vit.lock().respawn();
         self.death_shown = false;
-        if self.game.dim != crate::world::storage::Dim::Overworld {
-            self.switch_level(crate::world::storage::Dim::Overworld);
-        }
         let st = self.st.clone();
+        // ServerPlayer.findRespawnPositionAndUseSpawnBlock: a bed in the
+        // overworld or a charged respawn anchor in the nether
+        let (bed, rdim) = {
+            let v = self.me.vit.lock();
+            (v.respawn, crate::world::storage::Dim::from_index(v.respawn_dim))
+        };
+        let mut dest = (crate::world::storage::Dim::Overworld, st.spawn);
+        let mut lost = false;
+        if let Some(h) = bed {
+            let lv = st.level(rdim).clone();
+            let (cx, cz) = (h[0] >> 4, h[2] >> 4);
+            let near: Vec<(i32, i32)> = (-1..=1).flat_map(|dx| (-1..=1).map(move |dz| (cx + dx, cz + dz))).collect();
+            lv.world.ensure_loaded(&near, &st.store, st.generator_of(rdim));
+            match crate::game::block::use_block::stand_up_pos(&lv, h) {
+                Some(p) => dest = (rdim, p),
+                None => {
+                    self.me.vit.lock().respawn = None;
+                    lost = true;
+                }
+            }
+        }
+        if self.game.dim != dest.0 {
+            self.switch_level(dest.0);
+        }
         let cd = &st.config_data;
         let gm = self.gamemode();
         let mut b = Vec::new();
@@ -1346,19 +1370,11 @@ impl Session {
         b.u8(0);
         self.send("respawn", &b);
         self.send_abilities();
-        // the bed respawn point (ServerPlayer.findRespawnPositionAndUseSpawnBlock)
-        let bed = self.me.vit.lock().respawn;
-        let mut spawn = st.spawn;
-        if let Some(h) = bed {
-            match crate::game::block::use_block::stand_up_pos(&self.game, h) {
-                Some(p) => spawn = p,
-                None => {
-                    self.me.vit.lock().respawn = None;
-                    let mut b = crate::nbt::Tag::from_json(&serde_json::json!({ "translate": "block.minecraft.spawn.not_valid" })).to_network_bytes();
-                    b.bool(false);
-                    self.send("system_chat", &b);
-                }
-            }
+        let spawn = dest.1;
+        if lost {
+            let mut b = crate::nbt::Tag::from_json(&serde_json::json!({ "translate": "block.minecraft.spawn.not_valid" })).to_network_bytes();
+            b.bool(false);
+            self.send("system_chat", &b);
         }
         self.teleport(spawn, 0.0, 0.0);
         let c = ((spawn[0].floor() as i32) >> 4, (spawn[2].floor() as i32) >> 4);
@@ -2268,7 +2284,15 @@ impl Session {
                 }
             }
             // a waterlogged block leaves its water behind
-            let after = if BlockRegistry::get().property(cur, "waterlogged") == Some("true") { blocks::WATER } else { blocks::AIR };
+            let mut after = if BlockRegistry::get().property(cur, "waterlogged") == Some("true") { blocks::WATER } else { blocks::AIR };
+            // IceBlock.playerDestroy: melts into water unless silk touched or in the nether
+            if cur.name() == "ice" && gm == 0 && self.game.dim != crate::world::storage::Dim::Nether {
+                let silk = self.me.inv.lock().held(self.me.held.load(Ordering::Relaxed) as i16).is_some_and(|s| s.enchantment_level("silk_touch") > 0);
+                let below = self.game.world.get_block(pos.0, pos.1 - 1, pos.2).unwrap_or(blocks::AIR);
+                if !silk && (crate::game::ai::path::blocks_motion(below) || BlockRegistry::get().is_fluid(below)) {
+                    after = blocks::WATER;
+                }
+            }
             if gm == 1 {
                 // playerWillDestroy: creative breaking of an upper / head part
                 // removes the other part without drops
@@ -2491,6 +2515,16 @@ impl Session {
                     let target = if game.is_replaceable(target_block) && !fluid::fluid_state(target_block).is_source() { c } else { open };
                     let cur = game.world.get_block(target.0, target.1, target.2).unwrap_or(blocks::STONE);
                     if !game.is_replaceable(cur) || !self.within_reach(target) {
+                        return;
+                    }
+                    if name == "water_bucket" && game.dim == crate::world::storage::Dim::Nether {
+                        // BucketItem.emptyContents: water boils away in ultrawarm dimensions
+                        let mut rng = rand::thread_rng();
+                        game.play_sound("minecraft:block.fire.extinguish", 4, [target.0 as f64 + 0.5, target.1 as f64 + 0.5, target.2 as f64 + 0.5], 0.5, 2.6 + (rng.r#gen::<f32>() - rng.r#gen::<f32>()) * 0.8);
+                        if gm != 1 {
+                            self.me.inv.lock().set(slot, Some(Stack::new(items.id("bucket").unwrap_or(0), 1)));
+                        }
+                        game.flush_inventory(&self.me);
                         return;
                     }
                     game.player_change_block([target.0, target.1, target.2], fluid_block, !cur.is_air() && !BlockRegistry::get().is_fluid(cur), None);

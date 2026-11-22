@@ -346,6 +346,9 @@ impl Game {
                 .map(|(p, pos, gm)| super::projectile::Target { eid: p.eid, bbox: Aabb::entity(*pos, 0.6, 1.8), player: true, eye: [pos[0], pos[1] + 1.62, pos[2]], creative: *gm == 1 })
                 .collect();
             for e in ents.values() {
+                if let EKind::Crystal { .. } = e.kind {
+                    ptargets.push(super::projectile::Target { eid: e.eid, bbox: Aabb::entity(e.pos, 2.0, 2.0), player: false, eye: [e.pos[0], e.pos[1] + 1.0, e.pos[2]], creative: false });
+                }
                 if let EKind::Mob(m) = &e.kind {
                     if m.death == 0 {
                         ptargets.push(super::projectile::Target { eid: e.eid, bbox: Aabb::entity(e.pos, m.width(), m.height()), player: false, eye: [e.pos[0], e.pos[1] + m.eye(), e.pos[2]], creative: false });

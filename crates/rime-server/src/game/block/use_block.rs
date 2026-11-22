@@ -74,6 +74,43 @@ pub fn use_block(g: &Game, p: [i32; 3], s: BlockState, cx: &Ctx) -> Use {
             return Use::Consumed;
         }
     }
+    // RespawnAnchorBlock.useItemOn / useWithoutItem
+    if s.name() == "respawn_anchor" {
+        let charges: i32 = s.prop("charges").and_then(|c| c.parse().ok()).unwrap_or(0);
+        if item == "glowstone" && charges < 4 {
+            let ns = BlockRegistry::get().with(s, "charges", &(charges + 1).to_string()).unwrap_or(s);
+            g.set_block(p, ns, flags::ALL);
+            g.update_neighbour_for_output_signal(p, ns);
+            if !cx.creative {
+                consume_held(g, cx.player, "glowstone");
+            }
+            g.play_sound("minecraft:block.respawn_anchor.charge", 4, [p[0] as f64 + 0.5, p[1] as f64 + 0.5, p[2] as f64 + 0.5], 1.0, 1.0);
+            return Use::Consumed;
+        }
+        if charges > 0 && !(cx.sneaking && cx.held.is_some()) {
+            if g.dim != crate::world::storage::Dim::Nether {
+                // explode, unless water is next to it (then it only breaks)
+                g.set_block(p, blocks::AIR, flags::ALL | flags::SUPPRESS_DROPS);
+                let wet = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]].iter().any(|d| {
+                    let q = g.bs([p[0] + d[0], p[1] + d[1], p[2] + d[2]]);
+                    crate::game::fluid::fluid_state(q).fluid() == Some(crate::game::fluid::Fluid::Water)
+                });
+                let c = [p[0] as f64 + 0.5, p[1] as f64 + 0.5, p[2] as f64 + 0.5];
+                g.explode_full(c, 5.0, true, None, if wet { None } else { Some(true) });
+                return Use::Consumed;
+            }
+            let mut v = cx.player.vit.lock();
+            let nether = crate::world::storage::Dim::Nether.index();
+            if v.respawn != Some(p) || v.respawn_dim != nether {
+                v.respawn = Some(p);
+                v.respawn_dim = nether;
+                drop(v);
+                g.play_sound("minecraft:block.respawn_anchor.set_spawn", 4, [p[0] as f64 + 0.5, p[1] as f64 + 0.5, p[2] as f64 + 0.5], 1.0, 1.0);
+                msg(g, cx.player, "block.minecraft.set_spawn", false);
+            }
+            return Use::Consumed;
+        }
+    }
     let secondary = cx.sneaking && cx.held.is_some();
     // EndCrystalItem.useOn
     if item == "end_crystal" && matches!(s.name(), "obsidian" | "bedrock") {
@@ -269,6 +306,15 @@ fn bed_use(g: &Game, p: [i32; 3], s: BlockState, cx: &Ctx) -> Use {
     if class(hs) != Class::Bed {
         return Use::Consumed;
     }
+    // BedBlock.canSetSpawn: beds only work in the overworld; elsewhere they blow up
+    if g.dim != crate::world::storage::Dim::Overworld {
+        let foot = rel(head, opp(facing(hs)));
+        g.set_block(foot, blocks::AIR, flags::ALL | flags::SUPPRESS_DROPS);
+        g.set_block(head, blocks::AIR, flags::ALL | flags::SUPPRESS_DROPS);
+        let c = [head[0] as f64 + 0.5, head[1] as f64 + 0.5, head[2] as f64 + 0.5];
+        g.explode_full(c, 5.0, true, None, Some(true));
+        return Use::Consumed;
+    }
     if flag(hs, "occupied") {
         msg(g, cx.player, "block.minecraft.bed.occupied", true);
         return Use::Consumed;
@@ -296,8 +342,9 @@ fn start_sleep(g: &Game, pl: &Arc<Player>, head: [i32; 3], hs: BlockState) {
     // setRespawnPosition
     {
         let mut v = pl.vit.lock();
-        if v.respawn != Some(head) {
+        if v.respawn != Some(head) || v.respawn_dim != 0 {
             v.respawn = Some(head);
+            v.respawn_dim = 0;
             drop(v);
             msg(g, pl, "block.minecraft.set_spawn", false);
         }
@@ -320,6 +367,9 @@ fn start_sleep(g: &Game, pl: &Arc<Player>, head: [i32; 3], hs: BlockState) {
 /// `BedBlock.findStandUpPosition` (simplified: the free sides of the bed)
 pub fn stand_up_pos(g: &Game, head: [i32; 3]) -> Option<[f64; 3]> {
     let hs = g.bs(head);
+    if hs.name() == "respawn_anchor" {
+        return anchor_stand_up(g, head, hs);
+    }
     if class(hs) != Class::Bed {
         return None;
     }
@@ -635,4 +685,28 @@ fn damage_held(g: &Game, p: &Arc<Player>, item: &str) {
         l.events.extend(evs);
     });
     g.flush_inventory(p);
+}
+
+/// `RespawnAnchorBlock.findStandUpPosition`: a free spot around the anchor;
+/// uses up one charge.
+fn anchor_stand_up(g: &Game, p: [i32; 3], s: BlockState) -> Option<[f64; 3]> {
+    let charges: i32 = s.prop("charges").and_then(|c| c.parse().ok()).unwrap_or(0);
+    if charges == 0 {
+        return None;
+    }
+    const AROUND: [[i32; 2]; 9] = [[0, -1], [-1, 0], [0, 1], [1, 0], [-1, -1], [1, -1], [-1, 1], [1, 1], [0, 0]];
+    for dy in [0, 1, -1] {
+        for d in AROUND {
+            let q = [p[0] + d[0], p[1] + dy, p[2] + d[1]];
+            let below = g.bs([q[0], q[1] - 1, q[2]]);
+            let free = |r: [i32; 3]| !rstate::suffocating(g.bs(r)) && crate::game::fluid::fluid_state(g.bs(r)).fluid().is_none();
+            if (vstate::sturdy(below, UP) || class(below) == Class::Bed) && free(q) && free([q[0], q[1] + 1, q[2]]) && q != p {
+                let ns = BlockRegistry::get().with(s, "charges", &(charges - 1).to_string()).unwrap_or(s);
+                g.set_block(p, ns, flags::ALL);
+                g.play_sound("minecraft:block.respawn_anchor.deplete", 4, [p[0] as f64 + 0.5, p[1] as f64 + 0.5, p[2] as f64 + 0.5], 1.0, 1.0);
+                return Some([q[0] as f64 + 0.5, q[1] as f64, q[2] as f64 + 0.5]);
+            }
+        }
+    }
+    None
 }

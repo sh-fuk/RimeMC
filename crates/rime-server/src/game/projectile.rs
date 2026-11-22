@@ -765,6 +765,17 @@ impl Game {
             match a {
                 PAct::Sound { name, pos, volume, pitch } => self.play_sound(name, 7, pos, volume, pitch),
                 PAct::Pickup { eid, player } => self.pickup_projectile(eid, player),
+                // EndCrystal.hurtServer: any projectile blows it up
+                PAct::ArrowHit { eid, proj, target, chunk, .. } if self.is_crystal(target) => {
+                    self.destroy_crystal(target, proj.owner, true);
+                    if self.entities.lock().remove(&eid).is_some() {
+                        self.broadcast_chunk(chunk, &self.remove_packet(&[eid]));
+                    }
+                }
+                PAct::Land { eid, proj, pos, vel, target: Some(t), block } if self.is_crystal(t) => {
+                    self.destroy_crystal(t, proj.owner, true);
+                    self.throwable_land(eid, *proj, pos, vel, None, block, &mut rng);
+                }
                 PAct::ArrowHit { eid, proj, target, pos, vel, removed, chunk } => self.arrow_hit(eid, *proj, target, pos, vel, removed, chunk, &mut rng),
                 PAct::Land { eid, proj, pos, vel, target, block } => self.throwable_land(eid, *proj, pos, vel, target, block, &mut rng),
                 PAct::HitBlock { hit, arrow, fire, owner } => self.projectile_hit_block(&hit, arrow, fire, owner),
