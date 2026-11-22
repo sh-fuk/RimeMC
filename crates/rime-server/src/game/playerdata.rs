@@ -34,6 +34,7 @@ pub struct Saved {
     /// (XpLevel, XpP, XpTotal)
     pub xp: (i32, f32, i32),
     pub respawn: Option<[i32; 3]>,
+    pub seen_credits: bool,
     pub dim: crate::world::storage::Dim,
 }
 
@@ -129,6 +130,7 @@ pub fn to_nbt(p: &Player) -> Tag {
         ("active_effects".into(), Tag::List(v.living.effects.iter().map(|e| e.to_nbt()).collect())),
         ("foodLevel".into(), Tag::Int(v.food)),
         ("XpLevel".into(), Tag::Int(v.xp_level)),
+        ("seenCredits".into(), Tag::Byte(v.seen_credits as i8)),
         ("XpP".into(), Tag::Float(v.xp_progress)),
         ("XpTotal".into(), Tag::Int(v.xp_total)),
         ("foodSaturationLevel".into(), Tag::Float(v.saturation)),
@@ -231,6 +233,7 @@ pub fn from_nbt(t: &Tag) -> Option<Saved> {
             Some(Tag::IntArray(a)) if a.len() == 3 => Some([a[0], a[1], a[2]]),
             _ => None,
         },
+        seen_credits: num("seenCredits").unwrap_or(0.0) != 0.0,
         dim: match t.get("Dimension") {
             Some(Tag::String(k)) => crate::world::storage::Dim::from_key(k).unwrap_or(crate::world::storage::Dim::Overworld),
             _ => crate::world::storage::Dim::Overworld,
@@ -306,6 +309,7 @@ impl Saved {
         v.fall_distance = self.fall_distance;
         (v.xp_level, v.xp_progress, v.xp_total) = self.xp;
         v.respawn = self.respawn;
+        v.seen_credits = self.seen_credits;
         if self.dead {
             v.living.health = 0.0;
             v.living.dead = true;

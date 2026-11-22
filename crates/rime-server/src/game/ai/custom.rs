@@ -518,6 +518,90 @@ pub fn dragon_tick(m: &mut Mob, cx: &mut Ctx, node: &mut [f64; 3], phase_ticks: 
     });
     *phase_ticks += 1;
     let target = m.target.and_then(|t| cx.find(t)).cloned();
+    // perching on the exit portal (landing approach, landing, sitting, takeoff)
+    m.v.phase_time += 1;
+    let top = cx.game.motion_blocking_height(centre[0], centre[2]) as f64;
+    let perch = [centre[0] as f64 + 0.5, top, centre[2] as f64 + 0.5];
+    match m.v.phase {
+        2 => {
+            // DragonLandingApproachPhase
+            *node = [perch[0], perch[1] + 10.0, perch[2]];
+            if dist2(cx.pos, *node) < 100.0 {
+                m.v.phase = 3;
+                m.v.phase_time = 0;
+            }
+        }
+        3 => {
+            // DragonLandingPhase
+            *node = perch;
+            if dist2(cx.pos, perch) < 1.0 {
+                m.v.phase = 6;
+                m.v.phase_time = 0;
+                m.v.charge = 0;
+                m.v.sit_damage = 0.0;
+            }
+        }
+        5..=7 => {
+            // sitting: no motion, turn toward the target
+            cx.vel = [0.0; 3];
+            m.v.p0 = Some([0.0, 0.0, 0.0]);
+            let near = target.as_ref().filter(|t| dist2(cx.pos, t.pos) < 20.0 * 20.0);
+            if let Some(t) = near {
+                let want = control::wrap(180.0 - (t.pos[0] - cx.pos[0]).atan2(t.pos[2] - cx.pos[2]).to_degrees() as f32);
+                m.mo.yaw += control::wrap(want - m.mo.yaw).clamp(-10.0, 10.0);
+                m.mo.body_yaw = m.mo.yaw;
+                m.mo.head_yaw = m.mo.yaw;
+            }
+            match m.v.phase {
+                6 => {
+                    // DragonSittingScanningPhase
+                    if near.is_some() && m.v.phase_time >= 25 {
+                        m.v.phase = 7;
+                        m.v.phase_time = 0;
+                        cx.acts.push(Act::Sound { name: "minecraft:entity.ender_dragon.growl".into(), pos: cx.pos, hostile: true, volume: 2.5, pitch: 0.8 + cx.rng.r#gen::<f32>() * 0.3 });
+                    } else if m.v.phase_time > 100 {
+                        m.v.phase = 4;
+                        m.v.phase_time = 0;
+                    }
+                }
+                7 => {
+                    // DragonSittingAttackingPhase
+                    if m.v.phase_time >= 40 {
+                        m.v.phase = 5;
+                        m.v.phase_time = 0;
+                    }
+                }
+                _ => {
+                    // DragonSittingFlamingPhase: a cloud of breath ahead of the head
+                    if m.v.phase_time == 10 {
+                        let view = control::view(0.0, m.mo.yaw);
+                        let at = [cx.pos[0] - view[0] * 6.5, perch[1], cx.pos[2] - view[2] * 6.5];
+                        cx.acts.push(Act::Breath { owner: cx.eid, pos: at });
+                    }
+                    if m.v.phase_time >= 200 {
+                        m.v.charge += 1;
+                        m.v.phase = if m.v.charge >= 4 { 4 } else { 6 };
+                        m.v.phase_time = 0;
+                    }
+                }
+            }
+            return;
+        }
+        4 => {
+            // DragonTakeoffPhase
+            *node = [perch[0] + 20.0, perch[1] + 25.0, perch[2]];
+            if cx.pos[1] > perch[1] + 20.0 {
+                m.v.phase = 0;
+                m.v.phase_time = 0;
+                *node = [0.0; 3];
+            }
+        }
+        _ => {}
+    }
+    let perching = matches!(m.v.phase, 2..=4);
+    if perching {
+        *strafe = 0;
+    }
     // pick a flight target
     let mut speed = 0.6f32;
     if *strafe > 0 {
@@ -539,7 +623,14 @@ pub fn dragon_tick(m: &mut Mob, cx: &mut Ctx, node: &mut [f64; 3], phase_ticks: 
             *strafe = 0;
         }
     }
-    if *strafe <= 0 && (dist2(cx.pos, *node) < 100.0 || dist2(cx.pos, *node) > 22500.0 || m.mo.horizontal_collision || *node == [0.0; 3]) {
+    m.v.phase = if *strafe > 0 { 1 } else if perching { m.v.phase } else { 0 };
+    if !perching && *strafe <= 0 && (dist2(cx.pos, *node) < 100.0 || dist2(cx.pos, *node) > 22500.0 || m.mo.horizontal_collision || *node == [0.0; 3]) {
+        // DragonHoldingPatternPhase: sometimes perch on the portal
+        let crystals = cx.game.end_crystal_count() as i32;
+        if cx.game.exit_portal().is_some() && cx.rng.gen_range(0..crystals + 3) == 0 {
+            m.v.phase = 2;
+            m.v.phase_time = 0;
+        }
         // HoldingPattern: next node on the circle
         let ang = (*phase_ticks as f64 * 0.05) + cx.rng.r#gen::<f64>() * 0.5;
         let r = 60.0;

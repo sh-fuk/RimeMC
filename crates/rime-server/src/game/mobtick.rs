@@ -38,6 +38,8 @@ pub enum Act {
     /// events of a mob's own `Living` (self damage, effects)
     MobEvents { eid: i32, chunk: (i32, i32), pos: [f64; 3], events: Vec<Event> },
     Explode { pos: [f64; 3], power: f32, fire: bool, by: Option<i32> },
+    /// `DragonSittingFlamingPhase`: a lingering cloud of dragon's breath
+    Breath { owner: i32, pos: [f64; 3] },
     Sound { name: String, pos: [f64; 3], hostile: bool, volume: f32, pitch: f32 },
     /// `ProjectileUtil.getMobArrow` + `shoot`
     Arrow { owner: i32, from: [f64; 3], target: [f64; 3], power: f32, tipped: Option<&'static str>, fire: bool, velocity: f32, uncertainty: f32 },
@@ -181,7 +183,7 @@ impl Game {
         m.mo.head_yaw = m.mo.yaw;
         m.mo.body_yaw = m.mo.yaw;
         f(&mut m, &mut rng);
-        let eid = self.next_eid();
+        let eid = if m.ty.is("ender_dragon") { self.next_eids(9) } else { self.next_eid() };
         let e = Entity { eid, uuid: uuid::Uuid::new_v4(), kind: EKind::Mob(Box::new(m)), pos, vel: [0.0; 3], on_ground: false, age: 0, synced: pos };
         self.add_entity(e);
         eid
@@ -495,6 +497,10 @@ impl Game {
         let uuid = e.uuid;
         let chunk = e.chunk();
         let EKind::Mob(m) = &mut e.kind else { return true };
+        if m.death > 0 && m.ty.is("ender_dragon") {
+            m.death += 1;
+            return self.dragon_death_tick(eid, &mut e.pos, m);
+        }
         if m.death > 0 {
             // LivingEntity.tickDeath
             m.death += 1;
@@ -790,6 +796,11 @@ impl Game {
             Act::MobEvents { eid, chunk, pos, events } => self.mob_events(eid, chunk, pos, events),
             Act::Thunder { bolt, cause, area, fire } => self.thunder(bolt, cause, area, fire),
             Act::Explode { pos, power, fire, by } => self.explode_full(pos, power, fire, by, Some(true)),
+            Act::Breath { owner, pos } => {
+                let c = super::projectile::Cloud { owner: Some(owner), potion: Some("harming".into()), scale: 1.0, radius: 5.0, radius_on_use: 0.0, radius_per_tick: 0.0, duration: 200, wait_time: 0, reapplication_delay: 20, victims: Vec::new(), color: 0x9900ff };
+                let eid = self.next_eid();
+                self.add_entity(Entity { eid, uuid: uuid::Uuid::new_v4(), kind: EKind::Cloud(Box::new(c)), pos, vel: [0.0; 3], on_ground: false, age: 0, synced: pos });
+            }
             Act::Sound { name, pos, hostile, volume, pitch } => self.sound(&name, pos, hostile, volume, pitch),
             Act::Arrow { owner, from, target, power, tipped, fire, velocity, uncertainty } => {
                 // ProjectileUtil.getMobArrow: setBaseDamageFromMob(power)
@@ -1322,10 +1333,14 @@ impl Game {
         if let Some(p) = self.players().into_iter().find(|p| p.eid == eid) {
             return Some(Aabb::entity(p.pose.lock().pos, 0.6, 1.8));
         }
-        let ents = self.entities.lock();
-        let e = ents.get(&eid)?;
-        let (half, h) = e.size();
-        Some(Aabb::entity(e.pos, half * 2.0, h))
+        let found = {
+            let ents = self.entities.lock();
+            ents.get(&eid).map(|e| {
+                let (half, h) = e.size();
+                Aabb::entity(e.pos, half * 2.0, h)
+            })
+        };
+        found.or_else(|| self.dragon_part(eid).map(|d| d.2))
     }
 
     /// Fireballs and skulls: mob explosions (mobExplosionDropDecay).
@@ -1404,12 +1419,21 @@ impl Game {
             let pos = p.pose.lock().pos;
             victims.push((p.eid, pos, 1.62, 1.8, true));
         }
+        let mut crystals = Vec::new();
         for e in self.entities.lock().values() {
             if let EKind::Mob(m) = &e.kind {
                 if m.death == 0 && Some(e.eid) != by {
                     victims.push((e.eid, e.pos, m.eye(), m.height(), false));
                 }
             }
+            if let EKind::Crystal { invulnerable: false, .. } = e.kind {
+                if Some(e.eid) != by && Aabb::entity(e.pos, 2.0, 2.0).intersects(&area) && dist2(e.pos, c).sqrt() / r <= 1.0 {
+                    crystals.push(e.eid);
+                }
+            }
+        }
+        for eid in crystals {
+            self.destroy_crystal(eid, by, false);
         }
         for (eid, pos, eye, h, player) in victims {
             if !Aabb::entity(pos, 0.0, h).intersects(&area) {
@@ -1691,6 +1715,10 @@ impl Game {
             for dx in -3..=3 {
                 for dz in -3..=3 {
                     for (name, p) in self.world.take_gen_entities(cx + dx, cz + dz) {
+                        if name == "end_crystal" {
+                            self.spawn_crystal([p[0] as f64 + 0.5, p[1] as f64, p[2] as f64 + 0.5], true);
+                            continue;
+                        }
                         if let Some(ty) = MobType::from_name(&name) {
                             let difficulty = env.difficulty;
                             self.spawn_mob_with(ty, [p[0] as f64 + 0.5, p[1] as f64, p[2] as f64 + 0.5], true, |m, rng| {
@@ -1917,6 +1945,7 @@ fn experience(m: &Mob, rng: &mut impl Rng) -> i32 {
     let base = match n {
         "slime" | "magma_cube" => m.size,
         _ if m.ty.is_animal() || matches!(n, "squid" | "glow_squid" | "dolphin" | "cod" | "salmon" | "pufferfish" | "tropical_fish" | "axolotl" | "frog" | "tadpole") => 1 + rng.gen_range(0..3),
+        "ender_dragon" => 0,
         _ => m.ty.xp(),
     };
     if m.ty.hostile() && base > 0 {

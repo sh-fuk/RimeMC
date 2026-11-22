@@ -29,6 +29,7 @@ pub mod menu;
 pub mod workstation;
 pub mod playerdata;
 pub mod portal;
+pub mod endfight;
 pub mod survival;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -559,6 +560,8 @@ pub struct Game {
     /// block update state; held for the whole game tick and by any thread
     /// changing blocks, so updates never interleave
     pub(crate) level: parking_lot::ReentrantMutex<std::cell::RefCell<level::LevelState>>,
+    /// the End's dragon fight
+    pub(crate) fight: Mutex<endfight::Fight>,
 }
 
 pub(crate) struct GW<'a>(pub(crate) &'a Game);
@@ -596,6 +599,7 @@ impl Game {
             threshold: compression_threshold,
             weather: Mutex::new(weather::Weather::default()),
             level: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(level::LevelState::default())),
+            fight: Mutex::new(endfight::Fight::default()),
         }
     }
 
@@ -616,9 +620,14 @@ impl Game {
     }
 
     pub(crate) fn next_eid(&self) -> i32 {
+        self.next_eids(1)
+    }
+
+    /// `n` consecutive entity ids (the dragon's parts take the 8 after it).
+    pub(crate) fn next_eids(&self, n: i32) -> i32 {
         // entity ids are unique across all dimensions
         static NEXT: AtomicI32 = AtomicI32::new(1);
-        NEXT.fetch_add(1, Ordering::Relaxed)
+        NEXT.fetch_add(n, Ordering::Relaxed)
     }
 
     /// Register a player; returns None when the name/UUID is already online.
@@ -663,7 +672,10 @@ impl Game {
     }
 
     pub fn leave(&self, eid: i32) {
-        self.players.write().remove(&eid);
+        let p = self.players.write().remove(&eid);
+        if let Some(p) = p {
+            self.fight_player_left(&p);
+        }
     }
 
     /// A newer login takes over (RimeFleet hand-offs): the old session is
@@ -962,6 +974,7 @@ impl Game {
             EKind::Item { .. } => (regs.id("minecraft:entity_type", "minecraft:item").unwrap_or(0), 0),
             EKind::Falling { state } => (regs.id("minecraft:entity_type", "minecraft:falling_block").unwrap_or(0), state.0 as i32),
             EKind::Tnt { .. } => (regs.id("minecraft:entity_type", "minecraft:tnt").unwrap_or(0), 0),
+            EKind::Crystal { .. } => (regs.id("minecraft:entity_type", "minecraft:end_crystal").unwrap_or(0), 0),
             _ => unreachable!(),
         };
         let mut b = Vec::new();
@@ -975,7 +988,26 @@ impl Game {
         if let EKind::Item { stack, .. } = e.kind {
             out.push(self.item_meta(e.eid, stack));
         }
+        if let EKind::Crystal { show_bottom, beam, .. } = e.kind {
+            out.push(self.crystal_meta(e.eid, show_bottom, beam));
+        }
         out
+    }
+
+    /// `EndCrystal` data: beam target (8) and show bottom (9).
+    pub(crate) fn crystal_meta(&self, eid: i32, show_bottom: bool, beam: Option<[i32; 3]>) -> Arc<Vec<u8>> {
+        let mut b = Vec::new();
+        b.vi(eid).u8(8).vi(11);
+        match beam {
+            Some(p) => {
+                b.bool(true).i64(((p[0] as i64 & 0x3FF_FFFF) << 38) | ((p[2] as i64 & 0x3FF_FFFF) << 12) | (p[1] as i64 & 0xFFF));
+            }
+            None => {
+                b.bool(false);
+            }
+        }
+        b.u8(9).vi(8).bool(show_bottom).u8(0xFF);
+        self.encode("set_entity_data", &b)
     }
 
     pub(crate) fn item_meta(&self, eid: i32, stack: Stack) -> Arc<Vec<u8>> {
@@ -1150,6 +1182,7 @@ impl Game {
         self.run_block_events();
         self.tick_entities();
         self.tick_mobs();
+        self.tick_end_fight();
         self.tick_entity_inside();
         // light changed by block updates
         let relit = self.world.relight(256);
@@ -1178,6 +1211,17 @@ impl Game {
                 if matches!(e.kind, EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. } | EKind::Fangs { .. }) {
                     continue;
                 }
+                if let EKind::Crystal { .. } = e.kind {
+                    // EndCrystal.tick: no motion; keeps a fire below it in the End
+                    e.age += 1;
+                    if self.dim == crate::world::storage::Dim::End {
+                        let p = [e.pos[0].floor() as i32, e.pos[1].floor() as i32, e.pos[2].floor() as i32];
+                        if self.world.get_block(p[0], p[1], p[2]).is_some_and(|b| b.is_air()) {
+                            landed.push((p, BlockRegistry::get().by_name("fire").map(|b| BlockState(b.default)).unwrap_or(blocks::AIR)));
+                        }
+                    }
+                    continue;
+                }
                 let old_chunk = e.chunk();
                 if self.world.get_block(e.pos[0].floor() as i32, e.pos[1].floor() as i32, e.pos[2].floor() as i32).is_none() {
                     continue; // chunk unloaded: frozen
@@ -1199,7 +1243,7 @@ impl Game {
                             continue;
                         }
                     }
-                    EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. } | EKind::Fangs { .. } => {}
+                    EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. } | EKind::Fangs { .. } | EKind::Crystal { .. } => {}
                     EKind::Tnt { fuse, owner } => {
                         *fuse -= 1;
                         if *fuse <= 0 {

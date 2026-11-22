@@ -146,6 +146,7 @@ impl Game {
             EKind::Lightning { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "lightning_bolt", ..Default::default() } },
             EKind::Fangs { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "evoker_fangs", ..Default::default() } },
             EKind::Tnt { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "tnt", ..Default::default() } },
+            EKind::Crystal { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "end_crystal", ..Default::default() } },
         })
     }
 
@@ -183,6 +184,10 @@ impl Game {
 
     /// `hurtServer` on a mob.
     pub fn hurt_mob(&self, eid: i32, src: &DamageSource, amount: f32) -> bool {
+        if self.with_dragon(eid, |_| ()).is_some() {
+            // anything but a direct hit lands on the body part
+            return self.hurt_dragon(eid, 3, src, amount);
+        }
         self.with_mob(eid, |l, eq, body| l.hurt(eq, body, src, amount, &mut rand::thread_rng())).unwrap_or(false)
     }
 
@@ -474,7 +479,18 @@ impl Game {
 
     /// `Player.attack(entity)`.
     pub fn player_attack(&self, attacker: &Arc<Player>, target: i32) -> bool {
+        // EnderDragonPart: the hit goes to the dragon
+        let (target, part) = match self.entity_ref(target) {
+            Some(_) => (target, 0),
+            None => match self.dragon_part(target) {
+                Some((d, k, _)) => (d, k),
+                None => return false,
+            },
+        };
         let Some(tref) = self.entity_ref(target) else { return false };
+        if tref.info.type_name == "end_crystal" {
+            return self.destroy_crystal(target, Some(attacker.eid), true);
+        }
         if !tref.living {
             return false;
         }
@@ -543,7 +559,7 @@ impl Game {
         let old_health = self.health_of(target);
         let target_player = self.players().into_iter().find(|p| p.eid == target);
         let old_motion = target_player.as_ref().map(|t| *t.motion.lock());
-        let was_hurt = self.hurt_entity(target, &src, total);
+        let was_hurt = if part > 0 { self.hurt_dragon(target, part, &src, total) } else { self.hurt_entity(target, &src, total) };
         if !was_hurt {
             self.play_sound("minecraft:entity.player.attack.nodamage", 7, pose.pos, 1.0, 1.0);
             return true;

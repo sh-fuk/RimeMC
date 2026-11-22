@@ -140,6 +140,11 @@ impl ServerState {
             if let Err(e) = g.save_portals(&portals_file(&self.world_dir, g.dim)) {
                 tracing::error!("saving portals: {e:#}");
             }
+            if g.dim == Dim::End {
+                if let Err(e) = g.save_fight(&self.world_dir.join("rime-endfight.txt")) {
+                    tracing::error!("saving the dragon fight: {e:#}");
+                }
+            }
         }
     }
     pub fn online_players(&self) -> u32 {
@@ -364,6 +369,7 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
     for g in [&game, &nether, &end] {
         g.load_portals(&portals_file(&world_dir, g.dim));
     }
+    end.load_fight(&world_dir.join("rime-endfight.txt"));
     let spawn = load_or_find_spawn(&world_dir, &game, &store, &generator)?;
     tracing::info!("world spawn at {:.0} {:.0} {:.0}", spawn[0], spawn[1], spawn[2]);
 

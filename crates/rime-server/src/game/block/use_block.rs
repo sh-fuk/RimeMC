@@ -75,6 +75,16 @@ pub fn use_block(g: &Game, p: [i32; 3], s: BlockState, cx: &Ctx) -> Use {
         }
     }
     let secondary = cx.sneaking && cx.held.is_some();
+    // EndCrystalItem.useOn
+    if item == "end_crystal" && matches!(s.name(), "obsidian" | "bedrock") {
+        if g.place_end_crystal(p) {
+            if !cx.creative {
+                consume_held(g, cx.player, "end_crystal");
+            }
+            return Use::Consumed;
+        }
+        return Use::Pass;
+    }
     // EnderEyeItem.useOn
     if item == "ender_eye" && s.name() == "end_portal_frame" && s.prop("eye") == Some("false") {
         let filled = with_bool(s, "eye", true);

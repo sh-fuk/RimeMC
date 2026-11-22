@@ -18,6 +18,8 @@ pub enum EKind {
     Fangs { owner: Option<i32>, warmup: i32, life: i32, sent: bool, yaw: f32 },
     /// `PrimedTnt`
     Tnt { fuse: i32, owner: Option<i32> },
+    /// `EndCrystal`
+    Crystal { show_bottom: bool, beam: Option<[i32; 3]>, invulnerable: bool },
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +57,7 @@ impl Entity {
             EKind::Lightning { .. } => (0.0, 0.0),
             EKind::Fangs { .. } => (0.25, 0.8),
             EKind::Tnt { .. } => (0.49, 0.98),
+            EKind::Crystal { .. } => (1.0, 2.0),
         }
     }
 }

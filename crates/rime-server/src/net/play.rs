@@ -427,6 +427,9 @@ struct Session {
     portal_time: i32,
     /// `Entity.portalCooldown`
     portal_cooldown: i32,
+    /// left the End through the exit portal: waiting for the credits to end
+    won_game: bool,
+    credits_done: bool,
     combat: CombatChecker,
     vl: Violations,
     mining: MiningStats,
@@ -470,6 +473,8 @@ impl Session {
             sent: HashSet::new(),
             portal_time: 0,
             portal_cooldown: 0,
+            won_game: false,
+            credits_done: false,
             queue: Vec::new(),
             in_flight: 0,
             chunks_per_tick: 9.0,
@@ -1182,6 +1187,10 @@ impl Session {
         if self.me.vit.lock().dead() {
             return;
         }
+        if std::mem::take(&mut self.credits_done) {
+            self.leave_end().await;
+            return;
+        }
         let touched = portal::portal_touched(&self.game, &self.me);
         if self.portal_cooldown > 0 {
             self.portal_cooldown -= 1;
@@ -1237,13 +1246,18 @@ impl Session {
             "end_portal" => {
                 self.portal_cooldown = 10;
                 if self.game.dim == Dim::End {
-                    // the exit portal: back to the respawn point
-                    self.load_area(Dim::Overworld, ((self.st.spawn[0] as i32) >> 4 << 4, (self.st.spawn[2] as i32) >> 4 << 4), 1).await;
-                    let ow = self.st.level(Dim::Overworld).clone();
-                    let bed = self.me.vit.lock().respawn;
-                    let spawn = bed.and_then(|h| crate::game::block::use_block::stand_up_pos(&ow, h)).unwrap_or(self.st.spawn);
-                    self.change_dimension(Dim::Overworld, spawn, 0.0, 0.0);
-                } else {
+                    if self.won_game {
+                        return;
+                    }
+                    // ServerPlayer.teleport: the credits roll first (only the first time)
+                    let seen = std::mem::replace(&mut self.me.vit.lock().seen_credits, true);
+                    self.won_game = true;
+                    let mut b = Vec::new();
+                    b.u8(4).f32(if seen { 0.0 } else { 1.0 });
+                    self.send("game_event", &b);
+                    return;
+                }
+                {
                     let s = portal::END_SPAWN;
                     self.load_area(Dim::End, (s[0], s[2]), 1).await;
                     let end = self.st.level(Dim::End).clone();
@@ -1252,8 +1266,35 @@ impl Session {
                     self.change_dimension(Dim::End, pos, 90.0, 0.0);
                 }
             }
+            "end_gateway" => {
+                // TheEndGatewayBlockEntity.teleportEntity
+                self.portal_cooldown = 40;
+                let dim = self.game.dim;
+                if let Some(t) = self.game.gateway_exit_target(at) {
+                    self.load_area(dim, t, 2).await;
+                    self.game.make_gateway_exit(at, t);
+                }
+                let Some((rough, _)) = self.game.gateway_exit(at) else { return };
+                self.load_area(dim, (rough[0].floor() as i32, rough[2].floor() as i32), 1).await;
+                let Some((pos, _)) = self.game.gateway_exit(at) else { return };
+                self.game.gateway_beam(at);
+                let pose = *self.me.pose.lock();
+                self.change_dimension(dim, pos, pose.yaw, pose.pitch);
+            }
             _ => {}
         }
+    }
+
+    /// After the credits: back to the respawn point in the overworld.
+    async fn leave_end(&mut self) {
+        use crate::world::storage::Dim;
+        self.won_game = false;
+        self.portal_cooldown = 10;
+        self.load_area(Dim::Overworld, ((self.st.spawn[0] as i32) >> 4 << 4, (self.st.spawn[2] as i32) >> 4 << 4), 1).await;
+        let ow = self.st.level(Dim::Overworld).clone();
+        let bed = self.me.vit.lock().respawn;
+        let spawn = bed.and_then(|h| crate::game::block::use_block::stand_up_pos(&ow, h)).unwrap_or(self.st.spawn);
+        self.change_dimension(Dim::Overworld, spawn, 0.0, 0.0);
     }
 
     /// Load or generate the chunks within `r` chunks of block (`x`, `z`) in
@@ -1650,7 +1691,11 @@ impl Session {
             }
         } else if pid == sb("client_command") {
             if r.varint()? == 0 {
-                self.respawn();
+                if self.won_game {
+                    self.credits_done = true;
+                } else {
+                    self.respawn();
+                }
             }
         } else if pid == sb("client_information") {
             let _locale = r.string(16)?;

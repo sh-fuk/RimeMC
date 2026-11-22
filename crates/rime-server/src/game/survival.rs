@@ -31,6 +31,8 @@ pub struct Vitals {
     pub frozen: i32,
     /// bed respawn point (`ServerPlayer.respawnConfig`)
     pub respawn: Option<[i32; 3]>,
+    /// the end credits were shown (`seenCredits`)
+    pub seen_credits: bool,
     /// (bed position, `sleepCounter`) while in bed
     pub sleeping: Option<([i32; 3], i32)>,
 }
@@ -60,6 +62,7 @@ impl Default for Vitals {
             data_dirty: true,
             eating: None,
             respawn: None,
+            seen_credits: false,
             sleeping: None,
         }
     }
