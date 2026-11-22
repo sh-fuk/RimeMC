@@ -347,7 +347,7 @@ impl Game {
                     let r = self.rides.lock();
                     (r.passengers.keys().copied().collect(), r.vehicle_of.keys().copied().collect())
                 };
-                let trading: Vec<i32> = self.entities.lock().values().filter(|e| matches!(&e.kind, EKind::Mob(m) if m.merchant.as_ref().is_some_and(|x| x.customer.is_some()))).map(|e| e.eid).collect();
+                let trading: Vec<i32> = self.entities.lock().values().filter(|e| matches!(&e.kind, EKind::Mob(m) if m.merchant.as_ref().is_some_and(|x| x.customer.is_some()) || m.v.admire > 0)).map(|e| e.eid).collect();
                 vehicles.into_iter().filter(|v| self.controller(*v).is_some()).chain(riders).chain(trading).collect()
             },
         };

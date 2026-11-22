@@ -11,6 +11,7 @@ pub use blockhelp::chunk_min_max_y;
 pub mod level;
 pub mod blockentity;
 pub mod merchant;
+pub mod pickup;
 pub mod combat;
 pub mod consume;
 pub mod hazards;
@@ -1451,6 +1452,7 @@ impl Game {
         self.tick_rides();
         self.tick_leashes();
         self.tick_merchants();
+        self.tick_mob_pickup();
         for (c, owner) in booms {
             // PrimedTnt.explode: power 4 at y + height / 16
             self.explode_full([c[0], c[1] + 0.98 / 16.0, c[2]], 4.0, false, owner, Some(false));

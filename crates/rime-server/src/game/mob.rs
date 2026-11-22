@@ -323,6 +323,8 @@ impl MobType {
 pub struct Vars {
     /// name tag
     pub custom_name: Option<String>,
+    /// piglin admiring the gold in its off hand (ticks left)
+    pub admire: i32,
     /// ocelot trust
     pub trusting: bool,
     /// wolf / cat collar colour
