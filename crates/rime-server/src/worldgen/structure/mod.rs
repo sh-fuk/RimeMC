@@ -8,6 +8,7 @@
 
 pub mod jigsaw;
 pub mod legacy;
+mod endcity;
 mod mansion;
 mod monument;
 pub mod mineshaft;

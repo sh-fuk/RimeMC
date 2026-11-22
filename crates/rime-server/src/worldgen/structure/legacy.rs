@@ -83,6 +83,9 @@ pub enum LKind {
     Stronghold,
     OceanMonument,
     WoodlandMansion,
+    /// height: uniform absolute `min` .. `below_top` blocks under the top
+    NetherFossil { min: i32, below_top: i32 },
+    EndCity,
 }
 
 impl LKind {
@@ -126,6 +129,11 @@ impl LKind {
             "stronghold" => LKind::Stronghold,
             "ocean_monument" => LKind::OceanMonument,
             "woodland_mansion" => LKind::WoodlandMansion,
+            "end_city" => LKind::EndCity,
+            "nether_fossil" => LKind::NetherFossil {
+                min: v["height"]["min_inclusive"]["absolute"].as_i64().unwrap_or(32) as i32,
+                below_top: v["height"]["max_inclusive"]["below_top"].as_i64().unwrap_or(2) as i32,
+            },
             _ => return None,
         })
     }
@@ -158,6 +166,8 @@ impl LKind {
                 }
                 (1..=10).map(|i| format!("ruined_portal/portal_{i}")).chain((1..=3).map(|i| format!("ruined_portal/giant_portal_{i}"))).collect()
             }
+            LKind::EndCity => super::endcity::NAMES.iter().map(|n| format!("end_city/{n}")).collect(),
+            LKind::NetherFossil { .. } => (1..=14).map(|i| format!("nether_fossils/fossil_{i}")).collect(),
             LKind::WoodlandMansion => MANSION.split(' ').map(|n| format!("woodland_mansion/{n}")).collect(),
             LKind::OceanMonument => {
                 let mut set = std::collections::HashSet::new();
@@ -282,6 +292,8 @@ enum TKind {
     OceanRuin,
     Portal { placement: VPlace, cold: bool, overgrown: bool, vines: bool },
     Mansion,
+    NetherFossil,
+    EndCity,
 }
 
 struct TState {
@@ -358,7 +370,24 @@ impl TPiece {
                     lv.set(p, if p[1] > lv.lib.sea_level { blocks::AIR } else { state("water", &[]) });
                 }
             }
-            TKind::Portal { .. } => {}
+            TKind::Portal { .. } | TKind::NetherFossil => {}
+            TKind::EndCity => {
+                // `EndCityPiece.handleDataMarker`
+                if meta.starts_with("Chest") {
+                    if bb_inside(cb, below) {
+                        let id = crate::game::blockentity::be_id(lv.get(below).name()).unwrap_or("minecraft:chest");
+                        piece::loot_container(lv, below, id, "chests/end_city_treasure", r);
+                    }
+                } else if bb_inside(cb, p) {
+                    if meta.starts_with("Sentry") {
+                        lv.spawn_entity("shulker", p);
+                    } else if meta.starts_with("Elytra") {
+                        // item frame facing rot.rotate(SOUTH), holding an elytra
+                        const FRAMES: [&str; 4] = ["elytra_frame:south", "elytra_frame:west", "elytra_frame:north", "elytra_frame:east"];
+                        lv.spawn_entity(FRAMES[self.rot as usize & 3], p);
+                    }
+                }
+            }
             TKind::Mansion => {
                 if let Some(face) = meta.strip_prefix("Chest") {
                     let d = match face {
@@ -493,6 +522,31 @@ impl LPiece for TPiece {
             TKind::Mansion => {
                 let pos = st.pos;
                 st.bb = self.place(lv, seed, r, cb, reference, pos);
+            }
+            TKind::EndCity => {
+                let pos = st.pos;
+                st.bb = self.place(lv, seed, r, cb, reference, pos);
+            }
+            TKind::NetherFossil => {
+                // `NetherFossilPiece.postProcess`: the chunk box is widened to
+                // the whole template, then a dried ghast may be dropped
+                let tbb = self.t.bounding_box(st.pos, self.rot, self.pivot, self.mirror);
+                let area = bb_encapsulate(*cb, &tbb);
+                let pos = st.pos;
+                st.bb = self.place(lv, seed, r, &area, reference, pos);
+                let mut gr = crate::worldgen::random::Legacy::new(seed).fork_positional();
+                let c = bb_center(&tbb);
+                let mut gr = gr.at(c[0], c[1], c[2]);
+                if gr.next_float() < 0.5 {
+                    let x = tbb.0[0] + gr.next_int_bound(span(&tbb, 0));
+                    let y = tbb.0[1];
+                    let z = tbb.0[2] + gr.next_int_bound(span(&tbb, 2));
+                    let p = [x, y, z];
+                    if vstate::air(lv.get(p)) && bb_inside(&area, p) {
+                        let rot = gr.next_int_bound(4);
+                        lv.set(p, template::rotate_state(state("dried_ghast", &[]), rot));
+                    }
+                }
             }
             TKind::Portal { placement, cold, overgrown, vines } => {
                 let tbb = self.t.bounding_box(st.pos, self.rot, self.pivot, self.mirror);
@@ -967,6 +1021,54 @@ pub fn generate(kind: &LKind, lib: &LLib, ctx: &dyn Ctx, seed: i64, cx: i32, cz:
             out.push(Box::new(TPiece::new(t, pos, rot, mirror, pivot, procs, true, kind)));
             Some((out, pos))
         }
+        LKind::EndCity => {
+            // `EndCityStructure.findGenerationPoint`
+            let rot = r.next_int_bound(4);
+            let (i, j) = match rot {
+                1 => (-5, 5),
+                2 => (-5, -5),
+                3 => (5, -5),
+                _ => (5, 5),
+            };
+            let (x, z) = (x0 + 7, z0 + 7);
+            let y = lowest_y(ctx, x, z, i, j);
+            if y < 60 {
+                return None;
+            }
+            let pos = [x, y, z];
+            let get = |n: &str| lib.get(&format!("end_city/{n}"));
+            for e in super::endcity::start(&get, pos, rot, r) {
+                let ignore = if e.overwrite { vec!["structure_block"] } else { vec!["structure_block", "air"] };
+                out.push(Box::new(TPiece::new(get(e.name), e.pos, e.rot, 0, [0, 0, 0], vec![Proc::Ignore(ignore)], true, TKind::EndCity)));
+            }
+            Some((out, pos))
+        }
+        LKind::NetherFossil { min, below_top } => {
+            // `NetherFossilStructure.findGenerationPoint`
+            let x = x0 + r.next_int_bound(16);
+            let z = z0 + r.next_int_bound(16);
+            let sea = 32;
+            let top = crate::worldgen::gen_min_y() + crate::worldgen::gen_height() - 1 - below_top;
+            let mut y = if *min > top { *min } else { r.next_int_bound(top - min + 1) + min };
+            let col = ctx.base_column(x, z);
+            let at = |y: i32| col.get((y - MIN_Y) as usize).copied().unwrap_or(blocks::AIR);
+            while y > sea {
+                let s = at(y);
+                y -= 1;
+                let below = at(y);
+                if vstate::air(s) && (below.name() == "soul_sand" || vstate::sturdy(below, 1)) {
+                    break;
+                }
+            }
+            if y <= sea {
+                return None;
+            }
+            let pos = [x, y, z];
+            let rot = r.next_int_bound(4);
+            let t = lib.get(&format!("nether_fossils/fossil_{}", r.next_int_bound(14) + 1));
+            out.push(Box::new(TPiece::new(t, pos, rot, 0, [0, 0, 0], vec![Proc::Ignore(vec!["structure_block", "air"])], true, TKind::NetherFossil)));
+            Some((out, pos))
+        }
         LKind::BuriedTreasure => {
             let stub = chunk_center(ctx, cx, cz, Hm::Motion);
             let p = [x0 + 9, 90, z0 + 9];
@@ -1065,7 +1167,7 @@ fn ruin_piece(lib: &LLib, out: &mut Vec<Box<dyn LPiece>>, r: &mut dyn Rng, warm:
 
 /// `RuinedPortalStructure.findSuitableY`
 fn portal_y(r: &mut dyn Rng, ctx: &dyn Ctx, placement: VPlace, air_pocket: bool, i: i32, y_span: i32, tbb: &Bb) -> i32 {
-    let k = MIN_Y + 15;
+    let k = crate::worldgen::gen_min_y() + 15;
     let within = |r: &mut dyn Rng, a: i32, b: i32| if a < b { rbi(r, a, b) } else { b };
     let j = match placement {
         VPlace::InNether => {

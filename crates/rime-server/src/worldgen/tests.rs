@@ -872,12 +872,26 @@ fn list_vanilla_starts() {
 fn dims_match_vanilla() {
     let (Some(dir), Ok(world)) = (data_dir(), std::env::var("RIME_VREF_DIM")) else { return };
     let load = loader(dir);
-    for (dim, sub, chunks) in [
-        (super::DimKind::Nether, "dimensions/minecraft/the_nether", (-3..3).flat_map(|x| (-3..3).map(move |z| (x, z))).collect::<Vec<_>>()),
-        (super::DimKind::End, "dimensions/minecraft/the_end", (-3..3).flat_map(|x| (-3..3).map(move |z| (x, z))).chain((65..67).flat_map(|x| (65..67).map(move |z| (x, z)))).collect()),
-    ] {
+    // RIME_VREF_STRUCT: structures on, chunks around the structures of seed 12345
+    let structs = std::env::var("RIME_VREF_STRUCT").is_ok();
+    let area = |x0: i32, z0: i32, x1: i32, z1: i32| ((x0 >> 4) + 1..=(x1 >> 4) - 1).flat_map(move |x| ((z0 >> 4) + 1..=(z1 >> 4) - 1).map(move |z| (x, z)));
+    let (nether, end): (Vec<(i32, i32)>, Vec<(i32, i32)>) = if structs {
+        let only = std::env::var("RIME_VREF_ONLY").ok();
+        let mut n: Vec<(i32, i32)> = Vec::new();
+        for (name, a) in [("fossil", (-400, 48, -304, 144)), ("bastion", (112, -336, 255, -177)), ("portal", (-48, -336, 47, -241)), ("fortress", (-304, -688, -113, -497))] {
+            if only.as_deref().is_none_or(|o| o == name) {
+                n.extend(area(a.0, a.1, a.2, a.3));
+            }
+        }
+        (n, area(976, 608, 1167, 799).collect())
+    } else {
+        ((-3..3).flat_map(|x| (-3..3).map(move |z| (x, z))).collect(), (-3..3).flat_map(|x| (-3..3).map(move |z| (x, z))).chain((65..67).flat_map(|x| (65..67).map(move |z| (x, z)))).collect())
+    };
+    for (dim, sub, chunks) in [(super::DimKind::Nether, "dimensions/minecraft/the_nether", nether), (super::DimKind::End, "dimensions/minecraft/the_end", end)] {
         let mut g = super::VanillaGenerator::new_dim(&load, 12345, dim).unwrap();
-        g.structures = None;
+        if !structs {
+            g.structures = None;
+        }
         let reg = PathBuf::from(&world).join(sub).join("region");
         let mut by_kind: std::collections::BTreeMap<String, usize> = Default::default();
         let full = std::env::var("RIME_VREF_NOFEAT").is_err();
@@ -920,6 +934,13 @@ fn dims_match_vanilla() {
                 }
             }
             total += bad;
+            if std::env::var("RIME_VREF_PERCHUNK").is_ok() {
+                let names = crate::world::chunk::Biomes::get();
+                let mut bs: Vec<&str> = v.biomes[4..20].iter().flat_map(|s| s.iter()).map(|&b| names.names[b as usize].trim_start_matches("minecraft:")).collect();
+                bs.sort();
+                bs.dedup();
+                eprintln!("chunk {cx},{cz}: {bad} {bs:?}");
+            }
         }
         eprintln!("{sub}: {tested} chunks, {total} block mismatches, {bb} biome mismatches: {by_kind:?}");
         assert!(tested > 0);
