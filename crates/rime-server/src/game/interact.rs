@@ -38,6 +38,9 @@ impl Game {
         if p.gamemode.load(Ordering::Relaxed) == 3 {
             return false;
         }
+        if self.is_frame(eid) {
+            return hand == 0 && self.use_frame(p, eid, slot) || hand == 1 && held.is_some() && self.use_frame(p, eid, slot);
+        }
         let items = Items::get();
         let name = held.map(|s| items.name(s.item).to_string()).unwrap_or_default();
         let ppos = p.pose.lock().pos;

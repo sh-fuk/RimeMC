@@ -1338,9 +1338,12 @@ impl Game {
         }
         let found = {
             let ents = self.entities.lock();
-            ents.get(&eid).map(|e| {
-                let (half, h) = e.size();
-                Aabb::entity(e.pos, half * 2.0, h)
+            ents.get(&eid).map(|e| match e.kind {
+                EKind::Frame { facing, .. } => super::frame::frame_box(e.pos, facing),
+                _ => {
+                    let (half, h) = e.size();
+                    Aabb::entity(e.pos, half * 2.0, h)
+                }
             })
         };
         found.or_else(|| self.dragon_part(eid).map(|d| d.2))
@@ -1437,6 +1440,11 @@ impl Game {
         }
         for eid in crystals {
             self.destroy_crystal(eid, by, false);
+        }
+        // hanging entities are knocked off (ItemFrame.hurtServer by an explosion)
+        let frames: Vec<i32> = self.entities.lock().values().filter(|e| matches!(e.kind, EKind::Frame { fixed: false, .. }) && dist2(e.pos, c).sqrt() / r <= 1.0).map(|e| e.eid).collect();
+        for eid in frames {
+            self.break_frame(eid, true);
         }
         for (eid, pos, eye, h, player) in victims {
             if !Aabb::entity(pos, 0.0, h).intersects(&area) {
@@ -1718,6 +1726,11 @@ impl Game {
             for dx in -3..=3 {
                 for dz in -3..=3 {
                     for (name, p) in self.world.take_gen_entities(cx + dx, cz + dz) {
+                        if let Some(dir) = name.strip_prefix("elytra_frame:") {
+                            let elytra = Items::get().id("elytra").map(|id| Stack::new(id, 1));
+                            self.spawn_frame(p, super::frame::face_of(dir), false, elytra, false);
+                            continue;
+                        }
                         if name == "end_crystal" {
                             self.spawn_crystal([p[0] as f64 + 0.5, p[1] as f64, p[2] as f64 + 0.5], true);
                             continue;

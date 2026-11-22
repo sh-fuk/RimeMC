@@ -30,6 +30,7 @@ pub mod workstation;
 pub mod playerdata;
 pub mod portal;
 pub mod endfight;
+pub mod frame;
 pub mod survival;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -982,6 +983,7 @@ impl Game {
             EKind::Falling { state } => (regs.id("minecraft:entity_type", "minecraft:falling_block").unwrap_or(0), state.0 as i32),
             EKind::Tnt { .. } => (regs.id("minecraft:entity_type", "minecraft:tnt").unwrap_or(0), 0),
             EKind::Crystal { .. } => (regs.id("minecraft:entity_type", "minecraft:end_crystal").unwrap_or(0), 0),
+            EKind::Frame { glow, facing, .. } => (regs.id("minecraft:entity_type", if *glow { "minecraft:glow_item_frame" } else { "minecraft:item_frame" }).unwrap_or(0), *facing as i32),
             _ => unreachable!(),
         };
         let mut b = Vec::new();
@@ -997,6 +999,9 @@ impl Game {
         }
         if let EKind::Crystal { show_bottom, beam, .. } = e.kind {
             out.push(self.crystal_meta(e.eid, show_bottom, beam));
+        }
+        if let EKind::Frame { item, rotation, .. } = e.kind {
+            out.push(self.frame_meta(e.eid, item, rotation));
         }
         out
     }
@@ -1191,6 +1196,9 @@ impl Game {
         self.tick_mobs();
         self.tick_end_fight();
         self.tick_entity_portals();
+        if now % 100 == 0 {
+            self.check_frames();
+        }
         self.tick_entity_inside();
         // light changed by block updates
         let relit = self.world.relight(256);
@@ -1217,6 +1225,9 @@ impl Game {
             let mut ents = self.entities.lock();
             for e in ents.values_mut() {
                 if matches!(e.kind, EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. } | EKind::Fangs { .. }) {
+                    continue;
+                }
+                if let EKind::Frame { .. } = e.kind {
                     continue;
                 }
                 if let EKind::Crystal { .. } = e.kind {
@@ -1251,7 +1262,7 @@ impl Game {
                             continue;
                         }
                     }
-                    EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. } | EKind::Fangs { .. } | EKind::Crystal { .. } => {}
+                    EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. } | EKind::Fangs { .. } | EKind::Crystal { .. } | EKind::Frame { .. } => {}
                     EKind::Tnt { fuse, owner } => {
                         *fuse -= 1;
                         if *fuse <= 0 {

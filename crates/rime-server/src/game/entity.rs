@@ -20,6 +20,8 @@ pub enum EKind {
     Tnt { fuse: i32, owner: Option<i32> },
     /// `EndCrystal`
     Crystal { show_bottom: bool, beam: Option<[i32; 3]>, invulnerable: bool },
+    /// `ItemFrame` / `GlowItemFrame` (pos is the frame's centre)
+    Frame { item: Option<Stack>, rotation: u8, facing: u8, glow: bool, fixed: bool },
 }
 
 #[derive(Clone, Debug)]
@@ -58,6 +60,7 @@ impl Entity {
             EKind::Fangs { .. } => (0.25, 0.8),
             EKind::Tnt { .. } => (0.49, 0.98),
             EKind::Crystal { .. } => (1.0, 2.0),
+            EKind::Frame { .. } => (0.375, 0.75),
         }
     }
 }

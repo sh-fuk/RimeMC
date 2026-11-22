@@ -112,6 +112,16 @@ pub fn use_block(g: &Game, p: [i32; 3], s: BlockState, cx: &Ctx) -> Use {
         }
     }
     let secondary = cx.sneaking && cx.held.is_some();
+    // HangingEntityItem.useOn (item frames)
+    if matches!(item, "item_frame" | "glow_item_frame") {
+        if g.place_frame(p, cx.face, item == "glow_item_frame") {
+            if !cx.creative {
+                consume_held(g, cx.player, item);
+            }
+            return Use::Consumed;
+        }
+        return Use::Pass;
+    }
     // EndCrystalItem.useOn
     if item == "end_crystal" && matches!(s.name(), "obsidian" | "bedrock") {
         if g.place_end_crystal(p) {

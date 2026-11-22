@@ -146,6 +146,7 @@ impl Game {
             EKind::Lightning { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "lightning_bolt", ..Default::default() } },
             EKind::Fangs { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "evoker_fangs", ..Default::default() } },
             EKind::Tnt { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "tnt", ..Default::default() } },
+            EKind::Frame { glow, .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: if *glow { "glow_item_frame" } else { "item_frame" }, ..Default::default() } },
             EKind::Crystal { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "end_crystal", ..Default::default() } },
         })
     }
@@ -488,6 +489,9 @@ impl Game {
             },
         };
         let Some(tref) = self.entity_ref(target) else { return false };
+        if matches!(tref.info.type_name, "item_frame" | "glow_item_frame") {
+            return self.hit_frame(Some(attacker), target);
+        }
         if tref.info.type_name == "end_crystal" {
             return self.destroy_crystal(target, Some(attacker.eid), true);
         }
