@@ -31,6 +31,7 @@ pub mod playerdata;
 pub mod portal;
 pub mod endfight;
 pub mod frame;
+pub mod persist;
 pub mod survival;
 
 use std::collections::{BTreeMap, HashMap, HashSet};

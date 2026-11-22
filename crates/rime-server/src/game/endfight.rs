@@ -1020,7 +1020,8 @@ mod tests {
         let data = crate::data::GameData::load(&vanilla).ok()?;
         let g = Game::new_dim(256, Arc::new(data), Dim::End);
         let generator = Generator::new(1, false, 1);
-        let tmp = std::env::temp_dir().join(format!("rime-fight-test-{}", std::process::id()));
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let tmp = std::env::temp_dir().join(format!("rime-fight-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let store = WorldStore::open(&tmp, crate::config::WorldFormat::Airworld, 3, true, 64).ok()?;
         let all: Vec<(i32, i32)> = (-8..=8).flat_map(|x| (-8..=8).map(move |z| (x, z))).collect();
         g.world.ensure_loaded(&all, &store, &generator);
@@ -1086,6 +1087,35 @@ mod tests {
         assert_eq!(g.world.get_block(portal[0] + 1, portal[1], portal[2]).map(|b| b.name()), Some("end_portal"));
         let top = g.motion_blocking_height(portal[0], portal[2]);
         assert_eq!(g.world.get_block(portal[0], top - 1, portal[2]).map(|b| b.name()), Some("dragon_egg"));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn entities_survive_a_restart() {
+        let Some((g, _gen, _store, tmp)) = end_game() else { return };
+        let zombie = MobType::from_name("zombie").unwrap();
+        let z = g.spawn_mob_with(zombie, [3.5, 70.0, 3.5], true, |m, _| m.v.custom_name = Some("Bob".into()));
+        g.with_mob(z, |l, _, _| l.health = 7.0);
+        let apple = crate::data::Items::get().id("apple").unwrap();
+        g.spawn_item([1.0, 70.0, 1.0], crate::data::Stack::new(apple, 5), [0.0; 3], 0);
+        g.spawn_crystal([0.5, 80.0, 0.5], true);
+        let file = tmp.join("ents.dat");
+        std::fs::create_dir_all(&tmp).unwrap();
+        g.save_entities(&file).unwrap();
+        let h = Game::new_dim(256, g.data.clone(), Dim::End);
+        assert_eq!(h.load_entities(&file), 3);
+        let ents = h.entities.lock();
+        let m = ents.values().find_map(|e| match &e.kind {
+            EKind::Mob(m) => Some(m),
+            _ => None,
+        });
+        let m = m.expect("zombie back");
+        assert_eq!(m.v.custom_name.as_deref(), Some("Bob"));
+        assert!((m.living.health - 7.0).abs() < 1e-4);
+        assert!(m.persistent);
+        assert!(ents.values().any(|e| matches!(e.kind, EKind::Item { stack, .. } if stack.count == 5)));
+        assert!(ents.values().any(|e| matches!(e.kind, EKind::Crystal { show_bottom: true, .. })));
+        drop(ents);
         let _ = std::fs::remove_dir_all(tmp);
     }
 }
