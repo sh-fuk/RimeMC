@@ -175,6 +175,10 @@ pub struct LevelState {
     pub moving: std::collections::HashMap<[i32; 3], crate::game::block::piston::Moving>,
     /// hopper cooldowns
     pub hoppers: std::collections::HashMap<[i32; 3], crate::game::block::container::HopperState>,
+    /// ticking brewing stands and beacons
+    pub brewers: HashSet<[i32; 3]>,
+    /// beacon pyramid levels
+    pub beacons: std::collections::HashMap<[i32; 3], i32>,
 }
 
 const MAX_CHAINED: usize = 1_000_000;

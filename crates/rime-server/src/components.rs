@@ -36,6 +36,34 @@ pub struct Patch {
     pub charged: Vec<(i32, u8, u32)>,
     /// `intangible_projectile`: only picked up in creative
     pub intangible: bool,
+    /// `trim`: (material, pattern), no namespace
+    pub trim: Option<(String, String)>,
+    /// `banner_patterns`: (pattern, dye colour id), bottom layer first
+    pub banner: Vec<(String, u8)>,
+}
+
+/// Network ids of the synchronized data-driven registries (trim materials,
+/// banner patterns…), set once from the configuration data.
+static DATA_REGS: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
+
+pub fn set_data_registries(m: HashMap<String, Vec<String>>) {
+    let _ = DATA_REGS.set(m);
+}
+
+/// Network id of `name` (no namespace) in a data registry (`minecraft:trim_material`).
+pub fn data_reg_id(registry: &str, name: &str) -> Option<i32> {
+    let full = format!("minecraft:{}", name.trim_start_matches("minecraft:"));
+    DATA_REGS.get()?.get(registry)?.iter().position(|n| *n == full).map(|i| i as i32)
+}
+
+pub fn data_reg_name(registry: &str, id: i32) -> Option<String> {
+    DATA_REGS.get()?.get(registry)?.get(id as usize).map(|n| n.trim_start_matches("minecraft:").to_string())
+}
+
+pub const DYE_COLORS: [&str; 16] = ["white", "orange", "magenta", "light_blue", "yellow", "lime", "pink", "gray", "light_gray", "cyan", "purple", "blue", "brown", "green", "red", "black"];
+
+pub fn dye_id(name: &str) -> Option<u8> {
+    DYE_COLORS.iter().position(|c| *c == name).map(|i| i as u8)
 }
 
 impl Patch {
@@ -301,6 +329,22 @@ pub fn write_patch(b: &mut Vec<u8>, comp: u32) {
         }
         added.push((type_id("minecraft:charged_projectiles"), x));
     }
+    if let Some((m, pt)) = &p.trim {
+        if let (Some(a), Some(b)) = (data_reg_id("minecraft:trim_material", m), data_reg_id("minecraft:trim_pattern", pt)) {
+            let mut x = Vec::new();
+            x.vi(a + 1).vi(b + 1);
+            added.push((type_id("minecraft:trim"), x));
+        }
+    }
+    if !p.banner.is_empty() {
+        let mut x = Vec::new();
+        let layers: Vec<(i32, u8)> = p.banner.iter().filter_map(|(n, c)| Some((data_reg_id("minecraft:banner_pattern", n)?, *c))).collect();
+        x.vi(layers.len() as i32);
+        for (id, c) in layers {
+            x.vi(id + 1).vi(c as i32);
+        }
+        added.push((type_id("minecraft:banner_patterns"), x));
+    }
     added.retain(|(id, _)| *id >= 0);
     b.vi(added.len() as i32).vi(0);
     for (id, data) in added {
@@ -357,6 +401,26 @@ pub fn read_patch(r: &mut Reader) -> anyhow::Result<Option<Patch>> {
                     return Ok(None);
                 }
             }
+            "minecraft:trim" => {
+                let a = r.varint()?;
+                let b = r.varint()?;
+                anyhow::ensure!(a > 0 && b > 0, "inline trim");
+                match (data_reg_name("minecraft:trim_material", a - 1), data_reg_name("minecraft:trim_pattern", b - 1)) {
+                    (Some(m), Some(pt)) => p.trim = Some((m, pt)),
+                    _ => return Ok(None),
+                }
+            }
+            "minecraft:banner_patterns" => {
+                let n = r.varint()?;
+                anyhow::ensure!((0..=16).contains(&n), "too many banner layers");
+                for _ in 0..n {
+                    let h = r.varint()?;
+                    anyhow::ensure!(h > 0, "inline banner pattern");
+                    let c = r.varint()?;
+                    let Some(name) = data_reg_name("minecraft:banner_pattern", h - 1) else { return Ok(None) };
+                    p.banner.push((name, c.clamp(0, 15) as u8));
+                }
+            }
             _ => return Ok(None),
         }
     }
@@ -398,6 +462,17 @@ pub fn to_nbt(comp: u32) -> Option<Tag> {
     if p.intangible {
         c.push(("minecraft:intangible_projectile".into(), Tag::Compound(vec![])));
     }
+    if let Some((m, pt)) = &p.trim {
+        c.push(("minecraft:trim".into(), Tag::Compound(vec![("material".into(), Tag::String(format!("minecraft:{m}"))), ("pattern".into(), Tag::String(format!("minecraft:{pt}")))])));
+    }
+    if !p.banner.is_empty() {
+        let l = p
+            .banner
+            .iter()
+            .map(|(n, col)| Tag::Compound(vec![("pattern".into(), Tag::String(format!("minecraft:{n}"))), ("color".into(), Tag::String(DYE_COLORS[*col as usize % 16].into()))]))
+            .collect();
+        c.push(("minecraft:banner_patterns".into(), Tag::List(l)));
+    }
     if !p.charged.is_empty() {
         let items = crate::data::Items::get();
         let list = p
@@ -434,6 +509,18 @@ pub fn from_nbt(t: &Tag) -> u32 {
     p.repair_cost = t.get("minecraft:repair_cost").and_then(|d| d.as_i64()).map(|d| d as i32);
     p.potion = t.get("minecraft:potion_contents").and_then(|pc| pc.get("potion").or(Some(pc))).and_then(|x| x.as_str()).map(|s| s.trim_start_matches("minecraft:").to_string());
     p.intangible = t.get("minecraft:intangible_projectile").is_some();
+    if let Some(tr) = t.get("minecraft:trim") {
+        let s = |k: &str| tr.get(k).and_then(|v| v.as_str()).map(|x| x.trim_start_matches("minecraft:").to_string());
+        if let (Some(m), Some(pt)) = (s("material"), s("pattern")) {
+            p.trim = Some((m, pt));
+        }
+    }
+    if let Some(Tag::List(l)) = t.get("minecraft:banner_patterns") {
+        for e in l {
+            let (Some(n), Some(c)) = (e.get("pattern").and_then(|v| v.as_str()), e.get("color").and_then(|v| v.as_str()).and_then(dye_id)) else { continue };
+            p.banner.push((n.trim_start_matches("minecraft:").to_string(), c));
+        }
+    }
     if let Some(Tag::List(l)) = t.get("minecraft:charged_projectiles") {
         let items = crate::data::Items::get();
         for e in l {

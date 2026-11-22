@@ -284,6 +284,7 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
     }
     backup_on_generator_change(&world_dir, generator.gen_id())?;
     let config_data = net::config_data::ConfigData::build(&vanilla)?;
+    components::set_data_registries(config_data.names());
     tracing::info!("loaded {} synchronized registries from vanilla {} data", config_data.registries.len(), registry::blocks::MC_VERSION);
 
     game::combat::load(&vanilla)?;

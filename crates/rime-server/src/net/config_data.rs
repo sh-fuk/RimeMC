@@ -183,6 +183,11 @@ impl ConfigData {
         b
     }
 
+    /// Entry names of every synchronized registry, in network order.
+    pub fn names(&self) -> std::collections::HashMap<String, Vec<String>> {
+        self.registries.iter().map(|(r, e)| (r.clone(), e.iter().map(|(k, _)| k.clone()).collect())).collect()
+    }
+
     /// Network id of an entry in a synchronized registry.
     pub fn entry_id(&self, registry: &str, name: &str) -> i32 {
         self.registries

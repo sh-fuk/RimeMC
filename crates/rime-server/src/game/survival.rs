@@ -309,6 +309,17 @@ impl Vitals {
         }
     }
 
+    /// `Player.giveExperienceLevels`
+    pub fn give_levels(&mut self, n: i32) {
+        self.xp_level = self.xp_level.saturating_add(n);
+        if self.xp_level < 0 {
+            self.xp_level = 0;
+            self.xp_progress = 0.0;
+            self.xp_total = 0;
+        }
+        self.xp_dirty = true;
+    }
+
     /// `Player.giveExperiencePoints`
     pub fn give_xp(&mut self, n: i32) {
         self.xp_progress += n as f32 / self.xp_needed() as f32;

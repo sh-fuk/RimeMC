@@ -609,6 +609,7 @@ impl Session {
         let mut b = Vec::new();
         b.vi(0);
         self.send("set_held_slot", &b);
+        self.send("update_recipes", &crate::game::workstation::update_recipes(&self.st.game.data));
         self.st.game.send_inventory(&self.me);
     }
 
@@ -1342,6 +1343,17 @@ impl Session {
             let front = r.bool()?;
             let lines = [r.string(384)?.to_string(), r.string(384)?.to_string(), r.string(384)?.to_string(), r.string(384)?.to_string()];
             self.st.game.sign_update(&self.me, [pos.0, pos.1, pos.2], front, lines);
+        } else if pid == sb("container_button_click") {
+            let window = r.varint()?;
+            let id = r.varint()?;
+            self.menu_button(window, id);
+        } else if pid == sb("rename_item") {
+            let name = r.string(32767)?.to_string();
+            self.rename_item(name);
+        } else if pid == sb("set_beacon") {
+            let primary = if r.bool()? { Some(r.varint()?) } else { None };
+            let secondary = if r.bool()? { Some(r.varint()?) } else { None };
+            crate::game::workstation::set_beacon(&self.st.game, &self.me, primary, secondary);
         } else if pid == sb("set_carried_item") {
             let s = r.i16()?;
             if (0..9).contains(&s) {
@@ -1911,7 +1923,7 @@ impl Session {
                     inv.held(held as i16 - 36).map(|s| {
                         let n = if status == 3 { s.count } else { 1 };
                         inv.consume(held, n);
-                        Stack::new(s.item, n)
+                        Stack { count: n, ..s }
                     })
                 };
                 if let Some(t) = taken {
@@ -2056,6 +2068,8 @@ impl Session {
                 self.st.game.send_inventory(&self.me);
                 return Flow::Continue;
             }
+            inv.menu.creative = creative;
+            inv.menu.xp_level = self.me.vit.lock().xp_level;
             let out = inv.click(&self.st.game.data, slot, button, mode, creative);
             let contents = inv.window_contents();
             let as_pair = |s: Option<Stack>| s.map(|s| (s.item, s.count as i32));
@@ -2068,15 +2082,19 @@ impl Session {
         let open = {
             let inv = self.me.inv.lock();
             match inv.window {
-                crate::game::inventory::Window::Container(_, _, p) => Some((p, inv.ext.clone())),
+                crate::game::inventory::Window::Container(_, sc, p) => Some((p, sc, inv.ext.clone())),
                 _ => None,
             }
         };
-        if let Some((p, ext)) = open {
-            let stored = self.st.game.world.block_entity(p).map(|t| crate::game::blockentity::items(&t, ext.len()));
-            if stored.as_ref() != Some(&ext) {
-                self.st.game.container_changed(p, &ext, self.me.eid);
+        match open {
+            Some((_, sc, _)) if sc.transient() => self.menu_events(),
+            Some((p, _, ext)) => {
+                let stored = self.st.game.container_slots(p);
+                if stored.as_ref() != Some(&ext) {
+                    self.st.game.set_container_slots(p, &ext, self.me.eid);
+                }
             }
+            None => {}
         }
         if matches {
             self.st.game.flush_inventory(&self.me);
@@ -2155,6 +2173,28 @@ impl Session {
                     }
                 }
             }
+            "glass_bottle" => {
+                // BottleItem.use: fill from a water source
+                let hit = self.raycast(yaw, pitch, &|b| fluid::fluid_state(b).is_source() || b.is_solid());
+                if let Some((_, c)) = hit {
+                    let b = game.world.get_block(c.0, c.1, c.2).unwrap_or(blocks::AIR);
+                    if b.name() != "water" {
+                        return;
+                    }
+                    let full = Stack::new(items.id("potion").unwrap_or(0), 1).with_patch(|p| p.potion = Some("water".into()));
+                    game.play_sound("minecraft:item.bottle.fill", 0, self.me.pose.lock().pos, 1.0, 1.0);
+                    let mut inv = self.me.inv.lock();
+                    if gm != 1 {
+                        inv.consume(slot, 1);
+                    }
+                    if inv.slots[slot].is_none() {
+                        inv.set(slot, Some(full));
+                    } else if inv.add(full, slot as i16 - 36) > 0 {
+                        drop(inv);
+                        self.throw(full, false);
+                    }
+                }
+            }
             "water_bucket" | "lava_bucket" => {
                 let fluid_block = if name == "water_bucket" { blocks::WATER } else { blocks::LAVA };
                 let hit = self.raycast(yaw, pitch, &|b| !game.is_replaceable(b) || fluid::fluid_state(b).is_source());
@@ -2213,6 +2253,10 @@ impl Session {
 
     fn open_container(&mut self, p: [i32; 3], screen: crate::game::blockentity::Screen, title: &str) {
         use crate::game::blockentity as be;
+        if screen.transient() {
+            self.open_menu(p, screen, title);
+            return;
+        }
         let game = &self.st.game;
         let mut t = match game.world.block_entity(p) {
             Some(t) => t,
@@ -2237,7 +2281,7 @@ impl Session {
             let mut inv = self.me.inv.lock();
             let thrown = inv.close(&game.data, held);
             inv.window = crate::game::inventory::Window::Container(id, screen, p);
-            inv.ext = be::items(&t, screen.size());
+            inv.ext = game.container_slots(p).filter(|s| s.len() == screen.size()).unwrap_or_else(|| be::items(&t, screen.size()));
             drop(inv);
             for t in thrown {
                 self.throw(t, false);
@@ -2254,6 +2298,128 @@ impl Session {
             game.send_furnace_data(&self.me, p);
             game.watch_furnace(p);
         }
+        if screen == be::Screen::Brewing {
+            game.send_props(&self.me, &crate::game::workstation::brewing_props(game, p));
+            crate::game::workstation::ticker_placed(game, p, game.bs(p));
+        }
+    }
+
+    /// Open a workstation menu (its slots live in the menu only).
+    fn open_menu(&mut self, p: [i32; 3], screen: crate::game::blockentity::Screen, title: &str) {
+        use crate::game::blockentity::Screen;
+        let st = self.st.clone();
+        let game = &st.game;
+        self.next_window = self.next_window % 100 + 1;
+        let id = self.next_window;
+        {
+            let held = self.me.held.load(Ordering::Relaxed) as i16;
+            let mut inv = self.me.inv.lock();
+            let thrown = inv.close(&game.data, held);
+            inv.window = crate::game::inventory::Window::Container(id, screen, p);
+            inv.ext = vec![None; screen.size()];
+            let seed = inv.enchant_seed;
+            inv.menu = crate::game::menu::MenuState { pos: p, xp_level: self.me.vit.lock().xp_level, creative: self.gamemode() == 1, seed, selected: -1, ..Default::default() };
+            if screen == Screen::Enchanting {
+                inv.menu.bookshelves = crate::game::workstation::bookshelves(game, p);
+            }
+            inv.update_craft(&game.data);
+            drop(inv);
+            for t in thrown {
+                self.throw(t, false);
+            }
+        }
+        let menu = Registries::get().id("minecraft:menu", screen.menu()).unwrap_or(2);
+        let mut b = Vec::new();
+        b.vi(id as i32).vi(menu).raw(&text_nbt(title));
+        self.send("open_screen", &b);
+        game.send_inventory(&self.me);
+        if screen == Screen::Beacon {
+            game.send_props(&self.me, &crate::game::workstation::beacon_props(game, p));
+        } else {
+            let props = self.me.inv.lock().menu.props.clone();
+            game.send_props(&self.me, &props);
+        }
+    }
+
+    /// Apply the side effects a menu action queued, then sync the menu.
+    fn menu_events(&mut self) {
+        use crate::game::menu::MenuEvent;
+        let st = self.st.clone();
+        let game = &st.game;
+        let (events, pos) = {
+            let mut inv = self.me.inv.lock();
+            (std::mem::take(&mut inv.menu.events), inv.menu.pos)
+        };
+        let centre = [pos[0] as f64 + 0.5, pos[1] as f64 + 0.5, pos[2] as f64 + 0.5];
+        let creative = self.gamemode() == 1;
+        let mut refresh = false;
+        for e in events {
+            match e {
+                MenuEvent::Levels(n) => self.me.vit.lock().give_levels(n),
+                MenuEvent::Enchanted(n) => {
+                    if !creative {
+                        self.me.vit.lock().give_levels(-n);
+                    }
+                    let mut inv = self.me.inv.lock();
+                    inv.enchant_seed = rand::random();
+                    inv.menu.seed = inv.enchant_seed;
+                    refresh = true;
+                }
+                MenuEvent::Sound(s) => game.play_sound(s, 4, centre, 1.0, rand::random::<f32>() * 0.1 + 0.9),
+                MenuEvent::XpOrbs(n) => game.award_xp_orbs(centre, n),
+                MenuEvent::AnvilUsed => crate::game::workstation::anvil_used(game, pos, creative),
+                MenuEvent::Stat(_) => {}
+            }
+        }
+        let props = {
+            let mut inv = self.me.inv.lock();
+            inv.menu.xp_level = self.me.vit.lock().xp_level;
+            if refresh {
+                inv.update_craft(&game.data);
+            }
+            inv.menu.props.clone()
+        };
+        game.send_props(&self.me, &props);
+    }
+
+    fn menu_button(&mut self, window: i32, id: i32) {
+        let st = self.st.clone();
+        let game = &st.game;
+        let ok = {
+            let mut inv = self.me.inv.lock();
+            if window != inv.current_window() as i32 || window == 0 {
+                return;
+            }
+            inv.menu.creative = self.gamemode() == 1;
+            inv.menu.xp_level = self.me.vit.lock().xp_level;
+            crate::game::menu::button(&mut inv, &game.data, id)
+        };
+        if ok {
+            self.menu_events();
+        }
+        game.flush_inventory(&self.me);
+    }
+
+    fn rename_item(&mut self, name: String) {
+        let st = self.st.clone();
+        let game = &st.game;
+        {
+            let mut inv = self.me.inv.lock();
+            if !matches!(inv.window, crate::game::inventory::Window::Container(_, crate::game::blockentity::Screen::Anvil, _)) {
+                return;
+            }
+            // AnvilMenu.validateName: at most 50 characters
+            if name.chars().count() > 50 {
+                return;
+            }
+            inv.menu.rename = Some(name);
+            inv.menu.creative = self.gamemode() == 1;
+            inv.menu.xp_level = self.me.vit.lock().xp_level;
+            inv.update_craft(&game.data);
+        }
+        let props = self.me.inv.lock().menu.props.clone();
+        game.send_props(&self.me, &props);
+        game.flush_inventory(&self.me);
     }
 
     fn on_place(&mut self, hand: i32, pos: (i32, i32, i32), face: i32, cursor: (f32, f32, f32), seq: i32) -> Flow {
@@ -2289,7 +2455,7 @@ impl Session {
                     Some((k, sc, t)) => Use::Open(k, sc, t),
                     None => Use::Pass,
                 }
-            } else if gm == 2 && !matches!(crate::game::block::class(clicked), crate::game::block::Class::Door | crate::game::block::Class::TrapDoor | crate::game::block::Class::FenceGate | crate::game::block::Class::Lever | crate::game::block::Class::Button | crate::game::block::Class::Bed | crate::game::block::Class::Chest | crate::game::block::Class::TrappedChest) && crate::game::blockentity::screen_of(clicked.name()).is_none() && clicked.name() != "crafting_table" {
+            } else if gm == 2 && !matches!(crate::game::block::class(clicked), crate::game::block::Class::Door | crate::game::block::Class::TrapDoor | crate::game::block::Class::FenceGate | crate::game::block::Class::Lever | crate::game::block::Class::Button | crate::game::block::Class::Bed | crate::game::block::Class::Chest | crate::game::block::Class::TrappedChest) && crate::game::blockentity::screen_of(clicked.name()).is_none() && crate::game::blockentity::workstation_of(clicked.name()).is_none() && clicked.name() != "crafting_table" {
                 Use::Pass
             } else {
                 use_block(game, [pos.0, pos.1, pos.2], clicked, &cx)

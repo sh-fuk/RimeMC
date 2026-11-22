@@ -133,6 +133,9 @@ pub fn use_block(g: &Game, p: [i32; 3], s: BlockState, cx: &Ctx) -> Use {
     if name == "crafting_table" {
         return Use::Crafting;
     }
+    if let Some((sc, t)) = crate::game::blockentity::workstation_of(name) {
+        return Use::Open(p, sc, t);
+    }
     if let Some((sc, t)) = crate::game::blockentity::screen_of(name) {
         if name.ends_with("shulker_box") && !shulker_can_open(g, p, s) {
             return Use::Consumed;

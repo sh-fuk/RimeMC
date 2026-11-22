@@ -62,6 +62,16 @@ pub enum Screen {
     Grid3,
     Hopper,
     Furnace(CookKind),
+    Brewing,
+    // workstation menus (inputs live in the menu, not a block entity)
+    Enchanting,
+    Anvil,
+    Smithing,
+    Grindstone,
+    Stonecutter,
+    Loom,
+    Cartography,
+    Beacon,
 }
 
 impl Screen {
@@ -71,7 +81,17 @@ impl Screen {
             Screen::Grid3 => 9,
             Screen::Hopper => 5,
             Screen::Furnace(_) => 3,
+            Screen::Brewing => 5,
+            Screen::Enchanting | Screen::Stonecutter => 2,
+            Screen::Anvil | Screen::Grindstone | Screen::Cartography => 3,
+            Screen::Smithing | Screen::Loom => 4,
+            Screen::Beacon => 1,
         }
+    }
+
+    /// Menus whose slots are not stored in a block entity.
+    pub fn transient(self) -> bool {
+        matches!(self, Screen::Enchanting | Screen::Anvil | Screen::Smithing | Screen::Grindstone | Screen::Stonecutter | Screen::Loom | Screen::Cartography | Screen::Beacon)
     }
 
     /// `minecraft:menu` registry key
@@ -88,6 +108,15 @@ impl Screen {
             Screen::Furnace(CookKind::Blasting) => "minecraft:blast_furnace",
             Screen::Furnace(CookKind::Smoking) => "minecraft:smoker",
             Screen::Furnace(_) => "minecraft:furnace",
+            Screen::Brewing => "minecraft:brewing_stand",
+            Screen::Enchanting => "minecraft:enchantment",
+            Screen::Anvil => "minecraft:anvil",
+            Screen::Smithing => "minecraft:smithing",
+            Screen::Grindstone => "minecraft:grindstone",
+            Screen::Stonecutter => "minecraft:stonecutter",
+            Screen::Loom => "minecraft:loom",
+            Screen::Cartography => "minecraft:cartography_table",
+            Screen::Beacon => "minecraft:beacon",
         }
     }
 }
@@ -104,6 +133,22 @@ pub fn screen_of(block: &str) -> Option<(Screen, &'static str)> {
         "blast_furnace" => (Screen::Furnace(CookKind::Blasting), "Blast Furnace"),
         "smoker" => (Screen::Furnace(CookKind::Smoking), "Smoker"),
         n if n.ends_with("shulker_box") => (Screen::Rows(3), "Shulker Box"),
+        "brewing_stand" => (Screen::Brewing, "Brewing Stand"),
+        _ => return None,
+    })
+}
+
+/// Screen and title of a workstation block (no stored slots).
+pub fn workstation_of(block: &str) -> Option<(Screen, &'static str)> {
+    Some(match block {
+        "enchanting_table" => (Screen::Enchanting, "Enchant"),
+        "anvil" | "chipped_anvil" | "damaged_anvil" => (Screen::Anvil, "Repair & Name"),
+        "smithing_table" => (Screen::Smithing, "Upgrade Gear"),
+        "grindstone" => (Screen::Grindstone, "Repair & Disenchant"),
+        "stonecutter" => (Screen::Stonecutter, "Stonecutter"),
+        "loom" => (Screen::Loom, "Loom"),
+        "cartography_table" => (Screen::Cartography, "Cartography Table"),
+        "beacon" => (Screen::Beacon, "Beacon"),
         _ => return None,
     })
 }
@@ -203,7 +248,7 @@ pub fn unpack_loot(t: &mut Tag, size: usize, data: &GameData) -> bool {
         let i = rng.gen_range(0..split.len());
         let mut s = split.remove(i);
         let half = rng.gen_range(1..=(s.count / 2).max(1));
-        let part = Stack::new(s.item, half);
+        let part = Stack { count: half, ..s };
         s.count -= half;
         if s.count > 1 && rng.gen_bool(0.5) {
             split.push(s);

@@ -25,6 +25,8 @@ pub mod entity;
 pub mod fluid;
 pub mod interact;
 pub mod inventory;
+pub mod menu;
+pub mod workstation;
 pub mod playerdata;
 pub mod survival;
 
@@ -758,6 +760,8 @@ impl Game {
             self.furnaces.lock().insert(p);
         }
         self.world.set_block_entity(p, Some(t), false);
+        // BlockEntity.setChanged: comparators read the new contents
+        self.update_neighbour_for_output_signal(p, self.bs(p));
         self.resync_viewers(p, except);
     }
 
@@ -770,12 +774,30 @@ impl Game {
             }
             let mut inv = pl.inv.lock();
             if let inventory::Window::Container(_, sc, q) = inv.window {
-                if q == p {
-                    inv.ext = blockentity::items(&t, sc.size());
+                if sc.transient() {
+                    continue;
+                }
+                // a double chest is keyed by its first half
+                let viewing = q == p || (matches!(sc, blockentity::Screen::Rows(6)) && block::container::parts(self, q).contains(&p));
+                if viewing {
+                    inv.ext = match self.container_slots(q) {
+                        Some(s) if s.len() == sc.size() => s,
+                        _ => blockentity::items(&t, sc.size()),
+                    };
                     drop(inv);
                     self.send_inventory(&pl);
                 }
             }
+        }
+    }
+
+    /// `container_set_data` for the open window of one viewer.
+    pub fn send_props(&self, pl: &Player, props: &[i32]) {
+        let id = pl.inv.lock().current_window();
+        for (prop, v) in props.iter().enumerate() {
+            let mut b = Vec::new();
+            b.vi(id as i32).i16(prop as i16).i16(*v as i16);
+            pl.send(self.encode("container_set_data", &b));
         }
     }
 

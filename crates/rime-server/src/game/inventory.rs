@@ -33,11 +33,15 @@ pub struct Inventory {
     drag: Option<(u8, Vec<i16>)>,
     /// furnace shift-click target decided by the caller (needs recipes)
     quick_furnace_target: Option<Vec<usize>>,
+    /// state of an open workstation menu
+    pub menu: super::menu::MenuState,
+    /// `Player.enchantmentSeed`
+    pub enchant_seed: i32,
 }
 
 impl Default for Inventory {
     fn default() -> Self {
-        Self { slots: [None; SLOTS], table: [None; 10], cursor: None, state_id: 0, window: Window::Player, ext: Vec::new(), dirty: Vec::new(), drag: None, quick_furnace_target: None }
+        Self { slots: [None; SLOTS], table: [None; 10], cursor: None, state_id: 0, window: Window::Player, ext: Vec::new(), dirty: Vec::new(), drag: None, quick_furnace_target: None, menu: Default::default(), enchant_seed: rand::random() }
     }
 }
 
@@ -89,7 +93,7 @@ impl Inventory {
         for i in (36..45).chain(9..36) {
             if self.slots[i].is_none() {
                 let n = st.count.min(max);
-                self.set(i, Some(Stack::new(st.item, n)));
+                self.set(i, Some(Stack { count: n, ..st }));
                 st.count -= n;
                 if st.count == 0 {
                     return 0;
@@ -126,8 +130,26 @@ impl Inventory {
                 }
                 _ => true,
             },
+            Window::Container(_, Screen::Brewing, _) => {
+                let n = Items::get().name(item);
+                match slot {
+                    0..=2 => matches!(n, "potion" | "splash_potion" | "lingering_potion" | "glass_bottle"),
+                    3 => super::workstation::is_ingredient(item),
+                    4 => n == "blaze_powder",
+                    _ => true,
+                }
+            }
+            Window::Container(_, sc, _) if sc.transient() && slot < sc.size() => super::menu::may_place(sc, slot, item, data),
             Window::Container(_, _, _) => true,
             _ => true,
+        }
+    }
+
+    /// The result slot of the open window.
+    fn result_index(&self) -> Option<usize> {
+        match self.window {
+            Window::Player | Window::Crafting(_) => Some(0),
+            Window::Container(_, sc, _) => super::menu::result_slot(sc),
         }
     }
 
@@ -151,7 +173,7 @@ impl Inventory {
     }
 
     /// Window slot → storage. Crafting table: 0..=9 table, 10..=45 → player 9..=44.
-    fn get_w(&self, slot: usize) -> Option<Stack> {
+    pub(crate) fn get_w(&self, slot: usize) -> Option<Stack> {
         match self.window {
             Window::Player => self.slots[slot],
             Window::Crafting(_) if slot <= 9 => self.table[slot],
@@ -169,7 +191,7 @@ impl Inventory {
         }
     }
 
-    fn set_w(&mut self, slot: usize, s: Option<Stack>) {
+    pub(crate) fn set_w(&mut self, slot: usize, s: Option<Stack>) {
         let s = s.filter(|s| s.count > 0);
         match self.window {
             Window::Player => self.set(slot, s),
@@ -208,7 +230,14 @@ impl Inventory {
     }
 
     fn is_result(&self, slot: usize) -> bool {
-        slot == 0 && self.container().is_none()
+        self.result_index() == Some(slot)
+    }
+
+    fn menu_screen(&self) -> Option<Screen> {
+        match self.window {
+            Window::Container(_, sc, _) if sc.transient() => Some(sc),
+            _ => None,
+        }
     }
 
     fn is_armor(&self, slot: usize) -> bool {
@@ -217,6 +246,10 @@ impl Inventory {
 
     /// Recompute the crafting result slot.
     pub fn update_craft(&mut self, data: &GameData) {
+        if self.menu_screen().is_some() {
+            super::menu::slots_changed(self, data);
+            return;
+        }
         let (cells, size) = self.grid();
         if cells.is_empty() {
             return;
@@ -227,6 +260,9 @@ impl Inventory {
     }
 
     fn take_result(&mut self, data: &GameData) -> Option<Stack> {
+        if self.menu_screen().is_some() {
+            return super::menu::take(self, data);
+        }
         let r = self.get_w(0)?;
         let (cells, _) = self.grid();
         for i in cells {
@@ -272,6 +308,12 @@ impl Inventory {
                 let n = sc.size();
                 if slot < n {
                     (n..n + 36).rev().collect()
+                } else if sc.transient() || sc == Screen::Brewing {
+                    match &self.quick_furnace_target {
+                        Some(t) if !t.is_empty() => t.clone(),
+                        _ if slot < n + 27 => (n + 27..n + 36).collect(),
+                        _ => (n..n + 27).collect(),
+                    }
                 } else {
                     (0..n).collect()
                 }
@@ -317,7 +359,7 @@ impl Inventory {
                             out.thrown.push(c);
                             self.cursor = None;
                         } else {
-                            out.thrown.push(Stack::new(c.item, 1));
+                            out.thrown.push(Stack { count: 1, ..c });
                             c.count -= 1;
                             self.cursor = (c.count > 0).then_some(c);
                         }
@@ -329,7 +371,7 @@ impl Inventory {
                 }
                 let s = slot as usize;
                 if self.is_result(s) {
-                    if let Some(r) = self.get_w(0) {
+                    if let Some(r) = self.get_w(s) {
                         match self.cursor {
                             None => self.cursor = self.take_result(data),
                             Some(mut c) if c.same(&r) && c.count as u16 + r.count as u16 <= c.max() as u16 => {
@@ -353,7 +395,7 @@ impl Inventory {
                     }
                     (Some(mut c), None, _) => {
                         let take = c.count.div_ceil(2);
-                        self.cursor = Some(Stack::new(c.item, take));
+                        self.cursor = Some(Stack { count: take, ..c });
                         c.count -= take;
                         self.set_w(s, Some(c));
                     }
@@ -363,7 +405,7 @@ impl Inventory {
                         }
                         let n = if b == 0 { k.count } else { 1 };
                         let n = n.min(if self.is_armor(s) { 1 } else { k.max() });
-                        self.set_w(s, Some(Stack::new(k.item, n)));
+                        self.set_w(s, Some(Stack { count: n, ..k }));
                         k.count -= n;
                         self.cursor = (k.count > 0).then_some(k);
                     }
@@ -388,8 +430,8 @@ impl Inventory {
                 if self.is_result(s) {
                     // craft as many as fit
                     for _ in 0..64 {
-                        let Some(r) = self.get_w(0) else { break };
-                        let targets = self.quick_targets(0);
+                        let Some(r) = self.get_w(s) else { break };
+                        let targets = self.quick_targets(s);
                         if !self.fits(r, &targets) {
                             break;
                         }
@@ -409,10 +451,17 @@ impl Inventory {
                             }
                         }
                     }
+                    if let Window::Container(_, sc, _) = self.window {
+                        if (sc.transient() || sc == Screen::Brewing) && s >= sc.size() {
+                            let t: Vec<usize> = if sc == Screen::Brewing { (0..5).filter(|&i| self.may_place(i, st.item, data)).collect() } else { super::menu::quick_input(sc, st.item, data) };
+                            // the menu's input slots only take a single item where vanilla limits them
+                            self.quick_furnace_target = Some(t);
+                        }
+                    }
                     let targets = self.quick_targets(s);
                     self.quick_furnace_target = None;
                     let left = self.move_into(st, &targets);
-                    self.set_w(s, (left > 0).then_some(Stack::new(st.item, left)));
+                    self.set_w(s, (left > 0).then_some(Stack { count: left, ..st }));
                 }
             }
             // ---- number key swap (button 0-8 hotbar, 40 offhand)
@@ -454,7 +503,7 @@ impl Inventory {
             // ---- creative middle-click clone
             3 if valid && creative && self.cursor.is_none() => {
                 if let Some(st) = self.get_w(slot as usize) {
-                    self.cursor = Some(Stack::new(st.item, st.max()));
+                    self.cursor = Some(Stack { count: st.max(), ..st });
                 }
             }
             // ---- drop key (Q / ctrl+Q)
@@ -468,7 +517,7 @@ impl Inventory {
                         return out;
                     }
                     let n = if button == 1 { st.count } else { 1 };
-                    out.thrown.push(Stack::new(st.item, n));
+                    out.thrown.push(Stack { count: n, ..st });
                     st.count -= n;
                     self.set_w(s, Some(st));
                 }
@@ -480,8 +529,9 @@ impl Inventory {
                 match stage {
                     0 => self.drag = Some((kind, Vec::new())),
                     1 => {
+                        let res = valid && self.is_result(slot as usize);
                         if let Some((k, list)) = &mut self.drag {
-                            if *k == kind && valid && !list.contains(&slot) && slot != 0 {
+                            if *k == kind && valid && !list.contains(&slot) && !res {
                                 list.push(slot);
                             }
                         }
@@ -511,7 +561,7 @@ impl Inventory {
                                 let cur = self.get_w(s).map(|x| x.count).unwrap_or(0);
                                 let room = c.max().saturating_sub(cur);
                                 let n = if k == 2 { room } else { per.min(room).min(c.count) };
-                                self.set_w(s, Some(Stack::new(c.item, cur + n)));
+                                self.set_w(s, Some(Stack { count: cur + n, ..c }));
                                 if k != 2 {
                                     c.count -= n;
                                 }
@@ -528,7 +578,7 @@ impl Inventory {
                     let first = if self.container().is_some() { 0 } else { 1 };
                     for pass in 0..2 {
                         for s in first..len as usize {
-                            if self.container().is_some_and(|(sc, _)| matches!(sc, Screen::Furnace(_))) && s == 2 {
+                            if self.container().is_some() && (self.is_result(s) || matches!(self.window, Window::Container(_, Screen::Furnace(_), _)) && s == 2) {
                                 continue;
                             }
                             if c.count >= c.max() {
@@ -582,19 +632,31 @@ impl Inventory {
                 self.set_w(i, None);
             }
         }
-        self.set_w(0, None);
+        if let Some(sc) = self.menu_screen() {
+            let r = super::menu::result_slot(sc);
+            for i in 0..sc.size() {
+                if Some(i) != r {
+                    if let Some(s) = self.get_w(i) {
+                        back.push(s);
+                    }
+                }
+            }
+        } else if self.container().is_none() {
+            self.set_w(0, None);
+        }
         if let Some(c) = self.cursor.take() {
             back.push(c);
         }
         self.window = Window::Player;
         self.table = [None; 10];
         self.ext.clear();
+        self.menu = Default::default();
         self.update_craft(data);
         let mut thrown = Vec::new();
         for s in back {
             let left = self.add(s, selected);
             if left > 0 {
-                thrown.push(Stack::new(s.item, left));
+                thrown.push(Stack { count: left, ..s });
             }
         }
         thrown

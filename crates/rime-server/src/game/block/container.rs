@@ -655,6 +655,7 @@ pub fn tick_block_entities(g: &Game) {
     for p in hops {
         hopper_tick(g, p);
     }
+    crate::game::workstation::tick(g);
 }
 
 /// a block entity that ticks was placed
@@ -666,6 +667,6 @@ pub fn ticker_placed(g: &Game, p: [i32; 3], s: BlockState) {
         "furnace" | "blast_furnace" | "smoker" => {
             g.furnaces.lock().insert(p);
         }
-        _ => {}
+        _ => crate::game::workstation::ticker_placed(g, p, s),
     }
 }

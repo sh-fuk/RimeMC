@@ -118,6 +118,48 @@ pub struct GameData {
     pub recipes: Vec<Recipe>,
     /// furnace / blast furnace / smoker / campfire recipes
     pub cooking: Vec<Cooking>,
+    /// stonecutter, smithing and other workstation data
+    pub menus: MenuData,
+}
+
+/// `SmithingTransformRecipe` / `SmithingTrimRecipe`
+pub enum Smithing {
+    Transform { template: Ingredient, base: Ingredient, addition: Ingredient, result: Stack },
+    Trim { template: Ingredient, base: Ingredient, addition: Ingredient, pattern: String },
+}
+
+#[derive(Default)]
+pub struct MenuData {
+    /// (input, result) in recipe-id order
+    pub stonecutting: Vec<(Ingredient, Stack)>,
+    pub smithing: Vec<Smithing>,
+    /// tags in file order (`#` references expanded): "banner_pattern/no_item_required"…
+    pub ordered_tags: HashMap<String, Vec<String>>,
+}
+
+/// A tag's entries in declaration order, nested tags expanded.
+pub fn ordered_tag(v: &VanillaData, registry: &str, name: &str, depth: u32) -> Vec<String> {
+    let rel = format!("minecraft/tags/{registry}/{}.json", strip(name));
+    let Ok(j) = v.read_json(&rel) else { return Vec::new() };
+    let mut out = Vec::new();
+    for e in j.get("values").and_then(|x| x.as_array()).into_iter().flatten() {
+        let id = e.as_str().or_else(|| e.get("id").and_then(|x| x.as_str())).unwrap_or("");
+        if let Some(t) = id.strip_prefix('#') {
+            if depth < 8 {
+                for x in ordered_tag(v, registry, t, depth + 1) {
+                    if !out.contains(&x) {
+                        out.push(x);
+                    }
+                }
+            }
+        } else if !id.is_empty() {
+            let x = strip(id).to_string();
+            if !out.contains(&x) {
+                out.push(x);
+            }
+        }
+    }
+    out
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,20 +272,43 @@ impl GameData {
             }
         }
         let _ = SPAWNERS.set(spawners.clone());
-        let mut d = GameData { item_tags, block_tags, entity_tags, spawners, loot, recipes: Vec::new(), cooking: Vec::new() };
+        let mut d = GameData { item_tags, block_tags, entity_tags, spawners, loot, recipes: Vec::new(), cooking: Vec::new(), menus: MenuData::default() };
         for (_, path) in v.entries("recipe") {
             let json: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
             if let Some(r) = d.parse_recipe(&json) {
                 d.recipes.push(r);
             } else if let Some(c) = d.parse_cooking(&json) {
                 d.cooking.push(c);
+            } else {
+                d.parse_menu_recipe(&json);
+            }
+        }
+        for (reg, dir) in [("banner_pattern", "banner_pattern"), ("enchantment", "enchantment")] {
+            let base = v.path(&format!("minecraft/tags/{dir}"));
+            let mut files = Vec::new();
+            fn walk(base: &std::path::Path, cur: &std::path::Path, out: &mut Vec<String>) {
+                let Ok(rd) = std::fs::read_dir(cur) else { return };
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk(base, &p, out);
+                    } else if p.extension().is_some_and(|x| x == "json") {
+                        let rel = p.strip_prefix(base).unwrap().with_extension("");
+                        out.push(rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/"));
+                    }
+                }
+            }
+            walk(&base, &base, &mut files);
+            for f in files {
+                let list = ordered_tag(v, reg, &f, 0);
+                d.menus.ordered_tags.insert(format!("{reg}/{f}"), list);
             }
         }
         Ok(d)
     }
 
     pub fn empty() -> Self {
-        GameData { item_tags: HashMap::new(), block_tags: HashMap::new(), entity_tags: HashMap::new(), spawners: HashMap::new(), loot: HashMap::new(), recipes: Vec::new(), cooking: Vec::new() }
+        GameData { item_tags: HashMap::new(), block_tags: HashMap::new(), entity_tags: HashMap::new(), spawners: HashMap::new(), loot: HashMap::new(), recipes: Vec::new(), cooking: Vec::new(), menus: MenuData::default() }
     }
 
     pub fn block_in(&self, tag: &str, block: &str) -> bool {
@@ -333,6 +398,40 @@ impl GameData {
         let ctx = LootCtx { block: crate::registry::blocks::AIR, tool: None, data: self, entity: Some(e), explosion: None };
         self.eval_table(t, &ctx, rng, &mut out, 0);
         out
+    }
+
+    fn parse_menu_recipe(&mut self, j: &Value) -> Option<()> {
+        let ty = j.get("type")?.as_str()?;
+        match ty {
+            "minecraft:stonecutting" => {
+                let res = j.get("result")?;
+                let item = Items::get().id(res.get("id")?.as_str()?)?;
+                let count = res.get("count").and_then(|c| c.as_u64()).unwrap_or(1).clamp(1, 64) as u8;
+                let input = self.ingredient(j.get("ingredient")?)?;
+                self.menus.stonecutting.push((input, Stack::new(item, count)));
+            }
+            "minecraft:smithing_transform" => {
+                let res = j.get("result")?;
+                let item = Items::get().id(res.get("id")?.as_str()?)?;
+                let count = res.get("count").and_then(|c| c.as_u64()).unwrap_or(1).clamp(1, 64) as u8;
+                self.menus.smithing.push(Smithing::Transform {
+                    template: self.ingredient(j.get("template")?)?,
+                    base: self.ingredient(j.get("base")?)?,
+                    addition: self.ingredient(j.get("addition")?)?,
+                    result: Stack::new(item, count),
+                });
+            }
+            "minecraft:smithing_trim" => {
+                self.menus.smithing.push(Smithing::Trim {
+                    template: self.ingredient(j.get("template")?)?,
+                    base: self.ingredient(j.get("base")?)?,
+                    addition: self.ingredient(j.get("addition")?)?,
+                    pattern: strip(j.get("pattern")?.as_str()?).to_string(),
+                });
+            }
+            _ => return None,
+        }
+        Some(())
     }
 
     fn parse_recipe(&self, j: &Value) -> Option<Recipe> {
