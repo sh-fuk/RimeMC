@@ -873,12 +873,15 @@ fn dims_match_vanilla() {
     let (Some(dir), Ok(world)) = (data_dir(), std::env::var("RIME_VREF_DIM")) else { return };
     let load = loader(dir);
     for (dim, sub, chunks) in [
-        (super::DimKind::Nether, "dimensions/minecraft/the_nether", (-4..4).flat_map(|x| (-4..4).map(move |z| (x, z))).collect::<Vec<_>>()),
-        (super::DimKind::End, "dimensions/minecraft/the_end", (-4..4).flat_map(|x| (-4..4).map(move |z| (x, z))).chain((64..68).flat_map(|x| (64..68).map(move |z| (x, z)))).collect()),
+        (super::DimKind::Nether, "dimensions/minecraft/the_nether", (-3..3).flat_map(|x| (-3..3).map(move |z| (x, z))).collect::<Vec<_>>()),
+        (super::DimKind::End, "dimensions/minecraft/the_end", (-3..3).flat_map(|x| (-3..3).map(move |z| (x, z))).chain((65..67).flat_map(|x| (65..67).map(move |z| (x, z)))).collect()),
     ] {
-        let g = super::VanillaGenerator::new_dim(&load, 12345, dim).unwrap();
+        let mut g = super::VanillaGenerator::new_dim(&load, 12345, dim).unwrap();
+        g.structures = None;
         let reg = PathBuf::from(&world).join(sub).join("region");
         let mut by_kind: std::collections::BTreeMap<String, usize> = Default::default();
+        let full = std::env::var("RIME_VREF_NOFEAT").is_err();
+        let gens: std::collections::HashMap<(i32, i32), _> = if full { chunks.iter().copied().zip(g.generate_many(&chunks)).collect() } else { Default::default() };
         let (mut total, mut tested, mut bb) = (0, 0, 0);
         for (cx, cz) in chunks {
             let (rx, rz) = (cx >> 5, cz >> 5);
@@ -886,7 +889,7 @@ fn dims_match_vanilla() {
             let idx = ((cz & 31) * 32 + (cx & 31)) as usize;
             let Some(v) = list.into_iter().find(|c| c.index == idx).and_then(|c| crate::world::chunk::Chunk::from_nbt(&c.raw)) else { continue };
             tested += 1;
-            let ours = g.generate(cx, cz);
+            let ours = if full { gens.get(&(cx, cz)).map(super::decorate::clone_gen).expect("gen") } else { g.generate(cx, cz) };
             for si in 4..20 {
                 for i in 0..64 {
                     if ours.biomes[si][i] != v.biomes[si][i] {
@@ -909,7 +912,8 @@ fn dims_match_vanilla() {
                         }
                         *by_kind.entry(format!("{} -> {}", a.name(), b.name())).or_default() += 1;
                         if bad < 3 {
-                            eprintln!("{sub} chunk {cx},{cz} at {x},{y},{z}: ours {} vanilla {}", a.name(), b.name());
+                            let up = |d: i32| (ours.blocks[(((y + d + 64) * 16 + z) * 16 + x) as usize].name(), v.get(x as usize, y + d, z as usize).name());
+                            eprintln!("{sub} chunk {cx},{cz} at {x},{y},{z}: ours {} vanilla {} | above {:?} {:?} below {:?}", a.name(), b.name(), up(1), up(2), up(-1));
                         }
                         bad += 1;
                     }

@@ -308,6 +308,6 @@ fn fix_leaves<'a>(lib: &Lib, c: (i32, i32), chunk: &dyn Fn((i32, i32)) -> &'a Ve
     }
 }
 
-fn clone_gen(g: &Generated) -> Generated {
+pub(crate) fn clone_gen(g: &Generated) -> Generated {
     Generated { blocks: g.blocks.clone(), biomes: g.biomes.clone(), heights: g.heights, fluid_ticks: g.fluid_ticks.clone(), block_entities: g.block_entities.clone(), entities: g.entities.clone() }
 }

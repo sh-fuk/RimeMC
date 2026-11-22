@@ -86,6 +86,8 @@ pub fn kind(s: BlockState) -> Kind {
 
 /// Block tags used by survival rules.
 pub struct Tags {
+    /// blocks with their own `supports_<name>` tag (nether plants, wither rose)
+    own: Vec<(&'static str, BlockSet)>,
     vegetation: BlockSet,
     dry: BlockSet,
     azalea: BlockSet,
@@ -104,7 +106,12 @@ pub struct Tags {
 
 impl Tags {
     pub fn load(b: &mut Builder) -> Result<Tags> {
+        let mut own = Vec::new();
+        for n in ["crimson_roots", "warped_roots", "nether_sprouts", "crimson_fungus", "warped_fungus", "wither_rose"] {
+            own.push((n, b.tag(&format!("supports_{n}"))?));
+        }
         Ok(Tags {
+            own,
             vegetation: b.tag("supports_vegetation")?,
             dry: b.tag("supports_dry_vegetation")?,
             azalea: b.tag("supports_azalea")?,
@@ -137,6 +144,9 @@ const HORIZONTAL: [[i32; 3]; 4] = [[0, 0, -1], [1, 0, 0], [0, 0, 1], [-1, 0, 0]]
 pub fn can_survive(lv: &Region, s: BlockState, p: [i32; 3]) -> bool {
     let t = &lv.lib.tags;
     let below = || lv.get(add(p, [0, -1, 0]));
+    if let Some((_, set)) = t.own.iter().find(|(n, _)| *n == s.name()) {
+        return set.contains(below());
+    }
     match kind(s) {
         Kind::Always => true,
         Kind::Vegetation => t.vegetation.contains(below()),
