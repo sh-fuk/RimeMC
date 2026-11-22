@@ -16,6 +16,8 @@ pub enum EKind {
     Lightning { life: i32, flashes: i32, cause: Option<i32>, visual: bool, hit: Vec<i32> },
     /// `EvokerFangs`
     Fangs { owner: Option<i32>, warmup: i32, life: i32, sent: bool, yaw: f32 },
+    /// `PrimedTnt`
+    Tnt { fuse: i32, owner: Option<i32> },
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +54,7 @@ impl Entity {
             EKind::Cloud(c) => (c.radius as f64, 0.5),
             EKind::Lightning { .. } => (0.0, 0.0),
             EKind::Fangs { .. } => (0.25, 0.8),
+            EKind::Tnt { .. } => (0.49, 0.98),
         }
     }
 }
@@ -150,6 +153,16 @@ pub fn physics(e: &mut Entity, cell: &dyn Fn(i32, i32, i32) -> Cell, friction_be
         EKind::Falling { .. } => {
             for v in &mut e.vel {
                 *v *= 0.98;
+            }
+        }
+        EKind::Tnt { .. } => {
+            for v in &mut e.vel {
+                *v *= 0.98;
+            }
+            if ground {
+                e.vel[0] *= 0.7;
+                e.vel[1] *= -0.5;
+                e.vel[2] *= 0.7;
             }
         }
         _ => {}

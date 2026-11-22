@@ -209,6 +209,8 @@ pub enum PAct {
     Pickup { eid: i32, player: i32 },
     Sound { name: &'static str, pos: [f64; 3], volume: f32, pitch: f32 },
     Cloud { owner: Option<i32>, potion: Option<String>, scale: f32, hits: Vec<i32> },
+    /// `BlockBehaviour.onProjectileHit`
+    HitBlock { hit: crate::game::physics::BlockHit, arrow: bool, fire: bool, owner: Option<i32> },
 }
 
 /// What projectile ticks can collide with.
@@ -416,6 +418,7 @@ impl Game {
             }
             (None, Some(b)) => {
                 e.pos = b.pos;
+                acts.push(PAct::HitBlock { hit: b.clone(), arrow: false, fire: p.on_fire, owner: p.owner });
                 acts.push(PAct::Land { eid: e.eid, proj: p.clone(), pos: b.pos, vel: e.vel, target: None, block: Some(b) });
                 true
             }
@@ -475,6 +478,7 @@ impl Game {
                 return true;
             }
             (None, Some(b)) => {
+                acts.push(PAct::HitBlock { hit: b.clone(), arrow: false, fire: p.on_fire, owner: p.owner });
                 acts.push(PAct::Land { eid: e.eid, proj: p.clone(), pos: b.pos, vel: e.vel, target: None, block: Some(b) });
                 return true;
             }
@@ -632,6 +636,7 @@ impl Game {
                 e.pos = to;
                 if let Some(b) = block {
                     // onHitBlock
+                    acts.push(PAct::HitBlock { hit: b.clone(), arrow: true, fire: p.on_fire, owner: p.owner });
                     p.stuck = Some((b.block, b.state));
                     let s = [crate::game::physics::jsign(e.vel[0]) * 0.05, crate::game::physics::jsign(e.vel[1]) * 0.05, crate::game::physics::jsign(e.vel[2]) * 0.05];
                     e.pos = [e.pos[0] - s[0], e.pos[1] - s[1], e.pos[2] - s[2]];
@@ -762,6 +767,7 @@ impl Game {
                 PAct::Pickup { eid, player } => self.pickup_projectile(eid, player),
                 PAct::ArrowHit { eid, proj, target, pos, vel, removed, chunk } => self.arrow_hit(eid, *proj, target, pos, vel, removed, chunk, &mut rng),
                 PAct::Land { eid, proj, pos, vel, target, block } => self.throwable_land(eid, *proj, pos, vel, target, block, &mut rng),
+                PAct::HitBlock { hit, arrow, fire, owner } => self.projectile_hit_block(&hit, arrow, fire, owner),
                 PAct::Cloud { owner, potion, scale, hits } => {
                     let effects = potion.as_deref().map(potion_effects).unwrap_or(&[]).to_vec();
                     for t in hits {
@@ -1358,5 +1364,31 @@ mod tests {
         assert!((v[2] - 3.0).abs() < 1e-6 && v[0].abs() < 1e-6 && v[1].abs() < 1e-6);
         let v = shoot_vector(0.0, 90.0, 0.0, 1.0, 0.0, &mut rng);
         assert!((v[0] + 1.0).abs() < 1e-6, "{v:?}");
+    }
+}
+
+impl Game {
+    /// `onProjectileHit` of the blocks that react to projectiles
+    pub fn projectile_hit_block(&self, hit: &crate::game::physics::BlockHit, arrow: bool, fire: bool, owner: Option<i32>) {
+        use crate::game::block::{self, Class};
+        let _lv = self.level.lock();
+        let p = hit.block;
+        let s = self.bs(p);
+        match block::class(s) {
+            Class::Target => block::redstone::target_hit(self, p, s, hit.pos, hit.face, arrow),
+            Class::Tnt if fire => {
+                self.prime_tnt(p, owner);
+                self.remove_block(p, false);
+            }
+            Class::Bell => {
+                block::sound(self, p, "minecraft:block.bell.use", 2.0, 1.0);
+                self.block_event(p, s, 1, hit.face as i32);
+            }
+            _ => {
+                if fire && s.name().ends_with("campfire") && block::prop(s, "lit") == "false" && block::prop(s, "waterlogged") != "true" {
+                    self.set_block(p, block::with_bool(s, "lit", true), crate::game::level::flags::ALL | 8);
+                }
+            }
+        }
     }
 }

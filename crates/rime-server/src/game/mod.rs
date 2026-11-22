@@ -5,6 +5,10 @@
 //! so sending a chunk to N players costs one serialisation, not N.
 
 pub mod ai;
+pub mod block;
+pub mod blockhelp;
+pub use blockhelp::chunk_min_max_y;
+pub mod level;
 pub mod blockentity;
 pub mod combat;
 pub mod consume;
@@ -283,6 +287,21 @@ impl World {
         }
     }
 
+    /// Positions of loaded block entities whose id is in `ids`.
+    pub fn block_entities_with(&self, ids: &[&str]) -> Vec<[i32; 3]> {
+        let mut out = Vec::new();
+        for sh in self.shards.iter() {
+            for e in sh.lock().values() {
+                for (p, t) in &e.chunk.block_entities {
+                    if t.get("id").and_then(|v| v.as_str()).is_some_and(|id| ids.contains(&id.trim_start_matches("minecraft:"))) {
+                        out.push(*p);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// The block entity at `p` (vanilla NBT), if its chunk is loaded.
     pub fn block_entity(&self, p: [i32; 3]) -> Option<crate::nbt::Tag> {
         let s = self.shards[shard(p[0] >> 4, p[2] >> 4)].lock();
@@ -490,11 +509,14 @@ pub enum TickKind {
     Gravity,
     /// `FireBlock.tick`
     Fire,
+    /// `BlockBehaviour.tick` of the block type with this id
+    Block(u16),
 }
 
 #[derive(Default)]
 struct Ticks {
-    queue: BTreeMap<u64, Vec<([i32; 3], TickKind)>>,
+    /// (game time, priority) -> ticks in scheduling order
+    queue: BTreeMap<(u64, i8), Vec<([i32; 3], TickKind)>>,
     pending: HashSet<([i32; 3], TickKind)>,
 }
 
@@ -512,16 +534,19 @@ pub struct Game {
     entities: Mutex<HashMap<i32, Entity>>,
     ticks: Mutex<Ticks>,
     /// furnaces that may be burning or cooking
-    furnaces: Mutex<HashSet<[i32; 3]>>,
+    pub(crate) furnaces: Mutex<HashSet<[i32; 3]>>,
     now: AtomicU64,
     /// added to `now` by /time set
     time_offset: AtomicU64,
     next_eid: AtomicI32,
     pub threshold: i32,
     pub weather: Mutex<weather::Weather>,
+    /// block update state; held for the whole game tick and by any thread
+    /// changing blocks, so updates never interleave
+    pub(crate) level: parking_lot::ReentrantMutex<std::cell::RefCell<level::LevelState>>,
 }
 
-struct GW<'a>(&'a Game);
+pub(crate) struct GW<'a>(pub(crate) &'a Game);
 
 impl FluidWorld for GW<'_> {
     fn block(&self, p: [i32; 3]) -> Option<BlockState> {
@@ -549,6 +574,7 @@ impl Game {
             next_eid: AtomicI32::new(1),
             threshold: compression_threshold,
             weather: Mutex::new(weather::Weather::default()),
+            level: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(level::LevelState::default())),
         }
     }
 
@@ -671,30 +697,23 @@ impl Game {
     }
 
     pub fn change_block(&self, p: [i32; 3], b: BlockState, drops: bool, tool: Option<i32>) -> Option<BlockState> {
-        let old = self.world.set_block(p[0], p[1], p[2], b)?;
+        let _g = self.level.lock();
+        let old = self.world.get_block(p[0], p[1], p[2])?;
         if old == b {
             return Some(old);
-        }
-        self.broadcast_block(p[0], p[1], p[2], b);
-        if b.name() == "fire" && old.name() != "fire" {
-            // FireBlock.onPlace
-            self.schedule(p, TickKind::Fire, 30 + rand::thread_rng().gen_range(0..10));
         }
         if drops {
             self.drop_loot(p, old, tool);
         }
-        if old.name() != b.name() {
-            self.block_entity_replaced(p, b);
-        }
-        self.neighbor_update(p, old);
+        self.set_block(p, b, level::flags::ALL);
         Some(old)
     }
 
     /// The block at `p` changed type: spill and drop the old block entity,
     /// create the new block's.
-    fn block_entity_replaced(&self, p: [i32; 3], new: BlockState) {
+    pub(crate) fn block_entity_replaced(&self, p: [i32; 3], new: BlockState, spill: bool) {
         if let Some(mut t) = self.world.block_entity(p) {
-            if let Some((sc, _)) = blockentity::screen_of(old_name(&t)) {
+            if let Some((sc, _)) = blockentity::screen_of(old_name(&t)).filter(|_| spill) {
                 blockentity::unpack_loot(&mut t, sc.size(), &self.data);
                 let centre = [p[0] as f64 + 0.5, p[1] as f64 + 0.5, p[2] as f64 + 0.5];
                 for s in blockentity::items(&t, sc.size()).into_iter().flatten() {
@@ -814,43 +833,19 @@ impl Game {
     }
 
     pub fn schedule(&self, p: [i32; 3], kind: TickKind, delay: u32) {
+        self.schedule_p(p, kind, delay, 0);
+    }
+
+    pub fn schedule_p(&self, p: [i32; 3], kind: TickKind, delay: u32, priority: i8) {
         let mut t = self.ticks.lock();
         if t.pending.insert((p, kind)) {
             let at = self.now.load(Ordering::Relaxed) + delay.max(1) as u64;
-            t.queue.entry(at).or_default().push((p, kind));
-        }
-    }
-
-    fn neighbor_update(&self, p: [i32; 3], old: BlockState) {
-        let reg = BlockRegistry::get();
-        for d in [[0, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]] {
-            let q = [p[0] + d[0], p[1] + d[1], p[2] + d[2]];
-            let Some(bq) = self.world.get_block(q[0], q[1], q[2]) else { continue };
-            if bq.is_air() {
-                continue;
-            }
-            if let Some(f) = fluid_state(bq).fluid() {
-                if fluid::lava_interaction(&mut GW(self), q) {
-                    self.schedule(q, TickKind::Fluid, fluid::tick_delay(f));
-                }
-                if reg.is_fluid(bq) {
-                    continue;
-                }
-            }
-            let name = bq.name();
-            if is_gravity_block(name) {
-                self.schedule(q, TickKind::Gravity, 2);
-            }
-            if d != [0, 0, 0] && !self.can_survive(q, bq) {
-                // lost its support (plants, torches, the other half of doors…)
-                let other_half = matches!(reg.property(bq, "half"), Some("upper" | "lower")) && old.name() == name;
-                self.change_block(q, blocks::AIR, !other_half, None);
-            }
+            t.queue.entry((at, priority)).or_default().push((p, kind));
         }
     }
 
     /// Simplified `canSurvive`: things that stand on or hang from a block.
-    fn can_survive(&self, q: [i32; 3], b: BlockState) -> bool {
+    pub(crate) fn can_survive(&self, q: [i32; 3], b: BlockState) -> bool {
         let reg = BlockRegistry::get();
         let name = b.name();
         let at = |dx: i32, dy: i32, dz: i32| self.world.get_block(q[0] + dx, q[1] + dy, q[2] + dz);
@@ -916,18 +911,24 @@ impl Game {
         let (ty, data) = match &e.kind {
             EKind::Item { .. } => (regs.id("minecraft:entity_type", "minecraft:item").unwrap_or(0), 0),
             EKind::Falling { state } => (regs.id("minecraft:entity_type", "minecraft:falling_block").unwrap_or(0), state.0 as i32),
+            EKind::Tnt { .. } => (regs.id("minecraft:entity_type", "minecraft:tnt").unwrap_or(0), 0),
             _ => unreachable!(),
         };
         let mut b = Vec::new();
         b.vi(e.eid).uuid(e.uuid).vi(ty).f64(e.pos[0]).f64(e.pos[1]).f64(e.pos[2]).u8(0).u8(0).u8(0).u8(0).vi(data);
         let mut out = vec![self.encode("add_entity", &b)];
+        if let EKind::Tnt { fuse, .. } = e.kind {
+            let mut m = Vec::new();
+            m.vi(e.eid).u8(8).vi(1).vi(fuse).u8(0xFF);
+            out.push(self.encode("set_entity_data", &m));
+        }
         if let EKind::Item { stack, .. } = e.kind {
             out.push(self.item_meta(e.eid, stack));
         }
         out
     }
 
-    fn item_meta(&self, eid: i32, stack: Stack) -> Arc<Vec<u8>> {
+    pub(crate) fn item_meta(&self, eid: i32, stack: Stack) -> Arc<Vec<u8>> {
         let mut b = Vec::new();
         b.vi(eid).u8(8).vi(7);
         write_slot(&mut b, Some(stack));
@@ -1021,6 +1022,7 @@ impl Game {
 
     /// One game tick (runs on the tick thread).
     pub fn tick(&self) {
+        let _level = self.level.lock();
         let now = self.now.fetch_add(1, Ordering::Relaxed) + 1;
         self.tick_furnaces();
         // freshly generated fluids start flowing (vanilla post processing)
@@ -1034,25 +1036,36 @@ impl Game {
         let due: Vec<([i32; 3], TickKind)> = {
             let mut t = self.ticks.lock();
             let mut due = Vec::new();
-            while let Some((&at, _)) = t.queue.first_key_value() {
-                if at > now || due.len() >= TICK_BUDGET {
+            while let Some((&key, _)) = t.queue.first_key_value() {
+                if key.0 > now || due.len() >= TICK_BUDGET {
                     break;
                 }
-                let list = t.queue.remove(&at).unwrap_or_default();
+                let list = t.queue.remove(&key).unwrap_or_default();
                 due.extend(list);
             }
             if due.len() > TICK_BUDGET {
                 let rest = due.split_off(TICK_BUDGET);
-                t.queue.entry(now + 1).or_default().extend(rest);
+                t.queue.entry((now + 1, i8::MIN)).or_default().extend(rest);
             }
             for d in &due {
                 t.pending.remove(d);
             }
             due
         };
-        for (p, kind) in due {
+        self.lv(|l| {
+            l.handling = true;
+            l.running = due.iter().filter_map(|(p, k)| if let TickKind::Block(id) = k { Some((*p, *id)) } else { None }).collect();
+        });
+        // block ticks first, then fluid ticks (LevelTicks of blocks, then of fluids)
+        let (block_due, other_due): (Vec<_>, Vec<_>) = due.into_iter().partition(|(_, k)| matches!(k, TickKind::Block(_)));
+        for (p, kind) in block_due.into_iter().chain(other_due) {
             let Some(b) = self.world.get_block(p[0], p[1], p[2]) else { continue };
             match kind {
+                TickKind::Block(id) => {
+                    if level::block_id(b) == id {
+                        block::tick(self, p, b);
+                    }
+                }
                 TickKind::Fluid => {
                     if let Some(f) = fluid_state(b).fluid() {
                         Flow { w: &mut GW(self), fluid: f }.tick(p);
@@ -1075,10 +1088,19 @@ impl Game {
                 }
             }
         }
+        self.lv(|l| {
+            l.running.clear();
+            l.handling = false;
+        });
+        block::piston::tick_moving(self);
+        block::container::tick_block_entities(self);
         self.tick_weather();
+        self.tick_sleep();
         self.random_ticks();
+        self.run_block_events();
         self.tick_entities();
         self.tick_mobs();
+        self.tick_entity_inside();
         // light changed by block updates
         let relit = self.world.relight(256);
         if !relit.is_empty() {
@@ -1099,6 +1121,7 @@ impl Game {
         let mut removed: Vec<(i32, (i32, i32))> = Vec::new();
         let mut landed: Vec<([i32; 3], BlockState)> = Vec::new();
         let mut inv_changed: Vec<Arc<Player>> = Vec::new();
+        let mut booms: Vec<([f64; 3], Option<i32>)> = Vec::new();
         {
             let mut ents = self.entities.lock();
             for e in ents.values_mut() {
@@ -1127,6 +1150,14 @@ impl Game {
                         }
                     }
                     EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. } | EKind::Fangs { .. } => {}
+                    EKind::Tnt { fuse, owner } => {
+                        *fuse -= 1;
+                        if *fuse <= 0 {
+                            booms.push((e.pos, *owner));
+                            removed.push((e.eid, old_chunk));
+                            continue;
+                        }
+                    }
                     EKind::Falling { state } => {
                         if ground || e.age > 600 {
                             landed.push(([e.pos[0].floor() as i32, e.pos[1].round() as i32, e.pos[2].floor() as i32], *state));
@@ -1209,6 +1240,10 @@ impl Game {
         }
         for p in inv_changed {
             self.flush_inventory(&p);
+        }
+        for (c, owner) in booms {
+            // PrimedTnt.explode: power 4 at y + height / 16
+            self.explode_full([c[0], c[1] + 0.98 / 16.0, c[2]], 4.0, false, owner, Some(false));
         }
         for (p, state) in landed {
             match self.world.get_block(p[0], p[1], p[2]) {

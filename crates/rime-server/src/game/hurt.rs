@@ -145,6 +145,7 @@ impl Game {
             EKind::Falling { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "falling_block", ..Default::default() } },
             EKind::Lightning { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "lightning_bolt", ..Default::default() } },
             EKind::Fangs { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "evoker_fangs", ..Default::default() } },
+            EKind::Tnt { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "tnt", ..Default::default() } },
         })
     }
 

@@ -29,6 +29,10 @@ pub struct Vitals {
     pub xp_dirty: bool,
     /// `ticksFrozen`
     pub frozen: i32,
+    /// bed respawn point (`ServerPlayer.respawnConfig`)
+    pub respawn: Option<[i32; 3]>,
+    /// (bed position, `sleepCounter`) while in bed
+    pub sleeping: Option<([i32; 3], i32)>,
 }
 
 /// `Entity.getTicksRequiredToFreeze`
@@ -55,6 +59,8 @@ impl Default for Vitals {
             dirty: true,
             data_dirty: true,
             eating: None,
+            respawn: None,
+            sleeping: None,
         }
     }
 }
@@ -327,7 +333,9 @@ impl Vitals {
 
     /// Back to full health at respawn (attributes reset, effects cleared).
     pub fn respawn(&mut self) {
+        let r = self.respawn;
         *self = Vitals::default();
+        self.respawn = r;
     }
 }
 

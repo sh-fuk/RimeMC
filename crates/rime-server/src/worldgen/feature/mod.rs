@@ -149,6 +149,18 @@ pub struct Region<'a> {
     pub outside: &'a (dyn Fn(i32, i32, i32) -> u8 + Sync),
 }
 
+/// Read access to blocks, for shape updates shared by world generation
+/// and the live game.
+pub trait Getter {
+    fn get(&self, p: [i32; 3]) -> BlockState;
+}
+
+impl Getter for Region<'_> {
+    fn get(&self, p: [i32; 3]) -> BlockState {
+        Region::get(self, p)
+    }
+}
+
 impl Region<'_> {
     #[inline]
     fn slot(&self, x: i32, z: i32) -> Option<usize> {
@@ -274,7 +286,7 @@ pub fn post_process(lv: &mut Region) {
 /// `Block.updateFromNeighbourShapes` (UPDATE_SHAPE_ORDER: west, east,
 /// north, south, down, up) for the blocks structures and features leave:
 /// fence / pane / wall connections and the support of torches and ladders.
-pub fn shape_update(lv: &Region, s: BlockState, p: [i32; 3]) -> BlockState {
+pub fn shape_update(lv: &dyn Getter, s: BlockState, p: [i32; 3]) -> BlockState {
     let mut out = s;
     for (d, o) in UPDATE_ORDER {
         let q = [p[0] + o[0], p[1] + o[1], p[2] + o[2]];
@@ -317,7 +329,7 @@ fn gate_connects(nb: BlockState, d: u8) -> bool {
 }
 
 /// `BlockState.updateShape` towards one neighbour (direction ordinal `d`).
-pub fn update_shape(lv: &Region, s: BlockState, p: [i32; 3], d: u8, nb: BlockState) -> BlockState {
+pub fn update_shape(lv: &dyn Getter, s: BlockState, p: [i32; 3], d: u8, nb: BlockState) -> BlockState {
     let reg = crate::registry::BlockRegistry::get();
     let name = s.name();
     let horizontal = d >= 2;
@@ -377,7 +389,7 @@ fn opposite_facing(f: &str) -> &'static str {
 }
 
 /// `StairBlock.getStairsShape`
-fn stairs_shape(lv: &Region, s: BlockState, p: [i32; 3]) -> &'static str {
+fn stairs_shape(lv: &dyn Getter, s: BlockState, p: [i32; 3]) -> &'static str {
     let reg = crate::registry::BlockRegistry::get();
     let prop = |b: BlockState, k: &str| reg.property(b, k).unwrap_or("").to_string();
     let is_stairs = |b: BlockState| b.name().ends_with("_stairs");
@@ -444,7 +456,7 @@ fn covers(above: BlockState, rect: (i32, i32, i32, i32)) -> bool {
 const POST: (i32, i32, i32, i32) = (7, 9, 7, 9);
 
 /// `WallBlock.updateShape`
-fn wall_update(lv: &Region, s: BlockState, p: [i32; 3], d: u8, nb: BlockState) -> BlockState {
+fn wall_update(lv: &dyn Getter, s: BlockState, p: [i32; 3], d: u8, nb: BlockState) -> BlockState {
     let reg = crate::registry::BlockRegistry::get();
     if d == 0 {
         return s;

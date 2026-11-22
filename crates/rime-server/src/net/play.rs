@@ -119,7 +119,7 @@ pub fn light_data(b: &mut Vec<u8>, light: &crate::world::light::ChunkLight) {
 
 /// The `commands` tree: a few literals, each taking an optional greedy string.
 fn commands_body() -> Vec<u8> {
-    let mut names: Vec<String> = ["rime", "stop", "op", "deop", "gamemode", "tp", "list", "help", "spawn", "summon", "time", "kill", "give"].map(String::from).to_vec();
+    let mut names: Vec<String> = ["rime", "stop", "op", "deop", "gamemode", "tp", "list", "help", "spawn", "summon", "time", "kill", "give", "setblock", "fill"].map(String::from).to_vec();
     if crate::plugins::active() {
         for c in crate::plugins::command_names() {
             if !names.contains(&c) && !c.is_empty() && c.chars().all(|ch| ch.is_ascii_graphic()) {
@@ -142,6 +142,27 @@ fn commands_body() -> Vec<u8> {
     b.u8(0x02 | 0x04).vi(0).str("args").vi(parser).vi(2);
     b.vi(0);
     b
+}
+
+/// a command coordinate: absolute or `~`-relative
+fn parse_coord(a: &str, base: i32) -> Option<i32> {
+    if let Some(r) = a.strip_prefix('~') {
+        let off = if r.is_empty() { 0.0 } else { r.parse::<f64>().ok()? };
+        return Some(base + off.floor() as i32);
+    }
+    let v = a.parse::<f64>().ok()?;
+    (v.abs() < 3.0e7).then(|| v.floor() as i32)
+}
+
+/// `minecraft:name[key=value,...]`
+fn parse_block_state(a: &str) -> Option<BlockState> {
+    let a = a.trim_start_matches("minecraft:");
+    let (name, props) = match a.split_once('[') {
+        Some((n, rest)) => (n, rest.strip_suffix(']')?),
+        None => (a, ""),
+    };
+    let kv: Vec<(&str, &str)> = props.split(',').filter(|s| !s.is_empty()).filter_map(|p| p.split_once('=')).collect();
+    BlockRegistry::get().state(name, &kv)
 }
 
 fn text_nbt(msg: &str) -> Vec<u8> {
@@ -1076,7 +1097,20 @@ impl Session {
         b.u8(0);
         self.send("respawn", &b);
         self.send_abilities();
-        let spawn = st.spawn;
+        // the bed respawn point (ServerPlayer.findRespawnPositionAndUseSpawnBlock)
+        let bed = self.me.vit.lock().respawn;
+        let mut spawn = st.spawn;
+        if let Some(h) = bed {
+            match crate::game::block::use_block::stand_up_pos(&st.game, h) {
+                Some(p) => spawn = p,
+                None => {
+                    self.me.vit.lock().respawn = None;
+                    let mut b = crate::nbt::Tag::from_json(&serde_json::json!({ "translate": "block.minecraft.spawn.not_valid" })).to_network_bytes();
+                    b.bool(false);
+                    self.send("system_chat", &b);
+                }
+            }
+        }
         self.teleport(spawn, 0.0, 0.0);
         let c = ((spawn[0].floor() as i32) >> 4, (spawn[2].floor() as i32) >> 4);
         self.set_center(c, true);
@@ -1303,6 +1337,11 @@ impl Session {
             let _border = r.bool()?;
             let seq = r.varint()?;
             return Ok(self.on_place(hand, pos, face, cursor, seq));
+        } else if pid == sb("sign_update") {
+            let pos = r.pos()?;
+            let front = r.bool()?;
+            let lines = [r.string(384)?.to_string(), r.string(384)?.to_string(), r.string(384)?.to_string(), r.string(384)?.to_string()];
+            self.st.game.sign_update(&self.me, [pos.0, pos.1, pos.2], front, lines);
         } else if pid == sb("set_carried_item") {
             let s = r.i16()?;
             if (0..9).contains(&s) {
@@ -1384,6 +1423,7 @@ impl Session {
         } else if pid == sb("player_command") {
             let _eid = r.varint()?;
             match r.varint()? {
+                0 => self.st.game.wake_up(&self.me),
                 1 => self.sprinting = true,
                 2 => self.sprinting = false,
                 6 => self.gliding = true,
@@ -1590,6 +1630,7 @@ impl Session {
         }
         let sender = CommandSender::Player { name: self.me.name.clone() };
         let mut words = line.split_whitespace();
+        let cmd = line.split_whitespace().next().unwrap_or("");
         match words.next().unwrap_or("") {
             "gamemode" => {
                 if !self.st.ops.is_op(&sender) {
@@ -1680,6 +1721,71 @@ impl Session {
                 }
                 self.st.game.flush_inventory(&target);
                 self.msg(&format!("Gave {count} [{}] to {}", item.trim_start_matches("minecraft:"), target.name));
+            }
+            "setblock" | "fill" => {
+                if !self.st.ops.is_op(&sender) {
+                    self.msg("§cYou do not have permission (operator only).");
+                    return Flow::Continue;
+                }
+                let args: Vec<&str> = words.collect();
+                let me = self.me.pose.lock().pos;
+                let base = [me[0].floor() as i32, me[1].floor() as i32, me[2].floor() as i32];
+                let n = if cmd == "fill" { 6 } else { 3 };
+                if args.len() < n + 1 {
+                    self.msg(if cmd == "fill" { "§cUsage: /fill <from> <to> <block> [replace|destroy|keep]" } else { "§cUsage: /setblock <pos> <block> [replace|destroy|keep]" });
+                    return Flow::Continue;
+                }
+                let coords: Option<Vec<i32>> = args[..n].iter().enumerate().map(|(i, a)| parse_coord(a, base[i % 3])).collect();
+                let (Some(c), Some(state)) = (coords, parse_block_state(args[n])) else {
+                    self.msg("§cInvalid position or block");
+                    return Flow::Continue;
+                };
+                let mode = args.get(n + 1).copied().unwrap_or("replace");
+                let (a, b) = if n == 6 { ([c[0], c[1], c[2]], [c[3], c[4], c[5]]) } else { ([c[0], c[1], c[2]], [c[0], c[1], c[2]]) };
+                let lo = [a[0].min(b[0]), a[1].min(b[1]), a[2].min(b[2])];
+                let hi = [a[0].max(b[0]), a[1].max(b[1]), a[2].max(b[2])];
+                let vol = (hi[0] - lo[0] + 1) as i64 * (hi[1] - lo[1] + 1) as i64 * (hi[2] - lo[2] + 1) as i64;
+                if vol > 32768 {
+                    self.msg(&format!("§cToo many blocks in the specified area (maximum 32768, specified {vol})"));
+                    return Flow::Continue;
+                }
+                let g = &self.st.game;
+                let mut changed = 0;
+                for x in lo[0]..=hi[0] {
+                    for y in lo[1]..=hi[1] {
+                        for z in lo[2]..=hi[2] {
+                            let Some(cur) = g.world.get_block(x, y, z) else { continue };
+                            if mode == "keep" && !cur.is_air() || cur == state {
+                                continue;
+                            }
+                            g.world.mark_edited(x, z);
+                            if mode == "destroy" {
+                                g.change_block([x, y, z], state, true, None);
+                            } else {
+                                g.set_block([x, y, z], state, crate::game::level::flags::CLIENTS);
+                            }
+                            changed += 1;
+                        }
+                    }
+                }
+                // updates after the whole area is set (vanilla: blockUpdated per position)
+                let _lv = g.level.lock();
+                for x in lo[0]..=hi[0] {
+                    for y in lo[1]..=hi[1] {
+                        for z in lo[2]..=hi[2] {
+                            if let Some(b) = g.world.get_block(x, y, z) {
+                                g.update_neighbors_at([x, y, z], b);
+                            }
+                        }
+                    }
+                }
+                if changed == 0 {
+                    self.msg(if cmd == "fill" { "§cNo blocks were filled" } else { "§cCould not set the block" });
+                } else if cmd == "fill" {
+                    self.msg(&format!("Successfully filled {changed} block(s)"));
+                } else {
+                    self.msg(&format!("Changed the block at {}, {}, {}", c[0], c[1], c[2]));
+                }
             }
             "summon" => {
                 if !self.st.ops.is_op(&sender) {
@@ -1864,6 +1970,11 @@ impl Session {
             }
             // a waterlogged block leaves its water behind
             let after = if BlockRegistry::get().property(cur, "waterlogged") == Some("true") { blocks::WATER } else { blocks::AIR };
+            if gm == 1 {
+                // playerWillDestroy: creative breaking of an upper / head part
+                // removes the other part without drops
+                st.game.prevent_drop_from_other_part([pos.0, pos.1, pos.2], cur);
+            }
             st.game.player_change_block([pos.0, pos.1, pos.2], after, gm == 0, tool);
             self.me.vit.lock().add_exhaustion(0.005);
             self.ack(seq);
@@ -2162,17 +2273,50 @@ impl Session {
         let game = &st.game;
         let w = &game.world;
         let clicked = w.get_block(pos.0, pos.1, pos.2).unwrap_or(blocks::AIR);
-        // interactive blocks (unless sneaking)
-        if clicked.name() == "crafting_table" && !self.sneaking && gm != 3 && self.within_reach(pos) {
-            self.ack(seq);
-            self.open_crafting();
-            return Flow::Continue;
-        }
-        if !self.sneaking && gm != 3 && self.within_reach(pos) {
-            if let Some((screen, title)) = crate::game::blockentity::screen_of(clicked.name()) {
-                self.ack(seq);
-                self.open_container([pos.0, pos.1, pos.2], screen, title);
-                return Flow::Continue;
+        let yaw_pitch = {
+            let p = self.me.pose.lock();
+            (p.yaw, p.pitch)
+        };
+        let horiz_dir = [3u8, 4, 2, 5][(((yaw_pitch.0 as f64 / 90.0) + 0.5).floor() as i64).rem_euclid(4) as usize];
+        // interactive blocks (BlockBehaviour.useItemOn / useWithoutItem)
+        if self.within_reach(pos) && (gm != 3 || crate::game::blockentity::screen_of(clicked.name()).is_some()) {
+            use crate::game::block::use_block::{use_block, Ctx, Use};
+            let held = self.me.inv.lock().slots[slot];
+            let other = self.me.inv.lock().slots[if hand == 1 { 36 + self.me.held.load(Ordering::Relaxed) as usize } else { 45 }];
+            let cx = Ctx { player: &self.me, held, sneaking: self.sneaking && (held.is_some() || other.is_some()), creative: gm == 1, face: face as u8, horiz: horiz_dir };
+            let r = if gm == 3 {
+                match crate::game::block::container::screen_at(game, [pos.0, pos.1, pos.2]) {
+                    Some((k, sc, t)) => Use::Open(k, sc, t),
+                    None => Use::Pass,
+                }
+            } else if gm == 2 && !matches!(crate::game::block::class(clicked), crate::game::block::Class::Door | crate::game::block::Class::TrapDoor | crate::game::block::Class::FenceGate | crate::game::block::Class::Lever | crate::game::block::Class::Button | crate::game::block::Class::Bed | crate::game::block::Class::Chest | crate::game::block::Class::TrappedChest) && crate::game::blockentity::screen_of(clicked.name()).is_none() && clicked.name() != "crafting_table" {
+                Use::Pass
+            } else {
+                use_block(game, [pos.0, pos.1, pos.2], clicked, &cx)
+            };
+            match r {
+                Use::Pass => {}
+                Use::Consumed => {
+                    self.ack(seq);
+                    return Flow::Continue;
+                }
+                Use::Crafting => {
+                    self.ack(seq);
+                    self.open_crafting();
+                    return Flow::Continue;
+                }
+                Use::Open(k, sc, t) => {
+                    self.ack(seq);
+                    self.open_container(k, sc, t);
+                    return Flow::Continue;
+                }
+                Use::Sign(p, front) => {
+                    self.ack(seq);
+                    let mut b = Vec::new();
+                    b.pos(p[0], p[1], p[2]).bool(front);
+                    self.send("open_sign_editor", &b);
+                    return Flow::Continue;
+                }
             }
         }
         if gm == 2 || gm == 3 {
@@ -2236,6 +2380,25 @@ impl Session {
         if reg.property(state, "waterlogged").is_some() && existing.is_some_and(|b| fluid::fluid_state(b).is_source()) {
             state = reg.with(state, "waterlogged", "true").unwrap_or(state);
         }
+        // Block.getStateForPlacement of blocks with behaviour
+        {
+            use crate::game::block::place::{nearest_looking, placement, PlaceCtx};
+            let pc = PlaceCtx {
+                horiz: horiz_dir,
+                look: nearest_looking(yaw_pitch.0, yaw_pitch.1),
+                face: face as u8,
+                click: [pos.0 as f64 + cursor.0 as f64, pos.1 as f64 + cursor.1 as f64, pos.2 as f64 + cursor.2 as f64],
+                sneaking: self.sneaking,
+            };
+            match placement(game, [target.0, target.1, target.2], state, &pc) {
+                Some(s) => state = s,
+                None => {
+                    self.ack(seq);
+                    self.resync(target);
+                    return Flow::Continue;
+                }
+            }
+        }
         // don't place solid blocks inside players
         if state.is_solid() {
             let bx = [target.0 as f64, target.1 as f64, target.2 as f64];
@@ -2294,6 +2457,13 @@ impl Session {
         game.player_change_block([target.0, target.1, target.2], state, false, None);
         if let Some((p, b)) = extra {
             game.player_change_block([p.0, p.1, p.2], b, false, None);
+        }
+        crate::game::block::place::placed_by(game, [target.0, target.1, target.2], state);
+        if state.name().ends_with("_sign") && !state.name().contains("hanging") {
+            // SignBlockEntity: the placer edits the front
+            let mut b = Vec::new();
+            b.pos(target.0, target.1, target.2).bool(true);
+            self.send("open_sign_editor", &b);
         }
         if fluid::fluid_state(state).fluid().is_some() {
             game.schedule([target.0, target.1, target.2], crate::game::TickKind::Fluid, 5);

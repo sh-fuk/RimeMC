@@ -1349,6 +1349,13 @@ impl Game {
             if state.is_air() {
                 continue;
             }
+            if state.name() == "tnt" {
+                // TntBlock.wasExploded
+                self.change_block(*p, blocks::AIR, false, None);
+                let f = rng.gen_range(0..20) + 10;
+                self.spawn_tnt(*p, by, f);
+                continue;
+            }
             for st in self.data.explosion_drops(state, radius, &mut rng) {
                 // Explosion.addOrAppendStack
                 let mut st = st;

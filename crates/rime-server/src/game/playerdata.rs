@@ -33,6 +33,7 @@ pub struct Saved {
     pub dead: bool,
     /// (XpLevel, XpP, XpTotal)
     pub xp: (i32, f32, i32),
+    pub respawn: Option<[i32; 3]>,
 }
 
 pub fn path(world: &Path, uuid: uuid::Uuid) -> PathBuf {
@@ -112,7 +113,7 @@ pub fn to_nbt(p: &Player) -> Tag {
             }
         }
     }
-    Tag::Compound(vec![
+    let mut t = Tag::Compound(vec![
         ("DataVersion".into(), Tag::Int(crate::world::chunk::DATA_VERSION)),
         ("Pos".into(), Tag::List(pose.pos.iter().map(|v| Tag::Double(*v)).collect())),
         ("Rotation".into(), Tag::List(vec![Tag::Float(pose.yaw), Tag::Float(pose.pitch)])),
@@ -135,7 +136,20 @@ pub fn to_nbt(p: &Player) -> Tag {
         ("Fire".into(), Tag::Short(v.fire.clamp(i16::MIN as i32, i16::MAX as i32) as i16)),
         ("fall_distance".into(), Tag::Double(v.fall_distance)),
         ("UUID".into(), Tag::IntArray(uuid_ints(p.uuid))),
-    ])
+    ]);
+    if let (Some(r), Tag::Compound(f)) = (v.respawn, &mut t) {
+        f.push((
+            "respawn".into(),
+            Tag::Compound(vec![
+                ("dimension".into(), Tag::String("minecraft:overworld".into())),
+                ("pos".into(), Tag::IntArray(vec![r[0], r[1], r[2]])),
+                ("yaw".into(), Tag::Float(0.0)),
+                ("pitch".into(), Tag::Float(0.0)),
+                ("forced".into(), Tag::Byte(0)),
+            ]),
+        ));
+    }
+    t
 }
 
 fn uuid_ints(u: uuid::Uuid) -> Vec<i32> {
@@ -212,6 +226,10 @@ pub fn from_nbt(t: &Tag) -> Option<Saved> {
         fall_distance: num("fall_distance").or(num("FallDistance")).unwrap_or(0.0).clamp(0.0, 1.0e4),
         dead: health <= 0.0,
         xp: (num("XpLevel").unwrap_or(0.0).max(0.0) as i32, num("XpP").unwrap_or(0.0).clamp(0.0, 1.0) as f32, num("XpTotal").unwrap_or(0.0).max(0.0) as i32),
+        respawn: match t.get("respawn").and_then(|r| r.get("pos")) {
+            Some(Tag::IntArray(a)) if a.len() == 3 => Some([a[0], a[1], a[2]]),
+            _ => None,
+        },
     })
 }
 
@@ -282,6 +300,7 @@ impl Saved {
         v.fire = self.fire;
         v.fall_distance = self.fall_distance;
         (v.xp_level, v.xp_progress, v.xp_total) = self.xp;
+        v.respawn = self.respawn;
         if self.dead {
             v.living.health = 0.0;
             v.living.dead = true;

@@ -409,3 +409,54 @@ pub mod vstate {
         matches!(fluid(s), 1 | 2)
     }
 }
+
+/// Redstone / piston facts per state dumped from vanilla 26.1
+/// (`tools/RsDump.java` → `assets/26.1/redstone_flags.bin`): three tables of
+/// one byte per state id: flags, piston push reaction, note block instrument.
+pub mod rstate {
+    use super::BlockState;
+
+    const DATA: &[u8] = include_bytes!("../assets/26.1/redstone_flags.bin");
+
+    #[inline]
+    fn table(i: usize, s: BlockState) -> u8 {
+        let n = DATA.len() / 3;
+        DATA.get(i * n + s.0 as usize).copied().unwrap_or(0)
+    }
+    /// `isRedstoneConductor`
+    pub fn conductor(s: BlockState) -> bool {
+        table(0, s) & 1 != 0
+    }
+    /// `isSignalSource`
+    pub fn signal_source(s: BlockState) -> bool {
+        table(0, s) & 2 != 0
+    }
+    /// `hasAnalogOutputSignal`
+    pub fn analog(s: BlockState) -> bool {
+        table(0, s) & 4 != 0
+    }
+    /// `hasBlockEntity`
+    pub fn block_entity(s: BlockState) -> bool {
+        table(0, s) & 8 != 0
+    }
+    /// destroy speed -1 (bedrock, obsidian-likes are not: only unbreakable)
+    pub fn unbreakable(s: BlockState) -> bool {
+        table(0, s) & 16 != 0
+    }
+    /// `isSuffocating`
+    pub fn suffocating(s: BlockState) -> bool {
+        table(0, s) & 32 != 0
+    }
+    /// `canOcclude`
+    pub fn occludes(s: BlockState) -> bool {
+        table(0, s) & 64 != 0
+    }
+    /// `PushReaction`: 0 normal, 1 destroy, 2 block, 3 ignore, 4 push only
+    pub fn push_reaction(s: BlockState) -> u8 {
+        table(1, s)
+    }
+    /// `NoteBlockInstrument` ordinal of `BlockState.instrument()`
+    pub fn instrument(s: BlockState) -> u8 {
+        table(2, s)
+    }
+}
