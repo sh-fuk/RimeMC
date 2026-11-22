@@ -33,6 +33,34 @@ pub fn stack_from(t: &Tag) -> Option<Stack> {
     Some(st)
 }
 
+fn slots_nbt(items: &[Option<Stack>]) -> Tag {
+    Tag::List(
+        items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                let s = (*s)?;
+                let Tag::Compound(mut c) = stack_nbt(&s) else { return None };
+                c.insert(0, ("Slot".into(), Tag::Byte(i as i8)));
+                Some(Tag::Compound(c))
+            })
+            .collect(),
+    )
+}
+
+fn slots_from(t: &Tag, size: usize) -> Vec<Option<Stack>> {
+    let mut out = vec![None; size];
+    if let Some(Tag::List(l)) = t.get("Items") {
+        for e in l {
+            let Some(i) = e.get("Slot").and_then(|v| v.as_i64()) else { continue };
+            if (0..size as i64).contains(&i) {
+                out[i as usize] = stack_from(e);
+            }
+        }
+    }
+    out
+}
+
 fn pos3(p: [f64; 3]) -> Tag {
     Tag::List(p.iter().map(|v| Tag::Double(*v)).collect())
 }
@@ -210,15 +238,17 @@ impl Game {
                         f.push(s("beam_target", Tag::IntArray(b.to_vec())));
                     }
                 }
-                EKind::Boat { ty, yaw, .. } => {
+                EKind::Boat { ty, yaw, items, .. } => {
                     f.push(s("id", Tag::String(format!("minecraft:{ty}"))));
                     f.push(s("Yaw", Tag::Float(*yaw)));
+                    f.push(s("Items", slots_nbt(items)));
                 }
                 EKind::Minecart(c) => {
                     f.push(s("id", Tag::String(format!("minecraft:{}", c.ty))));
                     f.push(s("Fuel", Tag::Int(c.fuel)));
                     f.push(s("Push", Tag::List(vec![Tag::Double(c.push[0]), Tag::Double(c.push[1])])));
                     f.push(s("Yaw", Tag::Float(c.yaw)));
+                    f.push(s("Items", slots_nbt(&c.items)));
                 }
                 EKind::Frame { item, rotation, facing, glow, fixed } => {
                     f.push(s("id", Tag::String(if *glow { "minecraft:glow_item_frame" } else { "minecraft:item_frame" }.into())));
@@ -270,11 +300,20 @@ impl Game {
                     let Some(st) = t.get("Item").and_then(stack_from) else { continue };
                     EKind::Item { stack: st, pickup_delay: num(t, "PickupDelay").unwrap_or(0).max(0) as u32 }
                 }
-                b if super::ride::is_boat_type(b) => EKind::Boat { ty: Box::leak(b.to_string().into_boxed_str()), yaw: float(t, "Yaw").unwrap_or(0.0), damage: 0.0, hurt: 0, hurt_dir: 1 },
+                b if super::ride::is_boat_type(b) => EKind::Boat {
+                    ty: Box::leak(b.to_string().into_boxed_str()),
+                    yaw: float(t, "Yaw").unwrap_or(0.0),
+                    damage: 0.0,
+                    hurt: 0,
+                    hurt_dir: 1,
+                    items: if b.contains("chest") { slots_from(t, 27) } else { Vec::new() },
+                },
                 c if super::minecart::is_cart_item(c) => {
                     let mut cart = super::minecart::Cart::new(Box::leak(c.to_string().into_boxed_str()));
                     cart.fuel = num(t, "Fuel").unwrap_or(0) as i32;
                     cart.yaw = float(t, "Yaw").unwrap_or(0.0);
+                    let n = cart.items.len();
+                    cart.items = slots_from(t, n);
                     if let Some(Tag::List(l)) = t.get("Push") {
                         if let (Some(Tag::Double(a)), Some(Tag::Double(b))) = (l.first(), l.get(1)) {
                             cart.push = [*a, *b];

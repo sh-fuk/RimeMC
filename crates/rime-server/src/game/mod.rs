@@ -487,6 +487,8 @@ pub enum Request {
     StopUsingItem,
     /// the player died from this damage
     Died(Box<combat::damage::DamageSource>),
+    /// open an entity's inventory (chest minecart / boat): eid, screen, title
+    OpenEntity(i32, blockentity::Screen, &'static str),
 }
 
 impl Player {
@@ -787,25 +789,30 @@ impl Game {
             }
             self.world.set_block_entity(p, None, true);
             self.furnaces.lock().remove(&p);
-            for pl in self.players() {
-                let open = matches!(pl.inv.lock().window, inventory::Window::Container(_, _, q) if q == p);
-                if open {
-                    let id = pl.inv.lock().current_window();
-                    let held = pl.held.load(Ordering::Relaxed) as i16;
-                    let thrown = pl.inv.lock().close(&self.data, held);
-                    let pos = pl.pose.lock().pos;
-                    for t in thrown {
-                        self.spawn_item([pos[0], pos[1] + 1.3, pos[2]], t, [0.0, 0.0, 0.0], 40);
-                    }
-                    let mut b = Vec::new();
-                    b.vi(id as i32);
-                    pl.send(self.encode("container_close", &b));
-                    self.send_inventory(&pl);
-                }
-            }
+            self.close_viewers(p);
         }
         if let Some(id) = blockentity::be_id(new.name()) {
             self.world.set_block_entity(p, Some(blockentity::new_tag(id, p)), true);
+        }
+    }
+
+    /// Close the screen of everyone looking at the container keyed `p`.
+    pub(crate) fn close_viewers(&self, p: [i32; 3]) {
+        for pl in self.players() {
+            let open = matches!(pl.inv.lock().window, inventory::Window::Container(_, _, q) if q == p);
+            if open {
+                let id = pl.inv.lock().current_window();
+                let held = pl.held.load(Ordering::Relaxed) as i16;
+                let thrown = pl.inv.lock().close(&self.data, held);
+                let pos = pl.pose.lock().pos;
+                for t in thrown {
+                    self.spawn_item([pos[0], pos[1] + 1.3, pos[2]], t, [0.0, 0.0, 0.0], 40);
+                }
+                let mut b = Vec::new();
+                b.vi(id as i32);
+                pl.send(self.encode("container_close", &b));
+                self.send_inventory(&pl);
+            }
         }
     }
 
@@ -1430,6 +1437,13 @@ impl Game {
                 minecart::CartEv::Eject(v) => self.eject_all(v),
                 minecart::CartEv::Primed(pos) => self.play_sound("minecraft:entity.tnt.primed", 4, pos, 1.0, 1.0),
             }
+        }
+        let hoppers: Vec<(i32, [f64; 3])> = self.entities.lock().values().filter_map(|e| match &e.kind {
+            EKind::Minecart(c) if c.ty == "hopper_minecart" && c.enabled => Some((e.eid, e.pos)),
+            _ => None,
+        }).collect();
+        for (eid, pos) in hoppers {
+            block::container::hopper_cart_tick(self, eid, pos);
         }
         self.tick_rides();
         self.tick_leashes();

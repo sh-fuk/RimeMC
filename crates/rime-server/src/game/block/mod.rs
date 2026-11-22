@@ -191,7 +191,8 @@ pub fn sturdy(g: &Game, p: [i32; 3], dir: u8) -> bool {
 /// `Block.canSupportRigidBlock` (approximated by a full top face)
 pub fn can_support_rigid(g: &Game, p: [i32; 3]) -> bool {
     let s = g.bs(p);
-    vstate::sturdy(s, UP) || vstate::sturdy_up_center(s) && vstate::full_up_face(s)
+    // the hopper's rim covers RIGID_SUPPORT_SHAPE (a full face minus a 12x12 hole)
+    vstate::sturdy(s, UP) || vstate::sturdy_up_center(s) && vstate::full_up_face(s) || s.name() == "hopper"
 }
 
 /// `Block.canSupportCenter(level, pos, dir)`

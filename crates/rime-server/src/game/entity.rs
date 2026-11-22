@@ -21,7 +21,7 @@ pub enum EKind {
     /// `EndCrystal`
     Crystal { show_bottom: bool, beam: Option<[i32; 3]>, invulnerable: bool },
     /// boats and rafts (`ty` is the entity type, e.g. `oak_chest_boat`)
-    Boat { ty: &'static str, yaw: f32, damage: f32, hurt: i32, hurt_dir: i32 },
+    Boat { ty: &'static str, yaw: f32, damage: f32, hurt: i32, hurt_dir: i32, items: Vec<Option<Stack>> },
     /// minecarts (`ty`: minecart, chest_minecart, furnace_minecart, tnt_minecart, hopper_minecart)
     Minecart(Box<super::minecart::Cart>),
     /// `LeashFenceKnotEntity`

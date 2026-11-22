@@ -27,11 +27,20 @@ pub struct Cart {
     /// furnace minecart fuel and push direction
     pub fuel: i32,
     pub push: [f64; 2],
+    /// chest (27) / hopper (5) minecart contents
+    pub items: Vec<Option<Stack>>,
+    /// hopper minecart: off while on a powered activator rail
+    pub enabled: bool,
 }
 
 impl Cart {
     pub fn new(ty: &'static str) -> Self {
-        Self { ty, yaw: 0.0, pitch: 0.0, damage: 0.0, hurt: 0, hurt_dir: 1, fuse: -1, fuel: 0, push: [0.0; 2] }
+        let size = match ty {
+            "chest_minecart" => 27,
+            "hopper_minecart" => 5,
+            _ => 0,
+        };
+        Self { ty, yaw: 0.0, pitch: 0.0, damage: 0.0, hurt: 0, hurt_dir: 1, fuse: -1, fuel: 0, push: [0.0; 2], items: vec![None; size], enabled: true }
     }
 }
 
@@ -117,6 +126,7 @@ impl Game {
             let chunk = e.chunk();
             let pos = e.pos;
             let EKind::Minecart(c) = &mut e.kind else { return false };
+            let _ = &c.items;
             c.hurt_dir = -c.hurt_dir;
             c.hurt = 10;
             c.damage += amount * 10.0;
@@ -126,11 +136,12 @@ impl Game {
         self.broadcast_chunk(chunk, &pkt);
         if broken {
             self.eject_all(eid);
-            self.entities.lock().remove(&eid);
+            self.close_viewers([super::block::container::ENTITY_KEY, eid, 0]);
+            let gone = self.entities.lock().remove(&eid);
             self.broadcast_chunk(chunk, &self.remove_packet(&[eid]));
-            if ty == "tnt_minecart" && !creative {
-                // MinecartTNT.destroy: blows up when broken by fire/explosions is
-                // handled by explode; a player breaking it drops it
+            // Containers.dropContents: the cart's items spill out (even in creative)
+            if let Some(EKind::Minecart(c)) = gone.map(|e| e.kind) {
+                self.spill(pos, &c.items);
             }
             if !creative {
                 if let Some(id) = Items::get().id(ty) {
@@ -148,6 +159,11 @@ impl Game {
             _ => return false,
         };
         match ty {
+            "chest_minecart" | "hopper_minecart" => {
+                let (screen, title) = if ty == "chest_minecart" { (super::blockentity::Screen::Rows(3), "Minecart with Chest") } else { (super::blockentity::Screen::Hopper, "Minecart with Hopper") };
+                p.requests.lock().push(super::Request::OpenEntity(eid, screen, title));
+                true
+            }
             "minecart" => {
                 if p.flags.load(Ordering::Relaxed) & super::hurt::F_SNEAKING != 0 {
                     return false;
@@ -190,6 +206,7 @@ impl Game {
                 // eject (done after the entity lock is released)
                 booms.push(CartEv::Eject(eid));
             }
+            "hopper_minecart" => c.enabled = !on,
             "tnt_minecart" if on && c.fuse < 0 => {
                 c.fuse = 80;
                 booms.push(CartEv::Primed(e.pos));
@@ -503,6 +520,54 @@ mod tests {
         g.tick_leashes();
         assert_eq!(g.leash_holder(pig), None, "snapped");
         assert!(!g.entities.lock().contains_key(&knot), "unused knot removed");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn cart_inventories_feed_hoppers() {
+        let Some((g, _gen, _store, tmp)) = crate::game::endfight::tests::end_game() else { return };
+        let r = BlockRegistry::get();
+        let items = crate::data::Items::get();
+        let y = g.motion_blocking_height(0, 0);
+        let rail = r.state("rail", &[("shape", "east_west")]).unwrap();
+        // a hopper minecart under a chest pulls from it
+        g.change_block([0, y, 0], rail, false, None);
+        g.change_block([0, y + 1, 0], r.state("chest", &[]).unwrap(), false, None);
+        let dirt = Stack::new(items.id("dirt").unwrap(), 3);
+        g.set_container_slots([0, y + 1, 0], &{
+            let mut v = vec![None; 27];
+            v[0] = Some(dirt);
+            v
+        }, -1);
+        assert!(g.place_minecart("hopper_minecart", [0, y, 0]));
+        let hop = g.entities.lock().values().find(|e| matches!(&e.kind, EKind::Minecart(c) if c.ty == "hopper_minecart")).map(|e| (e.eid, e.pos)).unwrap();
+        for _ in 0..3 {
+            crate::game::block::container::hopper_cart_tick(&g, hop.0, hop.1);
+        }
+        let got = g.entity_slots(hop.0).unwrap();
+        assert_eq!(got[0].map(|s| s.count), Some(3), "{got:?}");
+        assert!(g.container_slots([0, y + 1, 0]).unwrap().iter().all(|s| s.is_none()));
+        // a hopper block under a chest minecart pulls from the cart
+        g.change_block([5, y, 0], rail, false, None);
+        g.change_block([5, y - 1, 0], r.state("hopper", &[]).unwrap(), false, None);
+        assert!(g.place_minecart("chest_minecart", [5, y, 0]));
+        let chest = g.entities.lock().values().find(|e| matches!(&e.kind, EKind::Minecart(c) if c.ty == "chest_minecart")).map(|e| e.eid).unwrap();
+        let mut v = vec![None; 27];
+        v[4] = Some(Stack::new(items.id("stone").unwrap(), 2));
+        g.set_entity_slots(chest, &v);
+        for _ in 0..20 {
+            crate::game::block::container::hopper_tick(&g, [5, y - 1, 0]);
+        }
+        let h = g.container_slots([5, y - 1, 0]).unwrap();
+        assert_eq!(h.iter().flatten().map(|s| s.count as i32).sum::<i32>(), 2, "{h:?}");
+        // breaking a chest minecart spills what it holds
+        let mut v = vec![None; 27];
+        v[0] = Some(Stack::new(items.id("stone").unwrap(), 5));
+        g.set_entity_slots(chest, &v);
+        let before = g.entities.lock().values().filter(|e| matches!(e.kind, EKind::Item { .. })).count();
+        g.hit_minecart(None, chest, 100.0);
+        let after = g.entities.lock().values().filter(|e| matches!(e.kind, EKind::Item { .. })).count();
+        assert_eq!(after, before + 2, "contents and the cart itself drop");
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

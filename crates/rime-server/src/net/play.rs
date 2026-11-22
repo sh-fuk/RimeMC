@@ -842,6 +842,7 @@ impl Session {
                 crate::game::Request::Gamemode(gm) => self.set_gamemode(gm.clamp(0, 3)),
                 crate::game::Request::Kick(reason) => return Flow::Disconnect(reason),
                 crate::game::Request::StopUsingItem => self.stop_using_item(),
+                crate::game::Request::OpenEntity(eid, screen, title) => self.open_entity_container(eid, screen, title),
                 crate::game::Request::Died(src) => self.die(*src),
                 crate::game::Request::Chat(m) => {
                     if let Flow::Disconnect(r) = self.on_chat(&m) {
@@ -2674,6 +2675,31 @@ impl Session {
             game.send_props(&self.me, &crate::game::workstation::brewing_props(game, p));
             crate::game::workstation::ticker_placed(game, p, game.bs(p));
         }
+    }
+
+    /// `ContainerEntity.interactWithContainerVehicle`: a cart's or boat's slots.
+    fn open_entity_container(&mut self, eid: i32, screen: crate::game::blockentity::Screen, title: &str) {
+        let game = &*self.game.clone();
+        let key = [crate::game::block::container::ENTITY_KEY, eid, 0];
+        let Some(slots) = game.container_slots(key) else { return };
+        self.next_window = self.next_window % 100 + 1;
+        let id = self.next_window;
+        {
+            let held = self.me.held.load(Ordering::Relaxed) as i16;
+            let mut inv = self.me.inv.lock();
+            let thrown = inv.close(&game.data, held);
+            inv.window = crate::game::inventory::Window::Container(id, screen, key);
+            inv.ext = slots;
+            drop(inv);
+            for t in thrown {
+                self.throw(t, false);
+            }
+        }
+        let menu = Registries::get().id("minecraft:menu", screen.menu()).unwrap_or(2);
+        let mut b = Vec::new();
+        b.vi(id as i32).vi(menu).raw(&text_nbt(title));
+        self.send("open_screen", &b);
+        game.send_inventory(&self.me);
     }
 
     /// Open a workstation menu (its slots live in the menu only).

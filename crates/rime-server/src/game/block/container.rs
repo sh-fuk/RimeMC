@@ -89,9 +89,47 @@ fn part_size(g: &Game, p: [i32; 3]) -> usize {
     blockentity::screen_of(g.bs(p).name()).map(|(sc, _)| sc.size()).unwrap_or(0)
 }
 
+/// Container key of an entity's inventory (chest minecarts and boats):
+/// `[ENTITY_KEY, eid, 0]` in place of a block position.
+pub const ENTITY_KEY: i32 = i32::MIN;
+
 impl Game {
+    pub fn entity_slots(&self, eid: i32) -> Option<Vec<Option<Stack>>> {
+        let ents = self.entities.lock();
+        match ents.get(&eid).map(|e| &e.kind) {
+            Some(crate::game::entity::EKind::Minecart(c)) if !c.items.is_empty() => Some(c.items.clone()),
+            Some(crate::game::entity::EKind::Boat { items, .. }) if !items.is_empty() => Some(items.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn set_entity_slots(&self, eid: i32, slots: &[Option<Stack>]) {
+        self.store_entity_slots(eid, slots);
+        let key = [ENTITY_KEY, eid, 0];
+        for pl in self.players() {
+            let mut inv = pl.inv.lock();
+            if matches!(inv.window, crate::game::inventory::Window::Container(_, _, q) if q == key) && inv.ext != slots {
+                inv.ext = slots.to_vec();
+                drop(inv);
+                self.send_inventory(&pl);
+            }
+        }
+    }
+
+    fn store_entity_slots(&self, eid: i32, slots: &[Option<Stack>]) {
+        let mut ents = self.entities.lock();
+        match ents.get_mut(&eid).map(|e| &mut e.kind) {
+            Some(crate::game::entity::EKind::Minecart(c)) if c.items.len() == slots.len() => c.items = slots.to_vec(),
+            Some(crate::game::entity::EKind::Boat { items, .. }) if items.len() == slots.len() => *items = slots.to_vec(),
+            _ => {}
+        }
+    }
+
     /// Contents of the container at `p` (both halves of a double chest).
     pub fn container_slots(&self, p: [i32; 3]) -> Option<Vec<Option<Stack>>> {
+        if p[0] == ENTITY_KEY {
+            return self.entity_slots(p[1]);
+        }
         let ps = parts(self, p);
         let mut out = Vec::new();
         for q in ps {
@@ -110,6 +148,10 @@ impl Game {
 
     /// Store new contents (split over a double chest's halves).
     pub fn set_container_slots(&self, p: [i32; 3], slots: &[Option<Stack>], except: i32) {
+        if p[0] == ENTITY_KEY {
+            self.set_entity_slots(p[1], slots);
+            return;
+        }
         let ps = parts(self, p);
         let mut off = 0;
         for q in ps {
@@ -300,7 +342,43 @@ fn add_item(g: &Game, dp: [i32; 3], dest: &mut [Option<Stack>], mut st: Stack, f
 /// entities and not handled here).
 fn container_pos(g: &Game, p: [i32; 3]) -> Option<[i32; 3]> {
     let s = g.bs(p);
-    blockentity::screen_of(s.name()).map(|_| p).or_else(|| (s.name() == "brewing_stand").then_some(p))
+    blockentity::screen_of(s.name()).map(|_| p).or_else(|| (s.name() == "brewing_stand").then_some(p)).or_else(|| {
+        // HopperBlockEntity.getEntityContainer: a chest/hopper minecart or chest boat in the cell
+        let cell = Aabb { min: [p[0] as f64, p[1] as f64, p[2] as f64], max: [p[0] as f64 + 1.0, p[1] as f64 + 1.0, p[2] as f64 + 1.0] };
+        let ents = g.entities.lock();
+        let mut found: Vec<i32> = ents
+            .values()
+            .filter(|e| match &e.kind {
+                crate::game::entity::EKind::Minecart(c) => !c.items.is_empty() && Aabb::entity(e.pos, 0.98, 0.7).intersects(&cell),
+                crate::game::entity::EKind::Boat { items, .. } => !items.is_empty() && Aabb::entity(e.pos, 1.375, 0.5625).intersects(&cell),
+                _ => false,
+            })
+            .map(|e| e.eid)
+            .collect();
+        drop(ents);
+        if found.is_empty() {
+            return None;
+        }
+        let i = rand::thread_rng().gen_range(0..found.len());
+        Some([ENTITY_KEY, found.swap_remove(i), 0])
+    })
+}
+
+/// `MinecartHopper.tick` -> `suckInItems`: pull from the container above or
+/// from item entities touching the cart. `enabled` false on a powered
+/// activator rail.
+pub fn hopper_cart_tick(g: &Game, eid: i32, pos: [f64; 3]) {
+    let key = [ENTITY_KEY, eid, 0];
+    let Some(mut mine) = g.container_slots(key) else { return };
+    if !mine.iter().any(|x| x.is_none_or(|x| x.count < x.max())) {
+        return;
+    }
+    let up = [pos[0].floor() as i32, (pos[1] + 1.0).floor() as i32, pos[2].floor() as i32];
+    let b = Aabb::entity(pos, 0.98, 0.7);
+    let area = Aabb { min: [b.min[0] - 0.25, b.min[1], b.min[2] - 0.25], max: [b.max[0] + 0.25, b.max[1], b.max[2] + 0.25] };
+    if suck_at(g, key, up, &area, &mut mine) {
+        g.set_container_slots(key, &mine, -1);
+    }
 }
 
 // ------------------------------------------------------------ hoppers
@@ -403,7 +481,12 @@ fn eject(g: &Game, p: [i32; 3], s: BlockState, mine: &mut [Option<Stack>]) -> bo
 
 fn suck(g: &Game, p: [i32; 3], mine: &mut [Option<Stack>]) -> bool {
     let up = rel(p, UP);
-    if let Some(sp) = container_pos(g, up) {
+    let area = Aabb { min: [p[0] as f64, p[1] as f64 + 11.0 / 16.0, p[2] as f64], max: [p[0] as f64 + 1.0, p[1] as f64 + 2.0, p[2] as f64 + 1.0] };
+    suck_at(g, p, up, &area, mine)
+}
+
+fn suck_at(g: &Game, p: [i32; 3], up: [i32; 3], area: &Aabb, mine: &mut [Option<Stack>]) -> bool {
+    if let Some(sp) = container_pos(g, up).filter(|sp| *sp != p) {
         let Some(mut src) = g.container_slots(sp) else { return false };
         for slot in face_slots(g, sp, Some(DOWN), src.len()) {
             let Some(cur) = src.get(slot).copied().flatten() else { continue };
@@ -424,8 +507,7 @@ fn suck(g: &Game, p: [i32; 3], mine: &mut [Option<Stack>]) -> bool {
     if vstate::full_block(above) && !g.data.block_in("does_not_block_hoppers", above.name()) {
         return false;
     }
-    let area = Aabb { min: [p[0] as f64, p[1] as f64 + 11.0 / 16.0, p[2] as f64], max: [p[0] as f64 + 1.0, p[1] as f64 + 2.0, p[2] as f64 + 1.0] };
-    for (eid, st) in g.items_in(&area) {
+    for (eid, st) in g.items_in(area) {
         let (rem, moved) = add_item(g, p, mine, st, None);
         if moved || rem.is_none() {
             g.set_item_entity(eid, rem);

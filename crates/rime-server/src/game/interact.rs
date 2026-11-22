@@ -44,7 +44,18 @@ impl Game {
             _ => 0,
         });
         match vehicle {
-            Some(1) => return hand == 0 && p.flags.load(Ordering::Relaxed) & super::hurt::F_SNEAKING == 0 && self.mount(p.eid, eid),
+            Some(1) => {
+                if hand != 0 {
+                    return false;
+                }
+                let sneaking = p.flags.load(Ordering::Relaxed) & super::hurt::F_SNEAKING != 0;
+                // ChestBoat.interact: sneaking opens the chest
+                if sneaking && self.entity_slots(eid).is_some() {
+                    p.requests.lock().push(super::Request::OpenEntity(eid, super::blockentity::Screen::Rows(3), "Boat with Chest"));
+                    return true;
+                }
+                return !sneaking && self.mount(p.eid, eid);
+            }
             Some(2) => return hand == 0 && self.use_minecart(p, eid, held, slot),
             _ => {}
         }

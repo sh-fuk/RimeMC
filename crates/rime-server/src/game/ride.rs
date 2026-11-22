@@ -422,7 +422,7 @@ impl Game {
             return false;
         }
         let eid = self.next_eid();
-        self.add_entity(Entity { eid, uuid: uuid::Uuid::new_v4(), kind: EKind::Boat { ty, yaw, damage: 0.0, hurt: 0, hurt_dir: 1 }, pos: at, vel: [0.0; 3], on_ground: false, age: 0, synced: at });
+        self.add_entity(Entity { eid, uuid: uuid::Uuid::new_v4(), kind: EKind::Boat { ty, yaw, damage: 0.0, hurt: 0, hurt_dir: 1, items: vec![None; if ty.contains("chest") { 27 } else { 0 }] }, pos: at, vel: [0.0; 3], on_ground: false, age: 0, synced: at });
         self.play_sound("minecraft:entity.boat.paddle_water", 4, at, 1.0, 1.0);
         true
     }
@@ -431,6 +431,18 @@ impl Game {
         let mut b = Vec::new();
         b.vi(eid).u8(8).vi(1).vi(hurt).u8(9).vi(1).vi(dir).u8(10).vi(3).f32(damage).u8(0xFF);
         self.encode("set_entity_data", &b)
+    }
+
+    /// `Containers.dropContents` for an entity's slots.
+    pub(crate) fn spill(&self, pos: [f64; 3], items: &[Option<Stack>]) {
+        use rand::Rng;
+        if items.is_empty() {
+            return;
+        }
+        let mut rng = rand::thread_rng();
+        for s in items.iter().flatten() {
+            self.spawn_item([pos[0], pos[1] + 0.3, pos[2]], *s, [rng.gen_range(-0.1..0.1), 0.2, rng.gen_range(-0.1..0.1)], 10);
+        }
     }
 
     /// `VehicleEntity.hurtServer` by a player.
@@ -451,8 +463,12 @@ impl Game {
         self.broadcast_chunk(chunk, &pkt);
         if broken {
             self.eject_all(eid);
-            self.entities.lock().remove(&eid);
+            self.close_viewers([super::block::container::ENTITY_KEY, eid, 0]);
+            let gone = self.entities.lock().remove(&eid);
             self.broadcast_chunk(chunk, &self.remove_packet(&[eid]));
+            if let Some(EKind::Boat { items, .. }) = gone.map(|e| e.kind) {
+                self.spill(pos, &items);
+            }
             if !creative {
                 if let Some(id) = Items::get().id(ty) {
                     self.spawn_item(pos, Stack::new(id, 1), [0.0, 0.1, 0.0], 10);
