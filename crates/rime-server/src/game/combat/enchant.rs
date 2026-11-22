@@ -438,6 +438,12 @@ static ENCH: OnceLock<Enchantments> = OnceLock::new();
 
 impl Enchantments {
     pub fn load(v: &VanillaData) -> anyhow::Result<()> {
+        let e = Self::build(v)?;
+        let _ = ENCH.set(e);
+        Ok(())
+    }
+
+    fn build(v: &VanillaData) -> anyhow::Result<Enchantments> {
         let mut e = Enchantments { entity_tags: crate::data::load_tags(v, "entity_type")?, item_tags: crate::data::load_tags(v, "item")?, ..Default::default() };
         for (key, path) in v.entries("enchantment") {
             let j: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
@@ -445,12 +451,18 @@ impl Enchantments {
             e.names.push(name.clone());
             e.by_name.insert(name.clone(), parse_enchantment(name, &j));
         }
-        let _ = ENCH.set(e);
-        Ok(())
+        Ok(e)
     }
 
     pub fn get() -> &'static Enchantments {
-        ENCH.get_or_init(Enchantments::default)
+        ENCH.get_or_init(|| {
+            // tests running in parallel may ask before a game loaded the table
+            #[cfg(test)]
+            if let Some(e) = std::env::var("RIME_SERVER_DIR").ok().and_then(|d| VanillaData::ensure(std::path::Path::new(&d)).ok()).and_then(|v| Self::build(&v).ok()) {
+                return e;
+            }
+            Enchantments::default()
+        })
     }
 
     pub fn by(&self, name: &str) -> Option<&Enchantment> {
