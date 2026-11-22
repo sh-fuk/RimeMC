@@ -118,17 +118,17 @@ impl Session {
                     let empty = held.with_patch(|p| p.charged.clear());
                     self.me.inv.lock().set(slot, Some(empty));
                     let arrows: Vec<Stack> = ammo.iter().copied().filter(|s| items.name(s.item) != "firework_rocket").collect();
-                    st.game.shoot_arrows(self.me.eid, eye, pose.yaw, pose.pitch, motion, pose.on_ground, empty, &arrows, power, 1.0, true, gm == 1, false);
+                    self.game.shoot_arrows(self.me.eid, eye, pose.yaw, pose.pitch, motion, pose.on_ground, empty, &arrows, power, 1.0, true, gm == 1, false);
                     let mut rng = rand::thread_rng();
                     for i in 0..ammo.len() {
                         // CrossbowItem.getShotPitch
                         let high = i % 2 == 1;
                         let r = 1.0 / (rng.r#gen::<f32>() * 0.5 + 1.8);
                         let pitch = if i == 0 { 1.0 } else if high { r + 0.63 } else { r + 0.43 };
-                        st.game.play_sound("minecraft:item.crossbow.shoot", 7, pose.pos, 1.0, pitch);
+                        self.game.play_sound("minecraft:item.crossbow.shoot", 7, pose.pos, 1.0, pitch);
                     }
                     self.damage_weapon(slot, ammo.len() as i32);
-                    st.game.flush_inventory(&self.me);
+                    self.game.flush_inventory(&self.me);
                 } else if self.find_ammo("crossbow").is_some() {
                     self.start_using(hand as u8, held);
                 }
@@ -136,7 +136,7 @@ impl Session {
             }
             n if PType::for_thrown(n).is_some() => {
                 let st = self.st.clone();
-                st.game.throw_item(&self.me, held);
+                self.game.throw_item(&self.me, held);
                 if let Some(t) = crate::game::consume::use_cooldown(&held) {
                     let mut v = self.me.vit.lock();
                     let now = v.living.tick_count;
@@ -150,7 +150,7 @@ impl Session {
                 if gm != 1 {
                     self.me.inv.lock().consume(slot, 1);
                 }
-                st.game.flush_inventory(&self.me);
+                self.game.flush_inventory(&self.me);
                 true
             }
             _ => false,
@@ -165,10 +165,10 @@ impl Session {
 
     fn in_water_or_rain(&self) -> bool {
         let pos = self.me.pose.lock().pos;
-        let w = &self.st.game.world;
+        let w = &self.game.world;
         let (x, y, z) = (pos[0].floor() as i32, pos[1].floor() as i32, pos[2].floor() as i32);
         let wet = w.get_block(x, y, z).is_some_and(crate::registry::vstate::is_water);
-        wet || self.st.game.raining_at([x, y, z])
+        wet || self.game.raining_at([x, y, z])
     }
 
     /// `ItemStack.hurtAndBreak` on the weapon in `slot`.
@@ -178,7 +178,7 @@ impl Session {
         }
         let eq_slot = if slot == 45 { crate::game::combat::living::OFFHAND } else { crate::game::combat::living::MAINHAND };
         let st = self.st.clone();
-        st.game.with_player(&self.me, |l, eq, _| {
+        self.game.with_player(&self.me, |l, eq, _| {
             let mut events = Vec::new();
             crate::game::combat::living::hurt_and_break(eq, eq_slot, amount, false, &mut events, &mut rand::thread_rng());
             l.events.extend(events);
@@ -215,10 +215,10 @@ impl Session {
                 2 => "minecraft:item.crossbow.quick_charge_2",
                 _ => "minecraft:item.crossbow.quick_charge_3",
             };
-            st.game.play_sound(s, 7, pos, 0.5, 1.0);
+            self.game.play_sound(s, 7, pos, 0.5, 1.0);
         }
         if now >= 0.5 && before < 0.5 && quick == 0 {
-            st.game.play_sound("minecraft:item.crossbow.loading_middle", 7, pos, 0.5, 1.0);
+            self.game.play_sound("minecraft:item.crossbow.loading_middle", 7, pos, 0.5, 1.0);
         }
         if now >= 1.0 && held.patch().charged.is_empty() {
             let Some(ammo) = self.find_ammo("crossbow") else { return };
@@ -228,8 +228,8 @@ impl Session {
             }
             let charged = held.with_patch(|p| p.charged = drawn.iter().map(|s| (s.item, s.count, s.comp)).collect());
             self.me.inv.lock().set(slot, Some(charged));
-            st.game.flush_inventory(&self.me);
-            st.game.play_sound("minecraft:item.crossbow.loading_end", 7, pos, 1.0, 1.0 / (rng.r#gen::<f32>() * 0.5 + 1.0) + 0.2);
+            self.game.flush_inventory(&self.me);
+            self.game.play_sound("minecraft:item.crossbow.loading_end", 7, pos, 1.0, 1.0 / (rng.r#gen::<f32>() * 0.5 + 1.0) + 0.2);
         }
     }
 
@@ -258,11 +258,11 @@ impl Session {
                 let infinite = enchant_value(held, "ammo_use", Some(ammo.1), None, 1.0, &mut rng) == 0.0;
                 let drawn = self.draw_ammo(held, ammo);
                 if !drawn.is_empty() {
-                    st.game.shoot_arrows(self.me.eid, eye, pose.yaw, pose.pitch, motion, pose.on_ground, held, &drawn, pow * 3.0, 1.0, pow == 1.0, gm == 1, infinite);
+                    self.game.shoot_arrows(self.me.eid, eye, pose.yaw, pose.pitch, motion, pose.on_ground, held, &drawn, pow * 3.0, 1.0, pow == 1.0, gm == 1, infinite);
                     self.damage_weapon(slot, drawn.len() as i32);
                 }
-                st.game.play_sound("minecraft:entity.arrow.shoot", 7, pose.pos, 1.0, 1.0 / (rng.r#gen::<f32>() * 0.4 + 1.2) + pow * 0.5);
-                st.game.flush_inventory(&self.me);
+                self.game.play_sound("minecraft:entity.arrow.shoot", 7, pose.pos, 1.0, 1.0 / (rng.r#gen::<f32>() * 0.4 + 1.2) + pow * 0.5);
+                self.game.flush_inventory(&self.me);
             }
             "trident" => {
                 if u.elapsed < 10 {
@@ -297,8 +297,8 @@ impl Session {
                     p.foil = !one.patch().enchantments.is_empty();
                     let vel = crate::game::projectile::shoot_vector(pose.pitch, pose.yaw, 0.0, 2.5, 1.0, &mut rng);
                     let vel = [vel[0] + motion[0], vel[1] + if pose.on_ground { 0.0 } else { motion[1] }, vel[2] + motion[2]];
-                    st.game.launch(p, eye, vel);
-                    st.game.play_sound(sound, 7, pose.pos, 1.0, 1.0);
+                    self.game.launch(p, eye, vel);
+                    self.game.play_sound(sound, 7, pose.pos, 1.0, 1.0);
                 } else {
                     // riptide: push the player along the look vector
                     let r = std::f32::consts::PI / 180.0;
@@ -312,10 +312,10 @@ impl Session {
                     if pose.on_ground {
                         push[1] += 1.1999999;
                     }
-                    st.game.push_entity(self.me.eid, push);
-                    st.game.play_sound(sound, 7, pose.pos, 1.0, 1.0);
+                    self.game.push_entity(self.me.eid, push);
+                    self.game.play_sound(sound, 7, pose.pos, 1.0, 1.0);
                 }
-                st.game.flush_inventory(&self.me);
+                self.game.flush_inventory(&self.me);
             }
             _ => {}
         }

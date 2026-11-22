@@ -306,7 +306,7 @@ fn js(env: &mut JNIEnv, s: &str) -> jstring {
 }
 
 fn player(name: &str) -> Option<Arc<crate::game::Player>> {
-    state()?.game.find(name)
+    state()?.find_player(name)
 }
 
 extern "system" fn n_log(mut env: JNIEnv, _: JClass, level: jint, msg: JString) {
@@ -322,12 +322,12 @@ extern "system" fn n_broadcast(mut env: JNIEnv, _: JClass, msg: JString) {
     let m = rs(&mut env, &msg);
     if let Some(st) = state() {
         tracing::info!("[broadcast] {m}");
-        st.game.broadcast(st.game.system_chat(&m));
+        st.broadcast_all(st.game.system_chat(&m));
     }
 }
 
 extern "system" fn n_players(mut env: JNIEnv, _: JClass) -> jobjectArray {
-    let names: Vec<String> = state().map(|st| st.game.players().iter().map(|p| p.name.clone()).collect()).unwrap_or_default();
+    let names: Vec<String> = state().map(|st| st.all_players().iter().map(|p| p.name.clone()).collect()).unwrap_or_default();
     let r = (|| -> jni::errors::Result<jobjectArray> {
         let arr = env.new_object_array(names.len() as i32, "java/lang/String", JObject::null())?;
         for (i, n) in names.iter().enumerate() {

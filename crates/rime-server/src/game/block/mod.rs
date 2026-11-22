@@ -309,6 +309,7 @@ pub fn update_shape(g: &Game, p: [i32; 3], s: BlockState, dir: u8, np: [i32; 3],
             s
         }
         Class::TripWire => return tripwire::wire_update_shape(s, dir, ns),
+        _ if s.name() == "nether_portal" => return crate::game::portal::portal_update_shape(g, p, s, dir, ns),
         _ => s,
     };
     // fences, panes, walls, stairs, ladders…
@@ -342,6 +343,10 @@ fn torch_survives(g: &Game, p: [i32; 3], s: BlockState) -> bool {
 pub fn on_place(g: &Game, p: [i32; 3], s: BlockState, old: BlockState, moved: bool) {
     let name = s.name();
     if matches!(name, "fire" | "soul_fire") && !same_block(old, s) {
+        // BaseFireBlock.onPlace: an empty obsidian frame becomes a portal
+        if crate::game::portal::fire_placed(g, p) {
+            return;
+        }
         // FireBlock.onPlace
         g.schedule(p, TickKind::Fire, 30 + rand::Rng::gen_range(&mut rand::thread_rng(), 0..10));
     }

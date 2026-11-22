@@ -136,6 +136,11 @@ impl ServerState {
                 tracing::error!("saving player {}: {e:#}", p.name);
             }
         }
+        for g in self.levels() {
+            if let Err(e) = g.save_portals(&portals_file(&self.world_dir, g.dim)) {
+                tracing::error!("saving portals: {e:#}");
+            }
+        }
     }
     pub fn online_players(&self) -> u32 {
         self.online.load(Ordering::Relaxed)
@@ -246,6 +251,11 @@ impl ServerState {
     }
 }
 
+/// Nether portal positions of a dimension (vanilla keeps them as POIs).
+fn portals_file(world_dir: &Path, d: Dim) -> std::path::PathBuf {
+    world_dir.join(format!("rime-portals-{}.txt", d.key().trim_start_matches("minecraft:")))
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     tracing_subscriber::fmt().with_target(false).init();
@@ -351,6 +361,9 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
     let game = Arc::new(game::Game::new_dim(cfg.server.compression_threshold, game_data.clone(), Dim::Overworld));
     let nether = Arc::new(game::Game::new_dim(cfg.server.compression_threshold, game_data.clone(), Dim::Nether));
     let end = Arc::new(game::Game::new_dim(cfg.server.compression_threshold, game_data, Dim::End));
+    for g in [&game, &nether, &end] {
+        g.load_portals(&portals_file(&world_dir, g.dim));
+    }
     let spawn = load_or_find_spawn(&world_dir, &game, &store, &generator)?;
     tracing::info!("world spawn at {:.0} {:.0} {:.0}", spawn[0], spawn[1], spawn[2]);
 

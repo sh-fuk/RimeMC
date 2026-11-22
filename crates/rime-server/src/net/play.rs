@@ -119,7 +119,7 @@ pub fn light_data(b: &mut Vec<u8>, light: &crate::world::light::ChunkLight) {
 
 /// The `commands` tree: a few literals, each taking an optional greedy string.
 fn commands_body() -> Vec<u8> {
-    let mut names: Vec<String> = ["rime", "stop", "op", "deop", "gamemode", "tp", "list", "help", "spawn", "summon", "time", "kill", "give", "setblock", "fill"].map(String::from).to_vec();
+    let mut names: Vec<String> = ["rime", "stop", "op", "deop", "gamemode", "tp", "list", "help", "spawn", "summon", "time", "kill", "give", "setblock", "fill", "execute"].map(String::from).to_vec();
     if crate::plugins::active() {
         for c in crate::plugins::command_names() {
             if !names.contains(&c) && !c.is_empty() && c.chars().all(|ch| ch.is_ascii_graphic()) {
@@ -274,10 +274,13 @@ pub async fn run_with_state<S: Io>(mut sock: CryptStream<S>, st: Arc<ServerState
         Some(s) => Pose { pos: s.pos, yaw: s.yaw, pitch: s.pitch, on_ground: false },
         None => Pose { pos: spawn, yaw: 0.0, pitch: 0.0, on_ground: false },
     };
-    if forwarded && st.game.take_over(uuid) {
+    let dim = saved.as_ref().map(|s| s.dim).unwrap_or(crate::world::storage::Dim::Overworld);
+    if forwarded && st.levels().iter().fold(false, |any, g| g.take_over(uuid) | any) {
         tracing::info!("{name}: replacing the previous session on this node");
     }
-    let Some(me) = st.game.join(uuid, name.clone(), properties, pose, gamemode, view, tx) else {
+    let game = st.level(dim).clone();
+    let dup = st.all_players().iter().any(|p| p.uuid == uuid || p.name.eq_ignore_ascii_case(&name));
+    let Some(me) = (if dup { None } else { game.join(uuid, name.clone(), properties, pose, gamemode, view, tx) }) else {
         let b = text_nbt("You are already logged in from another location.");
         sock.write_all(&conn::encode(id("play", "clientbound", "disconnect"), &b, th)).await?;
         sock.flush().await?;
@@ -292,7 +295,7 @@ pub async fn run_with_state<S: Io>(mut sock: CryptStream<S>, st: Arc<ServerState
         me.held.store(s.held, Ordering::Relaxed);
         *me.vit.lock() = s.vitals();
     }
-    st.online.store(st.game.count() as u32, Ordering::Relaxed);
+    st.online.store(st.all_players().len() as u32, Ordering::Relaxed);
     tracing::info!("{name} joined the game ({uuid}, entity {})", me.eid);
 
     let (rd, wr) = tokio::io::split(sock);
@@ -300,7 +303,7 @@ pub async fn run_with_state<S: Io>(mut sock: CryptStream<S>, st: Arc<ServerState
     let (in_tx, in_rx) = mpsc::channel::<(Instant, Vec<u8>)>(1024);
     let reader = tokio::spawn(reader_task(rd, in_tx));
 
-    let mut s = Session::new(st.clone(), me.clone(), view);
+    let mut s = Session::new(st.clone(), game, me.clone(), view);
     let result = s.run(in_rx).await;
 
     // ---- leave
@@ -322,26 +325,27 @@ pub async fn run_with_state<S: Io>(mut sock: CryptStream<S>, st: Arc<ServerState
         // PlayerQuitEvent while the player is still online
         crate::plugins::quit(&name, &format!("§e{name} left the game"))
     };
-    st.game.leave(me.eid);
-    st.online.store(st.game.count() as u32, Ordering::Relaxed);
+    let game = s.game.clone();
+    game.leave(me.eid);
+    st.online.store(st.all_players().len() as u32, Ordering::Relaxed);
     for c in &s.sent {
-        st.game.world.remove_viewer(c.0, c.1);
+        game.world.remove_viewer(c.0, c.1);
     }
     if replaced {
         let mut b = Vec::new();
         b.vi(1).vi(me.eid);
-        st.game.broadcast(st.game.encode("remove_entities", &b));
+        game.broadcast(game.encode("remove_entities", &b));
         reader.abort();
         return Ok(());
     }
     let mut b = Vec::new();
     b.vi(1).uuid(me.uuid);
-    st.game.broadcast(st.game.encode("player_info_remove", &b));
+    st.broadcast_all(game.encode("player_info_remove", &b));
     let mut b = Vec::new();
     b.vi(1).vi(me.eid);
-    st.game.broadcast(st.game.encode("remove_entities", &b));
+    game.broadcast(game.encode("remove_entities", &b));
     if !quit_msg.is_empty() {
-        st.game.broadcast(st.game.system_chat(&quit_msg));
+        st.broadcast_all(game.system_chat(&quit_msg));
     }
     tracing::info!("{name} left the game{}", match &result {
         Err(e) => format!(" ({e:#})"),
@@ -399,6 +403,8 @@ mod ranged;
 
 struct Session {
     st: Arc<ServerState>,
+    /// the level of the dimension this player is in
+    game: Arc<crate::game::Game>,
     me: Arc<Player>,
     base_view: i32,
     view: i32,
@@ -417,6 +423,10 @@ struct Session {
     sneaking: bool,
     next_window: u8,
     checker: MovementChecker,
+    /// ticks spent in a nether portal (`PortalProcessor.portalTime`)
+    portal_time: i32,
+    /// `Entity.portalCooldown`
+    portal_cooldown: i32,
     combat: CombatChecker,
     vl: Violations,
     mining: MiningStats,
@@ -448,15 +458,18 @@ enum Flow {
 }
 
 impl Session {
-    fn new(st: Arc<ServerState>, me: Arc<Player>, view: i32) -> Self {
+    fn new(st: Arc<ServerState>, game: Arc<crate::game::Game>, me: Arc<Player>, view: i32) -> Self {
         let p = me.pose.lock().pos;
         Self {
             st,
+            game,
             me,
             base_view: view,
             view,
             center: ((p[0].floor() as i32) >> 4, (p[2].floor() as i32) >> 4),
             sent: HashSet::new(),
+            portal_time: 0,
+            portal_cooldown: 0,
             queue: Vec::new(),
             in_flight: 0,
             chunks_per_tick: 9.0,
@@ -491,11 +504,11 @@ impl Session {
     }
 
     fn send(&self, name: &str, body: &[u8]) {
-        self.me.send(self.st.game.encode(name, body));
+        self.me.send(self.game.encode(name, body));
     }
 
     fn msg(&self, text: &str) {
-        self.me.send(self.st.game.system_chat(text));
+        self.me.send(self.game.system_chat(text));
     }
 
     fn now_ms(&self) -> u64 {
@@ -546,7 +559,7 @@ impl Session {
         b.i32(self.me.eid).bool(false).vi(3).str("minecraft:overworld").str("minecraft:the_end").str("minecraft:the_nether");
         b.vi(st.cfg.server.max_players as i32).vi(self.view).vi(st.cfg.server.simulation_distance as i32);
         b.bool(false).bool(true).bool(false);
-        b.vi(cd.entry_id("minecraft:dimension_type", "minecraft:overworld")).str("minecraft:overworld").i64(hashed_seed(st.seed));
+        b.vi(cd.entry_id("minecraft:dimension_type", self.game.dim.key())).str(self.game.dim.key()).i64(hashed_seed(st.seed));
         b.u8(gm as u8).u8(255).bool(false).bool(false).bool(false).vi(0).vi(63);
         b.bool(false);
         self.send("login", &b);
@@ -557,7 +570,7 @@ impl Session {
         self.send("commands", &commands_body());
         self.teleport(pose.pos, pose.yaw, pose.pitch);
         // tab list: everyone online, then announce me to everyone
-        let all = st.game.players();
+        let all = self.st.all_players();
         let mut b = Vec::new();
         b.u8(0x01 | 0x04 | 0x08 | 0x10).vi(all.len() as i32);
         for p in &all {
@@ -570,7 +583,7 @@ impl Session {
         b.u8(0x01 | 0x04 | 0x08 | 0x10).vi(1).uuid(self.me.uuid).str(&self.me.name);
         write_props(&mut b, &self.me.props);
         b.vi(gm).bool(true).vi(0);
-        let info = st.game.encode("player_info_update", &b);
+        let info = self.game.encode("player_info_update", &b);
         for p in &all {
             if p.eid != self.me.eid {
                 p.send(info.clone());
@@ -579,7 +592,7 @@ impl Session {
         let join_msg = format!("§e{} joined the game", self.me.name);
         let join_msg = if crate::plugins::active() { crate::plugins::join(&self.me.name, &join_msg) } else { join_msg };
         if !join_msg.is_empty() {
-            st.game.broadcast(st.game.system_chat(&join_msg));
+            self.st.broadcast_all(self.game.system_chat(&join_msg));
         }
         let mut b = Vec::new();
         b.f64(0.0).f64(0.0).f64(59_999_968.0).f64(59_999_968.0).vl(0).vi(29_999_984).vi(5).vi(15);
@@ -609,8 +622,8 @@ impl Session {
         let mut b = Vec::new();
         b.vi(0);
         self.send("set_held_slot", &b);
-        self.send("update_recipes", &crate::game::workstation::update_recipes(&self.st.game.data));
-        self.st.game.send_inventory(&self.me);
+        self.send("update_recipes", &crate::game::workstation::update_recipes(&self.game.data));
+        self.game.send_inventory(&self.me);
     }
 
     fn send_abilities(&self) {
@@ -633,7 +646,10 @@ impl Session {
     }
 
     fn send_weather(&self) {
-        for pkt in self.st.game.weather_packets() {
+        if self.game.dim != crate::world::storage::Dim::Overworld {
+            return;
+        }
+        for pkt in self.game.weather_packets() {
             self.me.send(pkt);
         }
     }
@@ -676,8 +692,8 @@ impl Session {
         let gone: Vec<(i32, i32)> = self.sent.iter().copied().filter(|c| !self.in_view(*c, center, self.view)).collect();
         for c in gone {
             self.sent.remove(&c);
-            self.st.game.world.remove_viewer(c.0, c.1);
-            let eids = self.st.game.entities_in(c);
+            self.game.world.remove_viewer(c.0, c.1);
+            let eids = self.game.entities_in(c);
             if !eids.is_empty() {
                 let mut b = Vec::new();
                 b.vi(eids.len() as i32);
@@ -730,7 +746,7 @@ impl Session {
         }
         let limits = self.budget.limits(&self.st.cfg.player_cost, self.base_view as u32);
         let mut n = (self.chunks_per_tick.ceil() as usize).clamp(1, 64).min(limits.chunk_sends_per_tick.max(1) as usize * 4);
-        let world = &self.st.game.world;
+        let world = &self.game.world;
         let mut batch = Vec::with_capacity(n);
         while batch.len() < n {
             let Some(c) = self.queue.pop() else { break };
@@ -747,6 +763,7 @@ impl Session {
             return;
         }
         let st = self.st.clone();
+        let game = self.game.clone();
         let coords = batch.clone();
         // load/generate (with neighbours: a chunk's light depends on its 3x3
         // neighbourhood) and build the packets on the blocking pool, in
@@ -755,8 +772,8 @@ impl Session {
             let mut all: Vec<(i32, i32)> = coords.iter().flat_map(|&(x, z)| (-1..=1).flat_map(move |dx| (-1..=1).map(move |dz| (x + dx, z + dz)))).collect();
             all.sort_unstable();
             all.dedup();
-            let world = &st.game.world;
-            world.ensure_loaded(&all, &st.store, &st.generator);
+            let world = &game.world;
+            world.ensure_loaded(&all, &st.store, st.generator_of(game.dim));
             let xray_mode = st.cfg.anticheat.xray;
             let xray_on = xray_mode != XrayMode::Off && st.cfg.anticheat.enabled;
             let seed = st.generator.seed;
@@ -785,7 +802,7 @@ impl Session {
 
     fn send_built(&mut self, built: Vec<((i32, i32), Option<Arc<Vec<u8>>>)>) {
         let st = self.st.clone();
-        let world = &st.game.world;
+        let world = &self.game.world;
         self.send("chunk_batch_start", &[]);
         let mut count = 0;
         for (c, pkt) in built {
@@ -797,7 +814,7 @@ impl Session {
                 world.add_viewer(c.0, c.1);
                 self.sent.insert(c);
                 count += 1;
-                for e in self.st.game.entity_spawns_in(c) {
+                for e in self.game.entity_spawns_in(c) {
                     self.me.send(e);
                 }
             }
@@ -852,6 +869,7 @@ impl Session {
         }
         self.track_players();
         self.tick_vitals();
+        self.tick_portal().await;
         self.pump_chunks().await;
         Flow::Continue
     }
@@ -860,7 +878,7 @@ impl Session {
 
     fn surroundings(&self) -> Surroundings {
         let pose = *self.me.pose.lock();
-        let w = &self.st.game.world;
+        let w = &self.game.world;
         let reg = BlockRegistry::get();
         let at = |dy: f64| w.get_block(pose.pos[0].floor() as i32, (pose.pos[1] + dy).floor() as i32, pose.pos[2].floor() as i32).unwrap_or(blocks::AIR);
         let water = |s: BlockState| matches!(s.name(), "water" | "bubble_column" | "kelp" | "kelp_plant" | "seagrass" | "tall_seagrass") || reg.property(s, "waterlogged") == Some("true");
@@ -929,7 +947,7 @@ impl Session {
             self.me.vit.lock().living.attack_ticker = 0;
         }
         let st = self.st.clone();
-        st.game.with_player(&self.me, |l, eq, body| {
+        self.game.with_player(&self.me, |l, eq, body| {
             l.tick_counters();
             l.tick_effects(eq, body, &mut rand::thread_rng());
         });
@@ -960,7 +978,7 @@ impl Session {
             b.u8(8).vi(0).u8(living_flags);
             b.u8(17).vi(3).f32(absorption);
             b.u8(0xff);
-            let pkt = self.st.game.encode("set_entity_data", &b);
+            let pkt = self.game.encode("set_entity_data", &b);
             self.to_viewers(pkt, true);
         }
     }
@@ -969,7 +987,7 @@ impl Session {
     fn to_viewers(&self, pkt: Arc<Vec<u8>>, me: bool) {
         let pos = self.me.pose.lock().pos;
         let c = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
-        for p in self.st.game.players() {
+        for p in self.game.players() {
             if p.eid == self.me.eid {
                 if me {
                     p.send(pkt.clone());
@@ -987,7 +1005,7 @@ impl Session {
             return None;
         }
         let pose = *self.me.pose.lock();
-        let Some(bx) = self.st.game.entity_box(target) else { return None };
+        let Some(bx) = self.game.entity_box(target) else { return None };
         let eye = [pose.pos[0], pose.pos[1] + 1.62, pose.pos[2]];
         if self.st.cfg.anticheat.enabled {
             let flags = self.combat.on_attack(self.now_ms(), eye, pose.yaw, pose.pitch, target as u32, &[bx], gm == 1);
@@ -1005,13 +1023,13 @@ impl Session {
             return None;
         }
         let st = self.st.clone();
-        st.game.player_attack(&self.me, target);
+        self.game.player_attack(&self.me, target);
         None
     }
 
     fn damage(&mut self, src: DamageSource, amount: f32) -> bool {
         let st = self.st.clone();
-        st.game.hurt_player(&self.me, &src, amount)
+        self.game.hurt_player(&self.me, &src, amount)
     }
 
     /// Stops using the held item (shield lowered / disabled).
@@ -1035,7 +1053,7 @@ impl Session {
             v.living.last_hurt_by_player.or(v.living.last_hurt_by_mob).map(|c| c.0)
         };
         let me_name = serde_json::json!({"text": self.me.name});
-        let msg_json = self.st.game.death_message(&src, me_name, credit);
+        let msg_json = self.game.death_message(&src, me_name, credit);
         let msg_nbt = crate::nbt::Tag::from_json(&msg_json).to_network_bytes();
         {
             let mut v = self.me.vit.lock();
@@ -1058,11 +1076,11 @@ impl Session {
         self.send("player_combat_kill", &b);
         let mut b = Vec::new();
         b.i32(self.me.eid).u8(3);
-        let pkt = self.st.game.encode("entity_event", &b);
+        let pkt = self.game.encode("entity_event", &b);
         self.to_viewers(pkt, false);
         let mut chat = msg_nbt.clone();
         chat.bool(false);
-        self.st.game.broadcast(self.st.game.encode("system_chat", &chat));
+        self.st.broadcast_all(self.game.encode("system_chat", &chat));
         tracing::info!("{} died: {}", self.me.name, msg_json);
         // Inventory.dropAll
         let stacks: Vec<Stack> = {
@@ -1079,8 +1097,194 @@ impl Session {
         for s in stacks {
             self.throw(s, true);
         }
-        self.st.game.flush_inventory(&self.me);
+        self.game.flush_inventory(&self.me);
         self.me.moved.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Move this player's state into another dimension's level (no packets
+    /// to the client).
+    fn switch_level(&mut self, dim: crate::world::storage::Dim) {
+        let old = self.game.clone();
+        let new = self.st.level(dim).clone();
+        if Arc::ptr_eq(&old, &new) {
+            return;
+        }
+        old.leave(self.me.eid);
+        let mut b = Vec::new();
+        b.vi(1).vi(self.me.eid);
+        old.broadcast(old.encode("remove_entities", &b));
+        for c in self.sent.drain() {
+            old.world.remove_viewer(c.0, c.1);
+        }
+        self.queue.clear();
+        if let Some(h) = self.building.take() {
+            h.abort();
+        }
+        self.in_flight = 0;
+        self.tracked.clear();
+        self.close_window_silently();
+        new.adopt(self.me.clone());
+        self.game = new;
+    }
+
+    /// `ServerPlayer.teleport` to another dimension: respawn packet, then
+    /// the position and everything the client forgets with its level.
+    pub(crate) fn change_dimension(&mut self, dim: crate::world::storage::Dim, pos: [f64; 3], yaw: f32, pitch: f32) {
+        if dim == self.game.dim {
+            self.teleport(pos, yaw, pitch);
+            let c = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
+            self.set_center(c, false);
+            return;
+        }
+        self.switch_level(dim);
+        let st = self.st.clone();
+        let cd = &st.config_data;
+        let gm = self.gamemode();
+        let mut b = Vec::new();
+        b.vi(cd.entry_id("minecraft:dimension_type", dim.key())).str(dim.key()).i64(hashed_seed(st.seed));
+        b.u8(gm as u8).u8(255).bool(false).bool(false).bool(false).vi(0).vi(63);
+        // keep attributes and entity data
+        b.u8(0x03);
+        self.send("respawn", &b);
+        let mut b = Vec::new();
+        b.vi(2).bool(false);
+        self.send("change_difficulty", &b);
+        self.send_abilities();
+        self.teleport(pos, yaw, pitch);
+        let c = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
+        self.center = c;
+        self.set_center(c, true);
+        let mut b = Vec::new();
+        b.u8(13).f32(0.0);
+        self.send("game_event", &b);
+        self.send_time();
+        self.send_weather();
+        let mut b = Vec::new();
+        b.vi(self.me.held.load(Ordering::Relaxed));
+        self.send("set_held_slot", &b);
+        self.game.send_inventory(&self.me);
+        {
+            let mut v = self.me.vit.lock();
+            v.dirty = true;
+            v.data_dirty = true;
+            v.fall_distance = 0.0;
+        }
+        let pkt = self.game.attributes_packet(self.me.eid, &mut self.me.vit.lock().living);
+        self.me.send(pkt);
+        self.resend_effects();
+        self.me.moved.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `Entity.handlePortal` for this player.
+    async fn tick_portal(&mut self) {
+        use crate::game::portal;
+        use crate::world::storage::Dim;
+        if self.me.vit.lock().dead() {
+            return;
+        }
+        let touched = portal::portal_touched(&self.game, &self.me);
+        if self.portal_cooldown > 0 {
+            self.portal_cooldown -= 1;
+            if touched.is_some() {
+                self.portal_cooldown = 10;
+            }
+            self.portal_time = 0;
+            return;
+        }
+        let Some((at, kind)) = touched else {
+            self.portal_time = (self.portal_time - 4).max(0);
+            return;
+        };
+        let gm = self.gamemode();
+        match kind {
+            "nether_portal" => {
+                if !portal::in_portal_dimension(&self.game) {
+                    return;
+                }
+                self.portal_time += 1;
+                let delay = if gm == 1 { 1 } else { 80 };
+                if self.portal_time < delay {
+                    return;
+                }
+                self.portal_time = 0;
+                self.portal_cooldown = 10;
+                let dest_dim = if self.game.dim == Dim::Nether { Dim::Overworld } else { Dim::Nether };
+                let pose = *self.me.pose.lock();
+                let scale = if dest_dim == Dim::Nether { 1.0 / 8.0 } else { 8.0 };
+                let exit = ((pose.pos[0] * scale).floor() as i32, (pose.pos[2] * scale).floor() as i32);
+                self.load_area(dest_dim, exit, 2).await;
+                let dest = self.st.level(dest_dim).clone();
+                // the known portals in search range must be loaded to be found
+                let r = if dest_dim == Dim::Nether { 16 } else { 128 };
+                let mut near: Vec<(i32, i32)> = dest.portals.lock().iter().filter(|p| (p[0] - exit.0).abs() <= r && (p[2] - exit.1).abs() <= r).map(|p| (p[0] >> 4, p[2] >> 4)).collect();
+                near.sort_unstable();
+                near.dedup();
+                if !near.is_empty() {
+                    let st = self.st.clone();
+                    let _ = tokio::task::spawn_blocking(move || st.level(dest_dim).world.ensure_loaded(&near, &st.store, st.generator_of(dest_dim))).await;
+                }
+                let Some((pos, dyaw)) = portal::nether_destination(&self.game, &dest, at, pose.pos) else {
+                    tracing::warn!("{}: no portal destination from {:?}", self.me.name, at);
+                    return;
+                };
+                tracing::info!("{} travels through the portal at {:?} to {:?} {:?}", self.me.name, at, dest_dim, pos);
+                self.change_dimension(dest_dim, pos, pose.yaw + dyaw, pose.pitch);
+                // LevelEvent.SOUND_PORTAL_TRAVEL, heard only by this player
+                let mut b = Vec::new();
+                b.i32(1032).pos(0, 0, 0).i32(0).bool(false);
+                self.send("level_event", &b);
+            }
+            "end_portal" => {
+                self.portal_cooldown = 10;
+                if self.game.dim == Dim::End {
+                    // the exit portal: back to the respawn point
+                    self.load_area(Dim::Overworld, ((self.st.spawn[0] as i32) >> 4 << 4, (self.st.spawn[2] as i32) >> 4 << 4), 1).await;
+                    let ow = self.st.level(Dim::Overworld).clone();
+                    let bed = self.me.vit.lock().respawn;
+                    let spawn = bed.and_then(|h| crate::game::block::use_block::stand_up_pos(&ow, h)).unwrap_or(self.st.spawn);
+                    self.change_dimension(Dim::Overworld, spawn, 0.0, 0.0);
+                } else {
+                    let s = portal::END_SPAWN;
+                    self.load_area(Dim::End, (s[0], s[2]), 1).await;
+                    let end = self.st.level(Dim::End).clone();
+                    portal::end_platform(&end, [s[0], s[1] - 1, s[2]]);
+                    let pos = [s[0] as f64 + 0.5, (s[1] - 1) as f64, s[2] as f64 + 0.5];
+                    self.change_dimension(Dim::End, pos, 90.0, 0.0);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Load or generate the chunks within `r` chunks of block (`x`, `z`) in
+    /// another dimension (off this session's thread).
+    async fn load_area(&self, dim: crate::world::storage::Dim, at: (i32, i32), r: i32) {
+        let st = self.st.clone();
+        let (cx, cz) = (at.0 >> 4, at.1 >> 4);
+        let _ = tokio::task::spawn_blocking(move || {
+            let all: Vec<(i32, i32)> = (-r..=r).flat_map(|dx| (-r..=r).map(move |dz| (cx + dx, cz + dz))).collect();
+            st.level(dim).world.ensure_loaded(&all, &st.store, st.generator_of(dim));
+        })
+        .await;
+    }
+
+    fn close_window_silently(&mut self) {
+        let held = self.me.held.load(Ordering::Relaxed) as i16;
+        let thrown = self.me.inv.lock().close(&self.game.data, held);
+        for t in thrown {
+            self.throw(t, false);
+        }
+    }
+
+    /// The respawn packet clears the client's effects: send them again.
+    fn resend_effects(&self) {
+        let effects: Vec<_> = self.me.vit.lock().living.effects.clone();
+        for e in effects {
+            let mut b = Vec::new();
+            b.vi(self.me.eid);
+            e.write(&mut b);
+            self.send("update_mob_effect", &b);
+        }
     }
 
     fn respawn(&mut self) {
@@ -1089,11 +1293,14 @@ impl Session {
         }
         self.me.vit.lock().respawn();
         self.death_shown = false;
+        if self.game.dim != crate::world::storage::Dim::Overworld {
+            self.switch_level(crate::world::storage::Dim::Overworld);
+        }
         let st = self.st.clone();
         let cd = &st.config_data;
         let gm = self.gamemode();
         let mut b = Vec::new();
-        b.vi(cd.entry_id("minecraft:dimension_type", "minecraft:overworld")).str("minecraft:overworld").i64(hashed_seed(st.seed));
+        b.vi(cd.entry_id("minecraft:dimension_type", self.game.dim.key())).str(self.game.dim.key()).i64(hashed_seed(st.seed));
         b.u8(gm as u8).u8(255).bool(false).bool(false).bool(false).vi(0).vi(63);
         b.u8(0);
         self.send("respawn", &b);
@@ -1102,7 +1309,7 @@ impl Session {
         let bed = self.me.vit.lock().respawn;
         let mut spawn = st.spawn;
         if let Some(h) = bed {
-            match crate::game::block::use_block::stand_up_pos(&st.game, h) {
+            match crate::game::block::use_block::stand_up_pos(&self.game, h) {
                 Some(p) => spawn = p,
                 None => {
                     self.me.vit.lock().respawn = None;
@@ -1121,11 +1328,11 @@ impl Session {
         let mut b = Vec::new();
         b.vi(self.me.held.load(Ordering::Relaxed));
         self.send("set_held_slot", &b);
-        st.game.send_inventory(&self.me);
+        self.game.send_inventory(&self.me);
         self.send_time();
         self.send_weather();
         // the respawn packet resets client attributes: resend them all
-        let pkt = st.game.attributes_packet(self.me.eid, &mut self.me.vit.lock().living);
+        let pkt = self.game.attributes_packet(self.me.eid, &mut self.me.vit.lock().living);
         self.me.send(pkt);
     }
 
@@ -1174,7 +1381,7 @@ impl Session {
         let mut b = Vec::new();
         b.i32(self.me.eid).u8(9);
         self.send("entity_event", &b);
-        st.game.consume(&self.me, held);
+        self.game.consume(&self.me, held);
         // use_cooldown
         if let Some(t) = crate::game::consume::use_cooldown(&held) {
             {
@@ -1200,7 +1407,7 @@ impl Session {
                 }
             }
         }
-        st.game.flush_inventory(&self.me);
+        self.game.flush_inventory(&self.me);
     }
 
     fn per_second(&mut self) {
@@ -1217,7 +1424,7 @@ impl Session {
         self.act_packets = 0;
         let st = self.st.clone();
         let cfg = &st.cfg;
-        let limits = self.budget.update(&cfg.player_cost, self.st.mspt() as f64, self.st.game.count(), estimate_cost(&act), self.base_view as u32);
+        let limits = self.budget.update(&cfg.player_cost, self.st.mspt() as f64, self.game.count(), estimate_cost(&act), self.base_view as u32);
         let new_view = limits.view_distance as i32;
         if new_view != self.view {
             self.view = new_view;
@@ -1236,7 +1443,7 @@ impl Session {
     }
 
     fn track_players(&mut self) {
-        let others = self.st.game.players();
+        let others = self.game.players();
         let mut seen = HashSet::new();
         let ptype = Registries::get().id("minecraft:entity_type", "minecraft:player").unwrap_or(0);
         for p in others.iter().filter(|p| p.eid != self.me.eid) {
@@ -1342,7 +1549,7 @@ impl Session {
             let pos = r.pos()?;
             let front = r.bool()?;
             let lines = [r.string(384)?.to_string(), r.string(384)?.to_string(), r.string(384)?.to_string(), r.string(384)?.to_string()];
-            self.st.game.sign_update(&self.me, [pos.0, pos.1, pos.2], front, lines);
+            self.game.sign_update(&self.me, [pos.0, pos.1, pos.2], front, lines);
         } else if pid == sb("container_button_click") {
             let window = r.varint()?;
             let id = r.varint()?;
@@ -1353,7 +1560,7 @@ impl Session {
         } else if pid == sb("set_beacon") {
             let primary = if r.bool()? { Some(r.varint()?) } else { None };
             let secondary = if r.bool()? { Some(r.varint()?) } else { None };
-            crate::game::workstation::set_beacon(&self.st.game, &self.me, primary, secondary);
+            crate::game::workstation::set_beacon(&self.game, &self.me, primary, secondary);
         } else if pid == sb("set_carried_item") {
             let s = r.i16()?;
             if (0..9).contains(&s) {
@@ -1394,11 +1601,11 @@ impl Session {
             return Ok(self.on_click(&mut r));
         } else if pid == sb("container_close") {
             let held = self.me.held.load(Ordering::Relaxed) as i16;
-            let thrown = self.me.inv.lock().close(&self.st.game.data, held);
+            let thrown = self.me.inv.lock().close(&self.game.data, held);
             for t in thrown {
                 self.throw(t, false);
             }
-            self.st.game.send_inventory(&self.me);
+            self.game.send_inventory(&self.me);
         } else if pid == sb("player_input") {
             self.sneaking = r.u8()? & 0x20 != 0;
         } else if pid == sb("interact") {
@@ -1407,13 +1614,13 @@ impl Session {
             // `Vec3.LP` location and the secondary-action flag follow
             let near = {
                 let me = self.me.pose.lock().pos;
-                self.st.game.entity_box(target).is_some_and(|b| {
+                self.game.entity_box(target).is_some_and(|b| {
                     let c = [me[0].clamp(b.min[0], b.max[0]), (me[1] + 1.62).clamp(b.min[1], b.max[1]), me[2].clamp(b.min[2], b.max[2])];
                     (c[0] - me[0]).powi(2) + (c[1] - me[1] - 1.62).powi(2) + (c[2] - me[2]).powi(2) < 36.0
                 })
             };
             if near {
-                self.st.game.interact_mob(&self.me, target, hand);
+                self.game.interact_mob(&self.me, target, hand);
             }
         } else if pid == sb("attack") {
             let target = r.varint()?;
@@ -1424,10 +1631,10 @@ impl Session {
             let hand = r.varint()?;
             let mut b = Vec::new();
             b.vi(self.me.eid).u8(if hand == 1 { 3 } else { 0 });
-            let pkt = self.st.game.encode("animate", &b);
+            let pkt = self.game.encode("animate", &b);
             let pos = self.me.pose.lock().pos;
             let c = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
-            for p in self.st.game.players() {
+            for p in self.game.players() {
                 if p.eid != self.me.eid && p.sees_chunk(c.0, c.1) {
                     p.send(pkt.clone());
                 }
@@ -1435,7 +1642,7 @@ impl Session {
         } else if pid == sb("player_command") {
             let _eid = r.varint()?;
             match r.varint()? {
-                0 => self.st.game.wake_up(&self.me),
+                0 => self.game.wake_up(&self.me),
                 1 => self.sprinting = true,
                 2 => self.sprinting = false,
                 6 => self.gliding = true,
@@ -1509,7 +1716,7 @@ impl Session {
         let dy = to[1] - self.last_y;
         self.last_y = to[1];
         let gm = self.gamemode();
-        let below = self.st.game.world.get_block(to[0].floor() as i32, (to[1] - 0.2).floor() as i32, to[2].floor() as i32).unwrap_or(blocks::AIR);
+        let below = self.game.world.get_block(to[0].floor() as i32, (to[1] - 0.2).floor() as i32, to[2].floor() as i32).unwrap_or(blocks::AIR);
         let landing = crate::game::hazards::landing(below, self.sneaking);
         let reset = ctx.in_liquid || ctx.climbing || ctx.in_web_or_powder_snow || (self.gliding && dy > -0.5) || (on_ground && landing.is_none());
         // Entity flags used by the attack code (crit / sweep conditions)
@@ -1546,7 +1753,7 @@ impl Session {
     }
 
     fn move_context(&self, to: [f64; 3]) -> MoveContext {
-        let w = &self.st.game.world;
+        let w = &self.game.world;
         let reg = BlockRegistry::get();
         let (x, y, z) = (to[0].floor() as i32, to[1].floor() as i32, to[2].floor() as i32);
         let at = |dy: i32| w.get_block(x, y + dy, z).unwrap_or(blocks::AIR);
@@ -1608,8 +1815,8 @@ impl Session {
     fn alert(&self, text: &str) {
         tracing::warn!("[anticheat] {text}");
         if self.st.cfg.anticheat.notify_ops {
-            let pkt = self.st.game.system_chat(&format!("§c[RimeMC AC]§r {text}"));
-            for p in self.st.game.players() {
+            let pkt = self.game.system_chat(&format!("§c[RimeMC AC]§r {text}"));
+            for p in self.st.all_players() {
                 if self.st.ops.is_op(&CommandSender::Player { name: p.name.clone() }) {
                     p.send(pkt.clone());
                 }
@@ -1628,7 +1835,7 @@ impl Session {
             return Flow::Continue;
         };
         tracing::info!("{line}");
-        self.st.game.broadcast(self.st.game.system_chat(&line));
+        self.st.broadcast_all(self.game.system_chat(&line));
         Flow::Continue
     }
 
@@ -1666,6 +1873,33 @@ impl Session {
                 let s = self.st.spawn;
                 self.teleport(s, 0.0, 0.0);
             }
+            "execute" => {
+                if !self.st.ops.is_op(&sender) {
+                    self.msg("§cYou do not have permission (operator only).");
+                    return Flow::Continue;
+                }
+                // execute in <dimension> run tp <x> <y> <z>
+                let args: Vec<&str> = words.collect();
+                let dim = match args.as_slice() {
+                    ["in", d, "run", "tp" | "teleport", ..] => crate::world::storage::Dim::from_key(d),
+                    _ => None,
+                };
+                let Some(dim) = dim else {
+                    self.msg("§cUsage: /execute in <dimension> run tp <x> <y> <z>");
+                    return Flow::Continue;
+                };
+                let nums: Vec<f64> = args[4..].iter().filter_map(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && v.abs() < 2.9e7).collect();
+                let pose = *self.me.pose.lock();
+                let pos = if nums.len() == 3 { [nums[0], nums[1], nums[2]] } else { pose.pos };
+                let st = self.st.clone();
+                let (cx, cz) = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
+                let _ = tokio::task::block_in_place(|| {
+                    let all: Vec<(i32, i32)> = (-1..=1).flat_map(|dx| (-1..=1).map(move |dz| (cx + dx, cz + dz))).collect();
+                    st.level(dim).world.ensure_loaded(&all, &st.store, st.generator_of(dim));
+                });
+                self.change_dimension(dim, pos, pose.yaw, pose.pitch);
+                self.msg(&format!("Teleported {} to {:.1}, {:.1}, {:.1}", self.me.name, pos[0], pos[1], pos[2]));
+            }
             "tp" => {
                 if !self.st.ops.is_op(&sender) {
                     self.msg("§cYou do not have permission (operator only).");
@@ -1673,7 +1907,15 @@ impl Session {
                 }
                 let args: Vec<&str> = words.collect();
                 let target = match args.as_slice() {
-                    [name] => self.st.game.find(name).map(|p| p.pose.lock().pos),
+                    [name] => self.st.find_player(name).map(|p| {
+                        let d = crate::world::storage::Dim::from_index(p.dim.load(Ordering::Relaxed));
+                        let pos = p.pose.lock().pos;
+                        if d != self.game.dim {
+                            let pose = *self.me.pose.lock();
+                            self.change_dimension(d, pos, pose.yaw, pose.pitch);
+                        }
+                        pos
+                    }),
                     [x, y, z] => match (x.parse::<f64>(), y.parse::<f64>(), z.parse::<f64>()) {
                         (Ok(x), Ok(y), Ok(z)) if [x, y, z].iter().all(|v| v.is_finite() && v.abs() < 2.9e7) => Some([x, y, z]),
                         _ => None,
@@ -1704,7 +1946,7 @@ impl Session {
                         return Flow::Continue;
                     }
                 };
-                let target = if who == "@s" || who == "@p" { Some(self.me.clone()) } else { self.st.game.find(who) };
+                let target = if who == "@s" || who == "@p" { Some(self.me.clone()) } else { self.st.find_player(who) };
                 let Some(target) = target else {
                     self.msg("§cNo player was found");
                     return Flow::Continue;
@@ -1728,10 +1970,10 @@ impl Session {
                     let rest = target.inv.lock().add(st, held);
                     if rest > 0 {
                         let pos = target.pose.lock().pos;
-                        self.st.game.spawn_item(pos, Stack::new(id, rest), [0.0; 3], 0);
+                        self.game.spawn_item(pos, Stack::new(id, rest), [0.0; 3], 0);
                     }
                 }
-                self.st.game.flush_inventory(&target);
+                self.game.flush_inventory(&target);
                 self.msg(&format!("Gave {count} [{}] to {}", item.trim_start_matches("minecraft:"), target.name));
             }
             "setblock" | "fill" => {
@@ -1761,7 +2003,7 @@ impl Session {
                     self.msg(&format!("§cToo many blocks in the specified area (maximum 32768, specified {vol})"));
                     return Flow::Continue;
                 }
-                let g = &self.st.game;
+                let g = &self.game;
                 let mut changed = 0;
                 for x in lo[0]..=hi[0] {
                     for y in lo[1]..=hi[1] {
@@ -1815,7 +2057,7 @@ impl Session {
                     _ => None,
                 };
                 match (args.first(), pos) {
-                    (Some(name), Some(pos)) => match self.st.game.summon(name, pos) {
+                    (Some(name), Some(pos)) => match self.game.summon(name, pos) {
                         Some(_) => self.msg(&format!("Summoned new {}", name.trim_start_matches("minecraft:"))),
                         None => self.msg(&format!("§cUnknown or unsupported entity: {name}")),
                     },
@@ -1835,7 +2077,7 @@ impl Session {
                     ["set", "midnight"] => Some(18000),
                     ["set", n] => n.parse::<u64>().ok(),
                     ["query", "daytime"] | [] => {
-                        self.msg(&format!("The time is {}", self.st.game.day_time()));
+                        self.msg(&format!("The time is {}", self.game.day_time()));
                         None
                     }
                     _ => {
@@ -1844,7 +2086,7 @@ impl Session {
                     }
                 };
                 if let Some(t) = target {
-                    self.st.game.set_day_time(t);
+                    self.game.set_day_time(t);
                     self.send_time();
                     self.msg(&format!("Set the time to {t}"));
                 }
@@ -1854,11 +2096,11 @@ impl Session {
                     self.msg("§cYou do not have permission (operator only).");
                     return Flow::Continue;
                 }
-                let n = self.st.game.kill_mobs();
+                let n = self.game.kill_mobs();
                 self.msg(&format!("Killed {n} entities"));
             }
             "list" => {
-                let names: Vec<String> = self.st.game.players().iter().map(|p| p.name.clone()).collect();
+                let names: Vec<String> = self.st.all_players().iter().map(|p| p.name.clone()).collect();
                 self.msg(&format!("There are {} of a max of {} players online: {}", names.len(), self.st.cfg.server.max_players, names.join(", ")));
             }
             _ => {
@@ -1883,7 +2125,7 @@ impl Session {
         self.send_abilities();
         let mut b = Vec::new();
         b.u8(0x04).vi(1).uuid(self.me.uuid).vi(gm);
-        self.st.game.broadcast(self.st.game.encode("player_info_update", &b));
+        self.st.broadcast_all(self.game.encode("player_info_update", &b));
         self.me.moved.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1904,7 +2146,7 @@ impl Session {
 
     /// Re-send the real state of a block (after a rejected action).
     fn resync(&self, pos: (i32, i32, i32)) {
-        if let Some(b) = self.st.game.world.get_block(pos.0, pos.1, pos.2) {
+        if let Some(b) = self.game.world.get_block(pos.0, pos.1, pos.2) {
             let mut body = Vec::new();
             body.pos(pos.0, pos.1, pos.2).vi(b.0 as i32);
             self.send("block_update", &body);
@@ -1928,7 +2170,7 @@ impl Session {
                 };
                 if let Some(t) = taken {
                     self.throw(t, false);
-                    self.st.game.flush_inventory(&self.me);
+                    self.game.flush_inventory(&self.me);
                 }
                 return Flow::Continue;
             }
@@ -1943,7 +2185,7 @@ impl Session {
             _ => {}
         }
         let st = self.st.clone();
-        let w = &st.game.world;
+        let w = &self.game.world;
         let Some(cur) = w.get_block(pos.0, pos.1, pos.2) else {
             self.ack(seq);
             return Flow::Continue;
@@ -1985,9 +2227,9 @@ impl Session {
             if gm == 1 {
                 // playerWillDestroy: creative breaking of an upper / head part
                 // removes the other part without drops
-                st.game.prevent_drop_from_other_part([pos.0, pos.1, pos.2], cur);
+                self.game.prevent_drop_from_other_part([pos.0, pos.1, pos.2], cur);
             }
-            st.game.player_change_block([pos.0, pos.1, pos.2], after, gm == 0, tool);
+            self.game.player_change_block([pos.0, pos.1, pos.2], after, gm == 0, tool);
             self.me.vit.lock().add_exhaustion(0.005);
             self.ack(seq);
             self.after_change(pos);
@@ -2012,7 +2254,7 @@ impl Session {
             vel[1] += (rng.gen_range(0.0..1.0) - rng.gen_range(0.0..1.0)) * 0.1;
             vel[2] += a.sin() * f;
         }
-        self.st.game.spawn_item([pose.pos[0], pose.pos[1] + 1.62 - 0.3, pose.pos[2]], st, vel, 40);
+        self.game.spawn_item([pose.pos[0], pose.pos[1] + 1.62 - 0.3, pose.pos[2]], st, vel, 40);
     }
 
     fn on_click(&mut self, r: &mut Reader) -> Flow {
@@ -2065,12 +2307,12 @@ impl Session {
             let mut inv = self.me.inv.lock();
             if window != inv.current_window() as i32 {
                 drop(inv);
-                self.st.game.send_inventory(&self.me);
+                self.game.send_inventory(&self.me);
                 return Flow::Continue;
             }
             inv.menu.creative = creative;
             inv.menu.xp_level = self.me.vit.lock().xp_level;
-            let out = inv.click(&self.st.game.data, slot, button, mode, creative);
+            let out = inv.click(&self.game.data, slot, button, mode, creative);
             let contents = inv.window_contents();
             let as_pair = |s: Option<Stack>| s.map(|s| (s.item, s.count as i32));
             let ok = predicted.iter().all(|(loc, pred)| contents.get(*loc as usize).is_some_and(|s| as_pair(*s) == *pred)) && as_pair(inv.cursor) == cursor;
@@ -2089,17 +2331,17 @@ impl Session {
         match open {
             Some((_, sc, _)) if sc.transient() => self.menu_events(),
             Some((p, _, ext)) => {
-                let stored = self.st.game.container_slots(p);
+                let stored = self.game.container_slots(p);
                 if stored.as_ref() != Some(&ext) {
-                    self.st.game.set_container_slots(p, &ext, self.me.eid);
+                    self.game.set_container_slots(p, &ext, self.me.eid);
                 }
             }
             None => {}
         }
         if matches {
-            self.st.game.flush_inventory(&self.me);
+            self.game.flush_inventory(&self.me);
         } else {
-            self.st.game.send_inventory(&self.me);
+            self.game.send_inventory(&self.me);
         }
         Flow::Continue
     }
@@ -2116,7 +2358,7 @@ impl Session {
         while t <= reach {
             let c = ((eye[0] + dir[0] * t).floor() as i32, (eye[1] + dir[1] * t).floor() as i32, (eye[2] + dir[2] * t).floor() as i32);
             if c != prev {
-                let b = self.st.game.world.get_block(c.0, c.1, c.2)?;
+                let b = self.game.world.get_block(c.0, c.1, c.2)?;
                 if stop(b) {
                     return Some((prev, c));
                 }
@@ -2148,7 +2390,7 @@ impl Session {
         let items = Items::get();
         let name = items.name(held.item).to_string();
         let gm = self.gamemode();
-        let game = &self.st.game;
+        let game = &*self.game.clone();
         match name.as_str() {
             "bucket" => {
                 let hit = self.raycast(yaw, pitch, &|b| fluid::fluid_state(b).is_source() || b.is_solid());
@@ -2222,9 +2464,9 @@ impl Session {
     fn after_change(&self, pos: (i32, i32, i32)) {
         if self.st.cfg.anticheat.enabled && self.st.cfg.anticheat.xray != XrayMode::Off {
             for p in xray::reveal_around([pos.0, pos.1, pos.2]) {
-                if let Some(b) = self.st.game.world.get_block(p[0], p[1], p[2]) {
+                if let Some(b) = self.game.world.get_block(p[0], p[1], p[2]) {
                     if b.is_ore() {
-                        self.st.game.broadcast_block(p[0], p[1], p[2], b);
+                        self.game.broadcast_block(p[0], p[1], p[2], b);
                     }
                 }
             }
@@ -2237,7 +2479,7 @@ impl Session {
         {
             let held = self.me.held.load(Ordering::Relaxed) as i16;
             let mut inv = self.me.inv.lock();
-            let thrown = inv.close(&self.st.game.data, held);
+            let thrown = inv.close(&self.game.data, held);
             inv.window = crate::game::inventory::Window::Crafting(id);
             drop(inv);
             for t in thrown {
@@ -2248,7 +2490,7 @@ impl Session {
         let mut b = Vec::new();
         b.vi(id as i32).vi(menu).raw(&text_nbt("Crafting"));
         self.send("open_screen", &b);
-        self.st.game.send_inventory(&self.me);
+        self.game.send_inventory(&self.me);
     }
 
     fn open_container(&mut self, p: [i32; 3], screen: crate::game::blockentity::Screen, title: &str) {
@@ -2257,7 +2499,7 @@ impl Session {
             self.open_menu(p, screen, title);
             return;
         }
-        let game = &self.st.game;
+        let game = &*self.game.clone();
         let mut t = match game.world.block_entity(p) {
             Some(t) => t,
             None => {
@@ -2292,7 +2534,7 @@ impl Session {
         b.vi(id as i32).vi(menu).raw(&text_nbt(title));
         self.send("open_screen", &b);
         let st = self.st.clone();
-        let game = &st.game;
+        let game = &*self.game.clone();
         game.send_inventory(&self.me);
         if let be::Screen::Furnace(_) = screen {
             game.send_furnace_data(&self.me, p);
@@ -2308,7 +2550,7 @@ impl Session {
     fn open_menu(&mut self, p: [i32; 3], screen: crate::game::blockentity::Screen, title: &str) {
         use crate::game::blockentity::Screen;
         let st = self.st.clone();
-        let game = &st.game;
+        let game = &*self.game.clone();
         self.next_window = self.next_window % 100 + 1;
         let id = self.next_window;
         {
@@ -2345,7 +2587,7 @@ impl Session {
     fn menu_events(&mut self) {
         use crate::game::menu::MenuEvent;
         let st = self.st.clone();
-        let game = &st.game;
+        let game = &*self.game.clone();
         let (events, pos) = {
             let mut inv = self.me.inv.lock();
             (std::mem::take(&mut inv.menu.events), inv.menu.pos)
@@ -2384,7 +2626,7 @@ impl Session {
 
     fn menu_button(&mut self, window: i32, id: i32) {
         let st = self.st.clone();
-        let game = &st.game;
+        let game = &*self.game.clone();
         let ok = {
             let mut inv = self.me.inv.lock();
             if window != inv.current_window() as i32 || window == 0 {
@@ -2402,7 +2644,7 @@ impl Session {
 
     fn rename_item(&mut self, name: String) {
         let st = self.st.clone();
-        let game = &st.game;
+        let game = &*self.game.clone();
         {
             let mut inv = self.me.inv.lock();
             if !matches!(inv.window, crate::game::inventory::Window::Container(_, crate::game::blockentity::Screen::Anvil, _)) {
@@ -2436,7 +2678,7 @@ impl Session {
         let slot = if hand == 1 { 45 } else { 36 + self.me.held.load(Ordering::Relaxed) as usize };
         let reg = BlockRegistry::get();
         let st = self.st.clone();
-        let game = &st.game;
+        let game = &*self.game.clone();
         let w = &game.world;
         let clicked = w.get_block(pos.0, pos.1, pos.2).unwrap_or(blocks::AIR);
         let yaw_pitch = {
@@ -2568,7 +2810,7 @@ impl Session {
         // don't place solid blocks inside players
         if state.is_solid() {
             let bx = [target.0 as f64, target.1 as f64, target.2 as f64];
-            for p in self.st.game.players() {
+            for p in self.game.players() {
                 if p.gamemode.load(Ordering::Relaxed) == 3 {
                     continue;
                 }

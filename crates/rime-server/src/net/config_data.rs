@@ -73,19 +73,30 @@ pub struct ConfigData {
     pub registries: Vec<(String, Vec<(String, Vec<u8>)>)>,
     /// body of the `update_tags` packet
     pub tags_body: Vec<u8>,
+    /// (registry, key) entries that differ from the vanilla core pack and
+    /// are always sent in full
+    pub forced: Vec<(String, String)>,
 }
 
 impl ConfigData {
     pub fn build(v: &VanillaData) -> anyhow::Result<Self> {
         let mut registries = Vec::new();
         let mut dynamic_ids: HashMap<String, HashMap<String, i32>> = HashMap::new();
+        let mut forced = Vec::new();
         for reg in SYNCED_REGISTRIES {
             let entries = v.entries(reg);
             anyhow::ensure!(!entries.is_empty(), "vanilla data has no entries for {reg}");
             let mut out = Vec::with_capacity(entries.len());
             let mut ids = HashMap::new();
             for (i, (key, path)) in entries.iter().enumerate() {
-                let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+                let mut json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+                // every dimension is stored with the overworld's -64..320
+                // sections, so the nether and the end tell the client so
+                if reg == "dimension_type" && (key == "minecraft:the_nether" || key == "minecraft:the_end") {
+                    json["min_y"] = serde_json::json!(-64);
+                    json["height"] = serde_json::json!(384);
+                    forced.push((format!("minecraft:{reg}"), key.clone()));
+                }
                 out.push((key.clone(), Tag::from_json(&json).to_network_bytes()));
                 ids.insert(key.clone(), i as i32);
             }
@@ -161,7 +172,7 @@ impl ConfigData {
                 }
             }
         }
-        Ok(Self { registries, tags_body: body })
+        Ok(Self { registries, tags_body: body, forced })
     }
 
     /// Body of one `registry_data` packet. With `known` the client already has
@@ -173,7 +184,7 @@ impl ConfigData {
         write_varint(&mut b, entries.len() as i32);
         for (k, nbt) in entries {
             write_string(&mut b, k);
-            if known {
+            if known && !self.forced.iter().any(|(r, e)| r == id && e == k) {
                 b.push(0);
             } else {
                 b.push(1);

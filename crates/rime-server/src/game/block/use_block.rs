@@ -50,7 +50,43 @@ pub fn use_block(g: &Game, p: [i32; 3], s: BlockState, cx: &Ctx) -> Use {
         g.set_block(p, blocks::AIR, flags::ALL | flags::SUPPRESS_DROPS);
         return Use::Consumed;
     }
+    // FlintAndSteelItem.useOn / FireChargeItem.useOn
+    if matches!(item, "flint_and_steel" | "fire_charge") {
+        let n = s.name();
+        let lightable = (n.ends_with("campfire") || n.ends_with("candle") || n.ends_with("candle_cake")) && s.prop("lit") == Some("false") && s.prop("waterlogged") != Some("true");
+        let done = if lightable {
+            g.set_block(p, with_bool(s, "lit", true), flags::ALL | 8);
+            let pos = [p[0] as f64 + 0.5, p[1] as f64 + 0.5, p[2] as f64 + 0.5];
+            g.play_sound(if item == "fire_charge" { "minecraft:item.firecharge.use" } else { "minecraft:item.flintandsteel.use" }, 4, pos, 1.0, rand::random::<f32>() * 0.4 + 0.8);
+            true
+        } else {
+            let o = crate::game::level::OFFSETS[cx.face as usize];
+            crate::game::portal::light_at(g, [p[0] + o[0], p[1] + o[1], p[2] + o[2]], cx.horiz, item == "fire_charge")
+        };
+        if done {
+            if !cx.creative {
+                if item == "fire_charge" {
+                    consume_held(g, cx.player, item);
+                } else {
+                    damage_held(g, cx.player, item);
+                }
+            }
+            return Use::Consumed;
+        }
+    }
     let secondary = cx.sneaking && cx.held.is_some();
+    // EnderEyeItem.useOn
+    if item == "ender_eye" && s.name() == "end_portal_frame" && s.prop("eye") == Some("false") {
+        let filled = with_bool(s, "eye", true);
+        g.set_block(p, filled, flags::CLIENTS);
+        g.update_neighbour_for_output_signal(p, filled);
+        if !cx.creative {
+            consume_held(g, cx.player, "ender_eye");
+        }
+        g.level_event(1503, p, 0);
+        crate::game::portal::try_end_portal(g, p);
+        return Use::Consumed;
+    }
     if secondary {
         return Use::Pass;
     }
@@ -565,4 +601,28 @@ impl Game {
             self.set_weather(0, 0, false, false);
         }
     }
+}
+
+/// Remove one of `item` from the hand holding it.
+fn consume_held(g: &Game, p: &Arc<Player>, item: &str) {
+    let id = Items::get().id(item);
+    let main = 36 + p.held.load(Ordering::Relaxed) as usize;
+    let mut inv = p.inv.lock();
+    let slot = if inv.slots[main].is_some_and(|s| Some(s.item) == id) { main } else { 45 };
+    inv.consume(slot, 1);
+    drop(inv);
+    g.flush_inventory(p);
+}
+
+/// `ItemStack.hurtAndBreak(1)` on the hand holding `item`.
+fn damage_held(g: &Game, p: &Arc<Player>, item: &str) {
+    let id = Items::get().id(item);
+    let main = p.inv.lock().slots[36 + p.held.load(Ordering::Relaxed) as usize].is_some_and(|s| Some(s.item) == id);
+    let slot = if main { crate::game::combat::living::MAINHAND } else { crate::game::combat::living::OFFHAND };
+    g.with_player(p, |l, eq, _| {
+        let mut evs = Vec::new();
+        crate::game::combat::living::hurt_and_break(eq, slot, 1, false, &mut evs, &mut rand::thread_rng());
+        l.events.extend(evs);
+    });
+    g.flush_inventory(p);
 }

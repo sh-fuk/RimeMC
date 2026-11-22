@@ -46,6 +46,27 @@ impl Dim {
         }
     }
     pub const ALL: [Dim; 3] = [Dim::Overworld, Dim::Nether, Dim::End];
+
+    /// The level / dimension type key (`minecraft:the_nether` …).
+    pub fn key(self) -> &'static str {
+        match self {
+            Dim::Overworld => "minecraft:overworld",
+            Dim::Nether => "minecraft:the_nether",
+            Dim::End => "minecraft:the_end",
+        }
+    }
+
+    pub fn from_key(k: &str) -> Option<Dim> {
+        Dim::ALL.into_iter().find(|d| d.key() == k || d.key().trim_start_matches("minecraft:") == k)
+    }
+
+    pub fn index(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_index(i: u8) -> Dim {
+        Dim::ALL[(i as usize).min(2)]
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

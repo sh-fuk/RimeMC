@@ -1203,6 +1203,14 @@ impl Game {
         self.broadcast_chunk(c, &self.encode("level_event", &b));
     }
 
+    /// A global level event (`ServerLevel.globalLevelEvent`): every player in
+    /// this dimension hears it.
+    pub fn level_event_global(&self, ev: i32, pos: [i32; 3]) {
+        let mut b = Vec::new();
+        b.i32(ev).pos(pos[0], pos[1], pos[2]).i32(0).bool(true);
+        self.broadcast(self.encode("level_event", &b));
+    }
+
     /// `Entity.extinguishFire`
     pub fn extinguish(&self, eid: i32) {
         if let Some(p) = self.players().into_iter().find(|p| p.eid == eid) {

@@ -229,6 +229,7 @@ impl Game {
                 self.block_entity_replaced(p, s, false);
             }
             block::after_removal(self, p, old, moved);
+            self.portal_changed(p, old, s);
         }
         if flags & flags::SKIP_ON_PLACE == 0 && self.bs(p) == s {
             block::on_place(self, p, s, old, moved);

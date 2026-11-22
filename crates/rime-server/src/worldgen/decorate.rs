@@ -63,7 +63,9 @@ impl VanillaGenerator {
         want.dedup();
         // finished chunks whose proto was evicted (asked for again): rebuild
         // them in a fresh state rather than decorating their neighbours twice
-        let (stale, live): (Vec<_>, Vec<_>) = want.into_iter().partition(|c| !st.protos.contains_key(c) && st.done(*c));
+        // (also when a decorated neighbour was evicted: post processing and
+        // leaf fixing read the 3x3 neighbourhood)
+        let (stale, live): (Vec<_>, Vec<_>) = want.into_iter().partition(|c| (!st.protos.contains_key(c) && st.done(*c)) || around(*c).any(|n| !st.protos.contains_key(&n) && st.decorated.contains(&n)));
         let mut out: HashMap<(i32, i32), Generated> = HashMap::new();
         if !stale.is_empty() {
             let mut fresh = PipeState::default();

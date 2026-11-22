@@ -28,6 +28,7 @@ pub mod inventory;
 pub mod menu;
 pub mod workstation;
 pub mod playerdata;
+pub mod portal;
 pub mod survival;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -460,6 +461,8 @@ pub struct Player {
     pub kicked: std::sync::atomic::AtomicBool,
     /// actions requested from outside the session (plugins), run on its tick
     pub requests: Mutex<Vec<Request>>,
+    /// the dimension the player is in (`Dim::index`)
+    pub dim: std::sync::atomic::AtomicU8,
 }
 
 /// Something another part of the server asks a player's session to do.
@@ -545,6 +548,8 @@ pub struct Game {
     ticks: Mutex<Ticks>,
     /// furnaces that may be burning or cooking
     pub(crate) furnaces: Mutex<HashSet<[i32; 3]>>,
+    /// nether portal blocks (vanilla's portal POIs)
+    pub(crate) portals: Mutex<HashSet<[i32; 3]>>,
     now: AtomicU64,
     /// added to `now` by /time set
     time_offset: AtomicU64,
@@ -584,6 +589,7 @@ impl Game {
             entities: Mutex::new(HashMap::new()),
             ticks: Mutex::new(Ticks::default()),
             furnaces: Mutex::new(HashSet::new()),
+            portals: Mutex::new(HashSet::new()),
             now: AtomicU64::new(0),
             time_offset: AtomicU64::new(0),
             next_eid: AtomicI32::new(1),
@@ -610,7 +616,9 @@ impl Game {
     }
 
     pub(crate) fn next_eid(&self) -> i32 {
-        self.next_eid.fetch_add(1, Ordering::Relaxed)
+        // entity ids are unique across all dimensions
+        static NEXT: AtomicI32 = AtomicI32::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Register a player; returns None when the name/UUID is already online.
@@ -642,9 +650,16 @@ impl Game {
             known_speed_sq: Mutex::new(0.0),
             kicked: std::sync::atomic::AtomicBool::new(false),
             requests: Mutex::new(Vec::new()),
+            dim: std::sync::atomic::AtomicU8::new(self.dim.index()),
         });
         m.insert(eid, p.clone());
         Some(p)
+    }
+
+    /// A player arriving from another dimension.
+    pub fn adopt(&self, p: Arc<Player>) {
+        p.dim.store(self.dim.index(), Ordering::Relaxed);
+        self.players.write().insert(p.eid, p);
     }
 
     pub fn leave(&self, eid: i32) {

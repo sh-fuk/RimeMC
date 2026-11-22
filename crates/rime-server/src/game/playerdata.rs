@@ -34,6 +34,7 @@ pub struct Saved {
     /// (XpLevel, XpP, XpTotal)
     pub xp: (i32, f32, i32),
     pub respawn: Option<[i32; 3]>,
+    pub dim: crate::world::storage::Dim,
 }
 
 pub fn path(world: &Path, uuid: uuid::Uuid) -> PathBuf {
@@ -118,7 +119,7 @@ pub fn to_nbt(p: &Player) -> Tag {
         ("Pos".into(), Tag::List(pose.pos.iter().map(|v| Tag::Double(*v)).collect())),
         ("Rotation".into(), Tag::List(vec![Tag::Float(pose.yaw), Tag::Float(pose.pitch)])),
         ("OnGround".into(), Tag::Byte(pose.on_ground as i8)),
-        ("Dimension".into(), Tag::String("minecraft:overworld".into())),
+        ("Dimension".into(), Tag::String(crate::world::storage::Dim::from_index(p.dim.load(Ordering::Relaxed)).key().into())),
         ("playerGameType".into(), Tag::Int(p.gamemode.load(Ordering::Relaxed))),
         ("SelectedItemSlot".into(), Tag::Int(p.held.load(Ordering::Relaxed))),
         ("Inventory".into(), Tag::List(inv)),
@@ -229,6 +230,10 @@ pub fn from_nbt(t: &Tag) -> Option<Saved> {
         respawn: match t.get("respawn").and_then(|r| r.get("pos")) {
             Some(Tag::IntArray(a)) if a.len() == 3 => Some([a[0], a[1], a[2]]),
             _ => None,
+        },
+        dim: match t.get("Dimension") {
+            Some(Tag::String(k)) => crate::world::storage::Dim::from_key(k).unwrap_or(crate::world::storage::Dim::Overworld),
+            _ => crate::world::storage::Dim::Overworld,
         },
     })
 }

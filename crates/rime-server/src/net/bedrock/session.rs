@@ -736,7 +736,7 @@ impl Session {
         let cfg = &self.st.cfg.bedrock;
         let name = java_name(&cfg.username_prefix, &id.name, cfg.replace_spaces);
         let uuid = java_uuid(&id, &name);
-        if self.st.game.players().iter().any(|p| p.name.eq_ignore_ascii_case(&name) || p.uuid == uuid) {
+        if self.st.all_players().iter().any(|p| p.name.eq_ignore_ascii_case(&name) || p.uuid == uuid) {
             self.disconnect("You are already logged in.");
             return;
         }
