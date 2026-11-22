@@ -86,6 +86,7 @@ pub enum LKind {
     /// height: uniform absolute `min` .. `below_top` blocks under the top
     NetherFossil { min: i32, below_top: i32 },
     EndCity,
+    Fortress,
 }
 
 impl LKind {
@@ -130,6 +131,7 @@ impl LKind {
             "ocean_monument" => LKind::OceanMonument,
             "woodland_mansion" => LKind::WoodlandMansion,
             "end_city" => LKind::EndCity,
+            "fortress" => LKind::Fortress,
             "nether_fossil" => LKind::NetherFossil {
                 min: v["height"]["min_inclusive"]["absolute"].as_i64().unwrap_or(32) as i32,
                 below_top: v["height"]["max_inclusive"]["below_top"].as_i64().unwrap_or(2) as i32,
@@ -1021,6 +1023,12 @@ pub fn generate(kind: &LKind, lib: &LLib, ctx: &dyn Ctx, seed: i64, cx: i32, cz:
             out.push(Box::new(TPiece::new(t, pos, rot, mirror, pivot, procs, true, kind)));
             Some((out, pos))
         }
+        LKind::Fortress => {
+            for p in super::fortress::generate(cx, cz, r) {
+                out.push(Box::new(p));
+            }
+            Some((out, [x0, 64, z0]))
+        }
         LKind::EndCity => {
             // `EndCityStructure.findGenerationPoint`
             let rot = r.next_int_bound(4);
@@ -1048,7 +1056,8 @@ pub fn generate(kind: &LKind, lib: &LLib, ctx: &dyn Ctx, seed: i64, cx: i32, cz:
             let x = x0 + r.next_int_bound(16);
             let z = z0 + r.next_int_bound(16);
             let sea = 32;
-            let top = crate::worldgen::gen_min_y() + crate::worldgen::gen_height() - 1 - below_top;
+            let (gmin, gh) = ctx.gen_range();
+            let top = gmin + gh - 1 - below_top;
             let mut y = if *min > top { *min } else { r.next_int_bound(top - min + 1) + min };
             let col = ctx.base_column(x, z);
             let at = |y: i32| col.get((y - MIN_Y) as usize).copied().unwrap_or(blocks::AIR);
@@ -1167,7 +1176,7 @@ fn ruin_piece(lib: &LLib, out: &mut Vec<Box<dyn LPiece>>, r: &mut dyn Rng, warm:
 
 /// `RuinedPortalStructure.findSuitableY`
 fn portal_y(r: &mut dyn Rng, ctx: &dyn Ctx, placement: VPlace, air_pocket: bool, i: i32, y_span: i32, tbb: &Bb) -> i32 {
-    let k = crate::worldgen::gen_min_y() + 15;
+    let k = ctx.gen_range().0 + 15;
     let within = |r: &mut dyn Rng, a: i32, b: i32| if a < b { rbi(r, a, b) } else { b };
     let j = match placement {
         VPlace::InNether => {

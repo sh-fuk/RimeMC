@@ -204,7 +204,9 @@ impl Generator {
     }
 
     pub fn with_vanilla(mut self, v: crate::worldgen::VanillaGenerator) -> Self {
-        self.vanilla = Some(std::sync::Arc::new(v));
+        let v = std::sync::Arc::new(v);
+        crate::worldgen::register_generator(v.clone());
+        self.vanilla = Some(v);
         self
     }
 

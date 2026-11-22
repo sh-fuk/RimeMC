@@ -104,7 +104,37 @@ impl VanillaGenerator {
     }
 }
 
+/// The vanilla generator of each dimension (`Dim::index` order), for
+/// game-time questions such as structure spawn lists.
+static GENERATORS: parking_lot::RwLock<[Option<std::sync::Arc<VanillaGenerator>>; 3]> = parking_lot::RwLock::new([None, None, None]);
+
+pub fn register_generator(g: std::sync::Arc<VanillaGenerator>) {
+    let i = match g.dim {
+        DimKind::Overworld => 0,
+        DimKind::Nether => 1,
+        DimKind::End => 2,
+    };
+    GENERATORS.write()[i] = Some(g);
+}
+
+pub fn generator_for(dim_index: usize) -> Option<std::sync::Arc<VanillaGenerator>> {
+    GENERATORS.read().get(dim_index).cloned().flatten()
+}
+
+impl VanillaGenerator {
+    /// Structure spawn overrides at `p` (see `Structures::mobs_at`).
+    pub fn structure_mobs_at(&self, cat: &str, p: [i32; 3], on_nether_bricks: bool) -> Option<Vec<(String, u32, u32, u32)>> {
+        self.structures.as_ref()?.mobs_at(self, cat, p, on_nether_bricks)
+    }
+}
+
 impl structure::Ctx for VanillaGenerator {
+    fn gen_range(&self) -> (i32, i32) {
+        match self.dim {
+            DimKind::Overworld => (MIN_Y, HEIGHT),
+            _ => (0, 128),
+        }
+    }
     fn base_height(&self, x: i32, z: i32, hm: feature::Hm) -> i32 {
         chunk::base_height_stop(&self.router, &self.settings, self.aquifer_random, self.ore_random, x, z, &|s| hm.test(s))
     }

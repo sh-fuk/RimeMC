@@ -9,6 +9,7 @@
 pub mod jigsaw;
 pub mod legacy;
 mod endcity;
+mod fortress;
 mod mansion;
 mod monument;
 pub mod mineshaft;
@@ -51,6 +52,10 @@ pub trait Ctx: Sync {
     fn temperature(&self, _biome: u8, _p: P) -> f32 {
         0.8
     }
+    /// `WorldGenerationContext` (min y, height) of the dimension
+    fn gen_range(&self) -> (i32, i32) {
+        (crate::worldgen::chunk::MIN_Y, crate::worldgen::chunk::HEIGHT)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -77,6 +82,8 @@ struct Structure {
     biomes: Vec<bool>,
     step: usize,
     adapt: Adapt,
+    /// `spawn_overrides`: category -> (piece box?, [(type, weight, min, max)])
+    overrides: HashMap<String, (bool, Vec<(String, u32, u32, u32)>)>,
 }
 
 struct Set {
@@ -215,7 +222,19 @@ impl Structures {
             };
             by_step[step].push(structures.len());
             index.insert(name.clone(), structures.len());
-            structures.push(Structure { name: name.clone(), kind, biomes, step, adapt });
+            let mut overrides = HashMap::new();
+            if let Some(o) = v["spawn_overrides"].as_object() {
+                for (cat, e) in o {
+                    let list = e["spawns"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|x| (x["type"].as_str().unwrap_or("").to_string(), x["weight"].as_u64().unwrap_or(1) as u32, x["minCount"].as_u64().unwrap_or(1) as u32, x["maxCount"].as_u64().unwrap_or(1) as u32))
+                        .collect();
+                    overrides.insert(cat.clone(), (e["bounding_box"].as_str() == Some("piece"), list));
+                }
+            }
+            structures.push(Structure { name: name.clone(), kind, biomes, step, adapt, overrides });
         }
         let mut sets = Vec::new();
         let mut set_by_name = HashMap::new();
@@ -446,6 +465,46 @@ impl Structures {
         out
     }
 
+    /// Boxes of a start's pieces.
+    fn piece_boxes(s: &Start) -> Vec<Bb> {
+        let mut v: Vec<Bb> = s.pieces.iter().map(|p| p.bb).collect();
+        if let Some(m) = &s.shaft {
+            v.extend(m.pieces.iter().map(|p| p.bb));
+        }
+        v.extend(s.legacy.iter().map(|p| p.bb()));
+        v
+    }
+
+    /// `ChunkGenerator.getMobsAt` / `NaturalSpawner.isInNetherFortressBounds`:
+    /// the spawn list a structure imposes at `p` for category `cat`.
+    /// `on_nether_bricks`: the block below is nether bricks.
+    pub fn mobs_at(&self, ctx: &dyn Ctx, cat: &str, p: P, on_nether_bricks: bool) -> Option<Vec<(String, u32, u32, u32)>> {
+        if !self.structures.iter().any(|s| !s.overrides.is_empty() && !matches!(s.kind, Kind::Unported)) {
+            return None;
+        }
+        let refs = self.references(ctx, p[0] >> 4, p[2] >> 4);
+        let full_box = |s: &Start| {
+            let b = Self::piece_boxes(s);
+            b.iter().skip(1).fold(b.first().copied(), |a, x| a.map(|a| bb_encapsulate(a, x)))
+        };
+        if cat == "monster" && on_nether_bricks {
+            for s in &refs {
+                if self.structures[s.structure].name == "fortress" && full_box(s).is_some_and(|b| template::bb_inside(&b, p)) {
+                    return self.structures[s.structure].overrides.get("monster").map(|o| o.1.clone());
+                }
+            }
+        }
+        for s in &refs {
+            let st = &self.structures[s.structure];
+            let Some((piece, list)) = st.overrides.get(cat) else { continue };
+            let inside = if *piece { Self::piece_boxes(s).iter().any(|b| template::bb_inside(b, p)) } else { full_box(s).is_some_and(|b| template::bb_inside(&b, p)) };
+            if inside {
+                return Some(list.clone());
+            }
+        }
+        None
+    }
+
     /// `Beardifier.forStructuresInChunk`
     pub fn beardifier(&self, ctx: &dyn Ctx, cx: i32, cz: i32) -> Option<Beardifier> {
         let (x0, z0) = (cx * 16, cz * 16);
@@ -570,6 +629,9 @@ impl Ctx for HeightCtx<'_> {
     }
     fn temperature(&self, biome: u8, p: P) -> f32 {
         self.ctx.temperature(biome, p)
+    }
+    fn gen_range(&self) -> (i32, i32) {
+        self.ctx.gen_range()
     }
 }
 

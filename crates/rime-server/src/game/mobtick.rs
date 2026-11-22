@@ -1534,7 +1534,9 @@ impl Game {
                 }
                 if spawner.is_none() {
                     let Some(biome) = self.world.biome(x, y, z) else { break };
-                    let Some(list) = self.data.spawners.get(biome.trim_start_matches("minecraft:")).and_then(|c| c.get(cat)) else { break };
+                    let below_bricks = self.world.get_block(x, y - 1, z).is_some_and(|b| b.name() == "nether_bricks");
+                    let over = crate::worldgen::generator_for(self.dim.index() as usize).and_then(|g| g.structure_mobs_at(cat, p, below_bricks));
+                    let Some(list) = over.as_ref().or_else(|| self.data.spawners.get(biome.trim_start_matches("minecraft:")).and_then(|c| c.get(cat))) else { break };
                     let total: u32 = list.iter().map(|e| e.1).sum();
                     if total == 0 {
                         break;

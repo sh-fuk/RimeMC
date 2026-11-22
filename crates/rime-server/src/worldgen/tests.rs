@@ -903,6 +903,21 @@ fn dims_match_vanilla() {
             let idx = ((cz & 31) * 32 + (cx & 31)) as usize;
             let Some(v) = list.into_iter().find(|c| c.index == idx).and_then(|c| crate::world::chunk::Chunk::from_nbt(&c.raw)) else { continue };
             tested += 1;
+            if std::env::var("RIME_VREF_STARTS").is_ok() {
+                if let Some(cc) = airworld::mca::read_mca(&reg.join(format!("r.{rx}.{rz}.mca")), rx, rz).ok().and_then(|(l, _)| l.into_iter().find(|c| c.index == idx)) {
+                    if let Ok((_, root)) = crate::nbt::Tag::from_root_bytes(&cc.raw) {
+                        if let Some(crate::nbt::Tag::Compound(st)) = root.get("structures").and_then(|s| s.get("starts")) {
+                            for (k, v) in st {
+                                let bbs: Vec<String> = match v.get("Children") {
+                                    Some(crate::nbt::Tag::List(l)) => l.iter().map(|p| format!("{:?} {:?}", p.get("id").and_then(|x| x.as_str()), p.get("BB"))).collect(),
+                                    _ => Vec::new(),
+                                };
+                                eprintln!("vstart {cx},{cz} {k}: {bbs:?}");
+                            }
+                        }
+                    }
+                }
+            }
             let ours = if full { gens.get(&(cx, cz)).map(super::decorate::clone_gen).expect("gen") } else { g.generate(cx, cz) };
             for si in 4..20 {
                 for i in 0..64 {
@@ -945,4 +960,28 @@ fn dims_match_vanilla() {
         eprintln!("{sub}: {tested} chunks, {total} block mismatches, {bb} biome mismatches: {by_kind:?}");
         assert!(tested > 0);
     }
+}
+
+#[test]
+fn fortress_spawn_override() {
+    let Some(dir) = data_dir() else { return };
+    let load = loader(dir);
+    let g = super::VanillaGenerator::new_dim(&load, 12345, super::DimKind::Nether).unwrap();
+    // seed 12345: the fortress start is in chunk (-13, -37); its first piece
+    // (a bridge crossing) covers x -208..-190 around the start
+    let mut found = None;
+    'o: for y in 48..90 {
+        for dx in 0..19 {
+            for dz in 0..19 {
+                let p = [-208 + dx, y, -592 + dz];
+                if let Some(l) = g.structure_mobs_at("monster", p, true) {
+                    found = Some(l);
+                    break 'o;
+                }
+            }
+        }
+    }
+    let l = found.expect("fortress spawn list");
+    assert!(l.iter().any(|e| e.0 == "minecraft:wither_skeleton"), "{l:?}");
+    assert!(g.structure_mobs_at("monster", [0, 64, 0], false).is_none());
 }
