@@ -1396,8 +1396,9 @@ impl Game {
         match block::class(s) {
             Class::Target => block::redstone::target_hit(self, p, s, hit.pos, hit.face, arrow),
             Class::Tnt if fire => {
-                self.prime_tnt(p, owner);
-                self.remove_block(p, false);
+                if self.prime_tnt(p, owner) {
+                    self.remove_block(p, false);
+                }
             }
             Class::Bell => {
                 block::sound(self, p, "minecraft:block.bell.use", 2.0, 1.0);

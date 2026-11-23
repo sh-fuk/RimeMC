@@ -71,7 +71,7 @@ impl Game {
         let mut sp = self.spawners.lock();
         // ---------------------------------------------------- wandering trader
         sp.trader.0 -= 1;
-        if sp.trader.0 <= 0 {
+        if sp.trader.0 <= 0 && super::rules::on("spawn_wandering_traders") {
             sp.trader.0 = 1200;
             sp.trader.1 -= 1200;
             if sp.trader.1 <= 0 {
@@ -106,7 +106,7 @@ impl Game {
         }
         // ---------------------------------------------------- patrols
         sp.patrol -= 1;
-        if sp.patrol <= 0 {
+        if sp.patrol <= 0 && super::rules::on("spawn_patrols") {
             sp.patrol = 12000 + rng.gen_range(0..1200);
             let day = self.day_time() / 24000;
             if difficulty > 0 && day >= 5 && self.is_day() && rng.gen_range(0..5) == 0 {
@@ -139,7 +139,7 @@ impl Game {
         }
         // ---------------------------------------------------- phantoms
         sp.phantom -= 1;
-        if sp.phantom <= 0 {
+        if sp.phantom <= 0 && super::rules::on("spawn_phantoms") {
             sp.phantom = (60 + rng.gen_range(0..60)) * 20;
             let dark = self.sky_darken() >= 5;
             if difficulty > 0 && (dark || self.thundering()) {

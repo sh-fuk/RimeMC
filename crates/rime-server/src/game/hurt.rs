@@ -112,7 +112,7 @@ fn random_between(rng: &mut impl Rng, min: f32, max: f32) -> f32 {
 
 impl Game {
     pub fn difficulty(&self) -> i32 {
-        2
+        super::rules::difficulty()
     }
 
     fn player_side(&self, p: &Player) -> PlayerSide {
@@ -183,6 +183,14 @@ impl Game {
 
     /// `hurtServer` on a player.
     pub fn hurt_player(&self, p: &Arc<Player>, src: &DamageSource, amount: f32) -> bool {
+        // `Player.isInvulnerableTo`: damage game rules
+        use super::rules::on;
+        if (src.is("is_fall") && !on("fall_damage")) || (src.is("is_fire") && !on("fire_damage")) || (src.is("is_drowning") && !on("drowning_damage")) || (src.is("is_freezing") && !on("freeze_damage")) {
+            return false;
+        }
+        if !on("pvp") && src.causing.as_ref().is_some_and(|c| c.player && c.eid != p.eid) {
+            return false;
+        }
         self.with_player(p, |l, eq, body| l.hurt(eq, body, src, amount, &mut rand::thread_rng()))
     }
 

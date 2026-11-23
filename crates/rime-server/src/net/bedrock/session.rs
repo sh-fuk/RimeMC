@@ -993,7 +993,7 @@ impl Session {
     fn start_game(&mut self) {
         let st = self.st.clone();
         let gm = gamemode_to_bedrock(self.gamemode);
-        let spawn = st.spawn;
+        let spawn = st.spawn();
         let mut w = W::new();
         w.zz64(self.eid as i64).var(self.eid as u64).zz32(gm);
         w.vec3([self.pos[0] as f32, (self.pos[1] + EYE) as f32, self.pos[2] as f32]).f32(self.pitch).f32(self.yaw);

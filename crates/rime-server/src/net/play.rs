@@ -117,54 +117,6 @@ pub fn light_data(b: &mut Vec<u8>, light: &crate::world::light::ChunkLight) {
     }
 }
 
-/// The `commands` tree: a few literals, each taking an optional greedy string.
-fn commands_body() -> Vec<u8> {
-    let mut names: Vec<String> = ["rime", "stop", "op", "deop", "gamemode", "tp", "list", "help", "spawn", "summon", "time", "kill", "give", "setblock", "fill", "execute"].map(String::from).to_vec();
-    if crate::plugins::active() {
-        for c in crate::plugins::command_names() {
-            if !names.contains(&c) && !c.is_empty() && c.chars().all(|ch| ch.is_ascii_graphic()) {
-                names.push(c);
-            }
-        }
-    }
-    let parser = Registries::get().id("minecraft:command_argument_type", "brigadier:string").unwrap_or(5);
-    let arg = names.len() as i32 + 1;
-    let mut b = Vec::new();
-    b.vi(names.len() as i32 + 2);
-    // root
-    b.u8(0).vi(names.len() as i32);
-    for i in 0..names.len() {
-        b.vi(i as i32 + 1);
-    }
-    for n in &names {
-        b.u8(0x01 | 0x04).vi(1).vi(arg).str(n);
-    }
-    b.u8(0x02 | 0x04).vi(0).str("args").vi(parser).vi(2);
-    b.vi(0);
-    b
-}
-
-/// a command coordinate: absolute or `~`-relative
-fn parse_coord(a: &str, base: i32) -> Option<i32> {
-    if let Some(r) = a.strip_prefix('~') {
-        let off = if r.is_empty() { 0.0 } else { r.parse::<f64>().ok()? };
-        return Some(base + off.floor() as i32);
-    }
-    let v = a.parse::<f64>().ok()?;
-    (v.abs() < 3.0e7).then(|| v.floor() as i32)
-}
-
-/// `minecraft:name[key=value,...]`
-fn parse_block_state(a: &str) -> Option<BlockState> {
-    let a = a.trim_start_matches("minecraft:");
-    let (name, props) = match a.split_once('[') {
-        Some((n, rest)) => (n, rest.strip_suffix(']')?),
-        None => (a, ""),
-    };
-    let kv: Vec<(&str, &str)> = props.split(',').filter(|s| !s.is_empty()).filter_map(|p| p.split_once('=')).collect();
-    BlockRegistry::get().state(name, &kv)
-}
-
 fn text_nbt(msg: &str) -> Vec<u8> {
     Tag::text(msg).to_network_bytes()
 }
@@ -261,14 +213,14 @@ pub async fn run_with_state<S: Io>(mut sock: CryptStream<S>, st: Arc<ServerState
 
     // ---- play
     let view = client_view.min(st.cfg.server.view_distance as i32).max(2);
-    let spawn = st.spawn;
+    let spawn = st.spawn();
     let saved = match &state {
         Some(raw) => crate::game::playerdata::from_bytes(raw),
         None if forwarded => None,
         None => crate::game::playerdata::load(&crate::game::playerdata::path(&st.world_dir, uuid)),
     }
     .filter(|s| !s.dead);
-    let gamemode = saved.as_ref().map(|s| s.gamemode).filter(|g| *g >= 0).unwrap_or(st.cfg.server.default_gamemode.id());
+    let gamemode = saved.as_ref().map(|s| s.gamemode).filter(|g| *g >= 0).unwrap_or_else(|| crate::game::rules::default_gamemode().unwrap_or(st.cfg.server.default_gamemode.id()));
     let (tx, rx) = mpsc::channel::<Arc<Vec<u8>>>(OUT_QUEUE);
     let pose = match &saved {
         Some(s) => Pose { pos: s.pos, yaw: s.yaw, pitch: s.pitch, on_ground: false },
@@ -563,16 +515,16 @@ impl Session {
         let mut b = Vec::new();
         b.i32(self.me.eid).bool(false).vi(3).str("minecraft:overworld").str("minecraft:the_end").str("minecraft:the_nether");
         b.vi(st.cfg.server.max_players as i32).vi(self.view).vi(st.cfg.server.simulation_distance as i32);
-        b.bool(false).bool(true).bool(false);
+        b.bool(crate::game::rules::on("reduced_debug_info")).bool(!crate::game::rules::on("immediate_respawn")).bool(crate::game::rules::on("limited_crafting"));
         b.vi(cd.entry_id("minecraft:dimension_type", self.game.dim.key())).str(self.game.dim.key()).i64(hashed_seed(st.seed));
         b.u8(gm as u8).u8(255).bool(false).bool(false).bool(false).vi(0).vi(63);
         b.bool(false);
         self.send("login", &b);
         let mut b = Vec::new();
-        b.vi(2).bool(false);
+        b.u8(crate::game::rules::difficulty() as u8).bool(crate::game::rules::difficulty_locked());
         self.send("change_difficulty", &b);
         self.send_abilities();
-        self.send("commands", &commands_body());
+        self.send_commands();
         self.teleport(pose.pos, pose.yaw, pose.pitch);
         // tab list: everyone online, then announce me to everyone
         let all = self.st.all_players();
@@ -599,12 +551,13 @@ impl Session {
         if !join_msg.is_empty() {
             self.st.broadcast_all(self.game.system_chat(&join_msg));
         }
-        let mut b = Vec::new();
-        b.f64(0.0).f64(0.0).f64(59_999_968.0).f64(59_999_968.0).vl(0).vi(29_999_984).vi(5).vi(15);
-        self.send("initialize_border", &b);
+        // scoreboard, teams, boss bars and the world border
+        for pkt in crate::command::state::join_packets(&self.game, self.me.uuid) {
+            self.me.send(pkt);
+        }
         self.send_time();
         self.send_weather();
-        let (sx, sy, sz) = spawn_block(st.spawn);
+        let (sx, sy, sz) = spawn_block(st.spawn());
         let mut b = Vec::new();
         b.str("minecraft:overworld").pos(sx, sy, sz).f32(0.0).f32(0.0);
         self.send("set_default_spawn_position", &b);
@@ -646,7 +599,7 @@ impl Session {
         let age = self.st.started.elapsed().as_millis() as i64 / 50;
         let day = self.st.game.clock() as i64;
         let mut b = Vec::new();
-        b.i64(age).vi(1).vi(self.st.config_data.entry_id("minecraft:world_clock", "minecraft:overworld")).vl(day + 1000).f32(0.0).f32(1.0);
+        b.i64(age).vi(1).vi(self.st.config_data.entry_id("minecraft:world_clock", "minecraft:overworld")).vl(day + 1000).f32(0.0).f32(if crate::game::rules::on("advance_time") { 1.0 } else { 0.0 });
         self.send("set_time", &b);
     }
 
@@ -844,6 +797,8 @@ impl Session {
                 crate::game::Request::StopUsingItem => self.stop_using_item(),
                 crate::game::Request::OpenEntity(eid, screen, title) => self.open_entity_container(eid, screen, title),
                 crate::game::Request::OpenMerchant(eid) => self.open_merchant(eid),
+                crate::game::Request::Travel(dim, pos, yaw, pitch) => self.travel(dim, pos, yaw, pitch).await,
+                crate::game::Request::Commands => self.send_commands(),
                 crate::game::Request::Died(src) => self.die(*src),
                 crate::game::Request::Chat(m) => {
                     if let Flow::Disconnect(r) = self.on_chat(&m) {
@@ -912,7 +867,7 @@ impl Session {
             y: pose.pos[1],
             min_y: MIN_Y,
             gamemode: self.gamemode(),
-            difficulty: 2,
+            difficulty: crate::game::rules::difficulty(),
         }
     }
 
@@ -1085,10 +1040,22 @@ impl Session {
         b.i32(self.me.eid).u8(3);
         let pkt = self.game.encode("entity_event", &b);
         self.to_viewers(pkt, false);
-        let mut chat = msg_nbt.clone();
-        chat.bool(false);
-        self.st.broadcast_all(self.game.encode("system_chat", &chat));
+        if crate::game::rules::on("show_death_messages") {
+            let mut chat = msg_nbt.clone();
+            chat.bool(false);
+            self.st.broadcast_all(self.game.encode("system_chat", &chat));
+        }
         tracing::info!("{} died: {}", self.me.name, msg_json);
+        // scoreboard criteria
+        let killer = credit.and_then(|eid| match self.st.all_players().into_iter().find(|p| p.eid == eid) {
+            Some(p) => Some((p.name.clone(), true)),
+            None => self.game.entity_snap(eid).map(|s| (s.uuid.hyphenated().to_string(), false)),
+        });
+        crate::command::cmds2::on_death(&self.st, &self.me.name, killer.as_ref().map(|k| k.0.as_str()), killer.as_ref().is_some_and(|k| k.1), true);
+        if crate::game::rules::on("keep_inventory") {
+            self.me.moved.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         // Inventory.dropAll
         let stacks: Vec<Stack> = {
             let mut inv = self.me.inv.lock();
@@ -1154,7 +1121,7 @@ impl Session {
         b.u8(0x03);
         self.send("respawn", &b);
         let mut b = Vec::new();
-        b.vi(2).bool(false);
+        b.u8(crate::game::rules::difficulty() as u8).bool(crate::game::rules::difficulty_locked());
         self.send("change_difficulty", &b);
         self.send_abilities();
         self.teleport(pos, yaw, pitch);
@@ -1292,13 +1259,13 @@ impl Session {
         use crate::world::storage::Dim;
         self.won_game = false;
         self.portal_cooldown = 10;
-        self.load_area(Dim::Overworld, ((self.st.spawn[0] as i32) >> 4 << 4, (self.st.spawn[2] as i32) >> 4 << 4), 1).await;
+        self.load_area(Dim::Overworld, ((self.st.spawn()[0] as i32) >> 4 << 4, (self.st.spawn()[2] as i32) >> 4 << 4), 1).await;
         let ow = self.st.level(Dim::Overworld).clone();
-        let bed = {
+        let (bed, forced) = {
             let v = self.me.vit.lock();
-            v.respawn.filter(|_| v.respawn_dim == 0)
+            (v.respawn.filter(|_| v.respawn_dim == 0), v.respawn_forced)
         };
-        let spawn = bed.and_then(|h| crate::game::block::use_block::stand_up_pos(&ow, h)).unwrap_or(self.st.spawn);
+        let spawn = bed.and_then(|h| crate::game::block::use_block::respawn_pos(&ow, h, forced)).unwrap_or(self.st.spawn());
         self.change_dimension(Dim::Overworld, spawn, 0.0, 0.0);
     }
 
@@ -1342,18 +1309,18 @@ impl Session {
         let st = self.st.clone();
         // ServerPlayer.findRespawnPositionAndUseSpawnBlock: a bed in the
         // overworld or a charged respawn anchor in the nether
-        let (bed, rdim) = {
+        let (bed, rdim, forced) = {
             let v = self.me.vit.lock();
-            (v.respawn, crate::world::storage::Dim::from_index(v.respawn_dim))
+            (v.respawn, crate::world::storage::Dim::from_index(v.respawn_dim), v.respawn_forced)
         };
-        let mut dest = (crate::world::storage::Dim::Overworld, st.spawn);
+        let mut dest = (crate::world::storage::Dim::Overworld, st.spawn());
         let mut lost = false;
         if let Some(h) = bed {
             let lv = st.level(rdim).clone();
             let (cx, cz) = (h[0] >> 4, h[2] >> 4);
             let near: Vec<(i32, i32)> = (-1..=1).flat_map(|dx| (-1..=1).map(move |dz| (cx + dx, cz + dz))).collect();
             lv.world.ensure_loaded(&near, &st.store, st.generator_of(rdim));
-            match crate::game::block::use_block::stand_up_pos(&lv, h) {
+            match crate::game::block::use_block::respawn_pos(&lv, h, forced) {
                 Some(p) => dest = (rdim, p),
                 None => {
                     self.me.vit.lock().respawn = None;
@@ -1929,274 +1896,42 @@ impl Session {
         if crate::plugins::active() && crate::plugins::command(&self.me.name, line) {
             return Flow::Continue;
         }
-        let sender = CommandSender::Player { name: self.me.name.clone() };
-        let mut words = line.split_whitespace();
-        let cmd = line.split_whitespace().next().unwrap_or("");
-        match words.next().unwrap_or("") {
-            "gamemode" => {
-                if !self.st.ops.is_op(&sender) {
-                    self.msg("§cYou do not have permission (operator only).");
-                    return Flow::Continue;
-                }
-                let gm = match words.next() {
-                    Some("survival" | "s" | "0") => 0,
-                    Some("creative" | "c" | "1") => 1,
-                    Some("adventure" | "a" | "2") => 2,
-                    Some("spectator" | "sp" | "3") => 3,
-                    _ => {
-                        self.msg("§cUsage: /gamemode <survival|creative|adventure|spectator>");
-                        return Flow::Continue;
-                    }
-                };
-                self.set_gamemode(gm);
-                self.msg(&format!("Set own game mode to {}", ["Survival", "Creative", "Adventure", "Spectator"][gm as usize]));
-            }
-            "spawn" => {
-                let s = self.st.spawn;
-                self.teleport(s, 0.0, 0.0);
-            }
-            "execute" => {
-                if !self.st.ops.is_op(&sender) {
-                    self.msg("§cYou do not have permission (operator only).");
-                    return Flow::Continue;
-                }
-                // execute in <dimension> run tp <x> <y> <z>
-                let args: Vec<&str> = words.collect();
-                let dim = match args.as_slice() {
-                    ["in", d, "run", "tp" | "teleport", ..] => crate::world::storage::Dim::from_key(d),
-                    _ => None,
-                };
-                let Some(dim) = dim else {
-                    self.msg("§cUsage: /execute in <dimension> run tp <x> <y> <z>");
-                    return Flow::Continue;
-                };
-                let nums: Vec<f64> = args[4..].iter().filter_map(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && v.abs() < 2.9e7).collect();
-                let pose = *self.me.pose.lock();
-                let pos = if nums.len() == 3 { [nums[0], nums[1], nums[2]] } else { pose.pos };
-                let st = self.st.clone();
-                let (cx, cz) = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
-                let _ = tokio::task::block_in_place(|| {
-                    let all: Vec<(i32, i32)> = (-1..=1).flat_map(|dx| (-1..=1).map(move |dz| (cx + dx, cz + dz))).collect();
-                    st.level(dim).world.ensure_loaded(&all, &st.store, st.generator_of(dim));
-                });
-                self.change_dimension(dim, pos, pose.yaw, pose.pitch);
-                self.msg(&format!("Teleported {} to {:.1}, {:.1}, {:.1}", self.me.name, pos[0], pos[1], pos[2]));
-            }
-            "tp" => {
-                if !self.st.ops.is_op(&sender) {
-                    self.msg("§cYou do not have permission (operator only).");
-                    return Flow::Continue;
-                }
-                let args: Vec<&str> = words.collect();
-                let target = match args.as_slice() {
-                    [name] => self.st.find_player(name).map(|p| {
-                        let d = crate::world::storage::Dim::from_index(p.dim.load(Ordering::Relaxed));
-                        let pos = p.pose.lock().pos;
-                        if d != self.game.dim {
-                            let pose = *self.me.pose.lock();
-                            self.change_dimension(d, pos, pose.yaw, pose.pitch);
-                        }
-                        pos
-                    }),
-                    [x, y, z] => match (x.parse::<f64>(), y.parse::<f64>(), z.parse::<f64>()) {
-                        (Ok(x), Ok(y), Ok(z)) if [x, y, z].iter().all(|v| v.is_finite() && v.abs() < 2.9e7) => Some([x, y, z]),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                match target {
-                    Some(t) => {
-                        let pose = *self.me.pose.lock();
-                        self.teleport(t, pose.yaw, pose.pitch);
-                        let c = ((t[0].floor() as i32) >> 4, (t[2].floor() as i32) >> 4);
-                        self.set_center(c, false);
-                    }
-                    None => self.msg("§cUsage: /tp <player> | /tp <x> <y> <z>"),
-                }
-            }
-            "give" => {
-                if !self.st.ops.is_op(&sender) {
-                    self.msg("§cYou do not have permission (operator only).");
-                    return Flow::Continue;
-                }
-                let args: Vec<&str> = words.collect();
-                let (who, item, count) = match args.as_slice() {
-                    [w, i] => (*w, *i, 1u32),
-                    [w, i, n] => (*w, *i, n.parse::<u32>().unwrap_or(0)),
-                    _ => {
-                        self.msg("§cUsage: /give <player> <item> [count]");
-                        return Flow::Continue;
-                    }
-                };
-                let target = if who == "@s" || who == "@p" { Some(self.me.clone()) } else { self.st.find_player(who) };
-                let Some(target) = target else {
-                    self.msg("§cNo player was found");
-                    return Flow::Continue;
-                };
-                let items = Items::get();
-                let Some(id) = items.id(item) else {
-                    self.msg(&format!("§cUnknown item '{item}'"));
-                    return Flow::Continue;
-                };
-                if count == 0 || count > 6400 {
-                    self.msg("§cCount must be between 1 and 6400");
-                    return Flow::Continue;
-                }
-                let max = items.max_stack(id) as u32;
-                let mut left = count;
-                let held = target.held.load(Ordering::Relaxed) as i16;
-                while left > 0 {
-                    let n = left.min(max);
-                    left -= n;
-                    let st = Stack::new(id, n as u8);
-                    let rest = target.inv.lock().add(st, held);
-                    if rest > 0 {
-                        let pos = target.pose.lock().pos;
-                        self.game.spawn_item(pos, Stack::new(id, rest), [0.0; 3], 0);
-                    }
-                }
-                self.game.flush_inventory(&target);
-                self.msg(&format!("Gave {count} [{}] to {}", item.trim_start_matches("minecraft:"), target.name));
-            }
-            "setblock" | "fill" => {
-                if !self.st.ops.is_op(&sender) {
-                    self.msg("§cYou do not have permission (operator only).");
-                    return Flow::Continue;
-                }
-                let args: Vec<&str> = words.collect();
-                let me = self.me.pose.lock().pos;
-                let base = [me[0].floor() as i32, me[1].floor() as i32, me[2].floor() as i32];
-                let n = if cmd == "fill" { 6 } else { 3 };
-                if args.len() < n + 1 {
-                    self.msg(if cmd == "fill" { "§cUsage: /fill <from> <to> <block> [replace|destroy|keep]" } else { "§cUsage: /setblock <pos> <block> [replace|destroy|keep]" });
-                    return Flow::Continue;
-                }
-                let coords: Option<Vec<i32>> = args[..n].iter().enumerate().map(|(i, a)| parse_coord(a, base[i % 3])).collect();
-                let (Some(c), Some(state)) = (coords, parse_block_state(args[n])) else {
-                    self.msg("§cInvalid position or block");
-                    return Flow::Continue;
-                };
-                let mode = args.get(n + 1).copied().unwrap_or("replace");
-                let (a, b) = if n == 6 { ([c[0], c[1], c[2]], [c[3], c[4], c[5]]) } else { ([c[0], c[1], c[2]], [c[0], c[1], c[2]]) };
-                let lo = [a[0].min(b[0]), a[1].min(b[1]), a[2].min(b[2])];
-                let hi = [a[0].max(b[0]), a[1].max(b[1]), a[2].max(b[2])];
-                let vol = (hi[0] - lo[0] + 1) as i64 * (hi[1] - lo[1] + 1) as i64 * (hi[2] - lo[2] + 1) as i64;
-                if vol > 32768 {
-                    self.msg(&format!("§cToo many blocks in the specified area (maximum 32768, specified {vol})"));
-                    return Flow::Continue;
-                }
-                let g = &self.game;
-                let mut changed = 0;
-                for x in lo[0]..=hi[0] {
-                    for y in lo[1]..=hi[1] {
-                        for z in lo[2]..=hi[2] {
-                            let Some(cur) = g.world.get_block(x, y, z) else { continue };
-                            if mode == "keep" && !cur.is_air() || cur == state {
-                                continue;
-                            }
-                            g.world.mark_edited(x, z);
-                            if mode == "destroy" {
-                                g.change_block([x, y, z], state, true, None);
-                            } else {
-                                g.set_block([x, y, z], state, crate::game::level::flags::CLIENTS);
-                            }
-                            changed += 1;
-                        }
-                    }
-                }
-                // updates after the whole area is set (vanilla: blockUpdated per position)
-                let _lv = g.level.lock();
-                for x in lo[0]..=hi[0] {
-                    for y in lo[1]..=hi[1] {
-                        for z in lo[2]..=hi[2] {
-                            if let Some(b) = g.world.get_block(x, y, z) {
-                                g.update_neighbors_at([x, y, z], b);
-                            }
-                        }
-                    }
-                }
-                if changed == 0 {
-                    self.msg(if cmd == "fill" { "§cNo blocks were filled" } else { "§cCould not set the block" });
-                } else if cmd == "fill" {
-                    self.msg(&format!("Successfully filled {changed} block(s)"));
-                } else {
-                    self.msg(&format!("Changed the block at {}, {}, {}", c[0], c[1], c[2]));
-                }
-            }
-            "summon" => {
-                if !self.st.ops.is_op(&sender) {
-                    self.msg("§cYou do not have permission (operator only).");
-                    return Flow::Continue;
-                }
-                let args: Vec<&str> = words.collect();
-                let pose = *self.me.pose.lock();
-                let pos = match args.as_slice() {
-                    [_] => Some(pose.pos),
-                    [_, x, y, z] => match (x.parse::<f64>(), y.parse::<f64>(), z.parse::<f64>()) {
-                        (Ok(x), Ok(y), Ok(z)) if [x, y, z].iter().all(|v| v.is_finite() && v.abs() < 2.9e7) => Some([x, y, z]),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                match (args.first(), pos) {
-                    (Some(name), Some(pos)) => match self.game.summon(name, pos) {
-                        Some(_) => self.msg(&format!("Summoned new {}", name.trim_start_matches("minecraft:"))),
-                        None => self.msg(&format!("§cUnknown or unsupported entity: {name}")),
-                    },
-                    _ => self.msg("§cUsage: /summon <entity> [x y z]"),
-                }
-            }
-            "time" => {
-                if !self.st.ops.is_op(&sender) {
-                    self.msg("§cYou do not have permission (operator only).");
-                    return Flow::Continue;
-                }
-                let args: Vec<&str> = words.collect();
-                let target = match args.as_slice() {
-                    ["set", "day"] => Some(1000),
-                    ["set", "noon"] => Some(6000),
-                    ["set", "night"] => Some(13000),
-                    ["set", "midnight"] => Some(18000),
-                    ["set", n] => n.parse::<u64>().ok(),
-                    ["query", "daytime"] | [] => {
-                        self.msg(&format!("The time is {}", self.game.day_time()));
-                        None
-                    }
-                    _ => {
-                        self.msg("§cUsage: /time set <day|noon|night|midnight|ticks> | /time query daytime");
-                        None
-                    }
-                };
-                if let Some(t) = target {
-                    self.game.set_day_time(t);
-                    self.send_time();
-                    self.msg(&format!("Set the time to {t}"));
-                }
-            }
-            "kill" => {
-                if !self.st.ops.is_op(&sender) {
-                    self.msg("§cYou do not have permission (operator only).");
-                    return Flow::Continue;
-                }
-                let n = self.game.kill_mobs();
-                self.msg(&format!("Killed {n} entities"));
-            }
-            "list" => {
-                let names: Vec<String> = self.st.all_players().iter().map(|p| p.name.clone()).collect();
-                self.msg(&format!("There are {} of a max of {} players online: {}", names.len(), self.st.cfg.server.max_players, names.join(", ")));
-            }
-            _ => {
-                let st = self.st.clone();
-                let me = self.me.clone();
-                let line = line.to_string();
-                tokio::spawn(async move {
-                    let reply = st.dispatch(&CommandSender::Player { name: me.name.clone() }, &line).await;
-                    let text = if let Some(e) = reply.strip_prefix("ERR ") { format!("§c{e}") } else { reply.trim_start_matches("OK ").to_string() };
-                    me.send(st.game.system_chat(&text));
-                });
-            }
+        if crate::command::knows(line) {
+            let st = self.st.clone();
+            let me = self.me.clone();
+            crate::command::run_player(&st, &me, line);
+            return Flow::Continue;
         }
+        let st = self.st.clone();
+        let me = self.me.clone();
+        let line = line.to_string();
+        tokio::spawn(async move {
+            let reply = st.dispatch(&CommandSender::Player { name: me.name.clone() }, &line).await;
+            let text = if let Some(e) = reply.strip_prefix("ERR ") { format!("§c{e}") } else { reply.trim_start_matches("OK ").to_string() };
+            me.send(st.game.system_chat(&text));
+        });
         Flow::Continue
+    }
+
+    fn send_commands(&self) {
+        let level = crate::command::level_of(&self.st, &self.me.name);
+        // op permission level for the client (entity event 24 + level)
+        let mut b = Vec::new();
+        b.i32(self.me.eid).u8(24 + level.clamp(0, 4) as u8);
+        self.send("entity_event", &b);
+        self.send("commands", &crate::command::commands_packet(level));
+    }
+
+    /// `/tp` and friends: within this level, or into another one.
+    async fn travel(&mut self, dim: crate::world::storage::Dim, pos: [f64; 3], yaw: f32, pitch: f32) {
+        if dim != self.game.dim {
+            self.load_area(dim, (pos[0].floor() as i32, pos[2].floor() as i32), 1).await;
+            self.change_dimension(dim, pos, yaw, pitch);
+        } else {
+            self.teleport(pos, yaw, pitch);
+            let c = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
+            self.set_center(c, false);
+        }
     }
 
     fn set_gamemode(&mut self, gm: i32) {

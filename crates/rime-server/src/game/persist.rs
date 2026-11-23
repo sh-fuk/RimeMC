@@ -357,3 +357,26 @@ impl Game {
         n
     }
 }
+
+impl Game {
+    /// `/summon … {nbt}`: the given keys replace the mob's saved data.
+    pub fn apply_mob_nbt(&self, eid: i32, extra: &Tag) {
+        let Tag::Compound(extra) = extra else { return };
+        let sends = {
+            let mut ents = self.entities.lock();
+            let Some(e) = ents.get_mut(&eid) else { return };
+            let chunk = e.chunk();
+            let EKind::Mob(m) = &mut e.kind else { return };
+            let mut base = mob_nbt(m);
+            for (k, v) in extra {
+                base.retain(|(kk, _)| kk != k);
+                base.push((k.clone(), v.clone()));
+            }
+            let new = mob_from(m.ty, &Tag::Compound(base));
+            **m = new;
+            (self.mob_meta(eid, m), self.mob_equipment(eid, m), chunk)
+        };
+        self.broadcast_chunk(sends.2, &sends.0);
+        self.broadcast_chunk(sends.2, &sends.1);
+    }
+}

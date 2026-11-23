@@ -898,8 +898,10 @@ pub fn note_trigger(g: &Game, p: [i32; 3], s: BlockState) -> bool {
 
 pub fn tnt_check(g: &Game, p: [i32; 3], s: BlockState) {
     if g.has_neighbor_signal(p) {
-        g.remove_block(p, false);
-        g.prime_tnt(p, None);
+        if crate::game::rules::on("tnt_explodes") {
+            g.remove_block(p, false);
+            g.prime_tnt(p, None);
+        }
     }
     let _ = s;
 }

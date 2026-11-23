@@ -62,7 +62,21 @@ cargo build --release
 ./target/release/rime run
 ```
 
-Minecraft Java Edition **26.1** で `localhost:25565` に接続します。オペレーターにするにはコンソールで `op <名前>` と入力します。ゲーム内コマンド: `/gamemode <survival|creative|adventure|spectator>`（OP）、`/tp`（OP）、`/summon <モブ> [x y z]`（OP）、`/give <プレイヤー> <アイテム> [個数]`（OP）、`/time set|query`（OP）、`/kill`（OP）、`/spawn`、`/list`、`/rime sync`・`/rime status`（OP）。参加時のゲームモードは `rime.toml` の `server.default_gamemode` で設定できます。
+Minecraft Java Edition **26.1** で `localhost:25565` に接続します。オペレーターにするにはコンソールで `op <名前>` と入力します。参加時のゲームモードは `rime.toml` の `server.default_gamemode`（または `/defaultgamemode`）で設定できます。
+
+### コマンド
+
+バニラと同じコマンドツリー（Brigadier 互換）をクライアントに送るので、入力補完・構文エラー表示・権限による表示の切り替えがそのまま動きます。メッセージはバニラの翻訳キーで送るため、クライアントの言語（日本語など）で表示されます。ターゲットセレクター（`@p @a @r @s @e @n` と `type` `name` `tag` `team` `gamemode` `distance` `level` `x/y/z/dx/dy/dz` `x_rotation` `y_rotation` `scores` `nbt` `limit` `sort`）、相対座標（`~`）・ローカル座標（`^`）、SNBT、テキストコンポーネントに対応しています。
+
+- プレイヤー: `gamemode` `defaultgamemode` `difficulty` `tp`/`teleport` `give` `clear` `enchant` `effect` `xp`/`experience` `kill` `summon` `damage` `tag` `ride` `attribute` `spawnpoint` `setworldspawn` `spawn`
+- チャット: `say` `me` `msg`/`tell`/`w` `teammsg`/`tm` `tellraw` `title` `list` `help`
+- ワールド: `time` `weather` `gamerule` `setblock` `fill` `clone` `playsound` `stopsound` `particle` `worldborder` `seed`
+- スコアボード: `scoreboard`（objectives / players、表示スロット、`trigger`、死亡・キル数などの基準）、`team`、`bossbar`
+- `execute`: `as` `at` `positioned` `rotated` `facing` `align` `anchored` `in` `on` `summon`、`if`/`unless`（`block` `blocks` `entity` `score` `biome` `dimension` `loaded`）、`store result|success`（スコア・ボスバー）
+- 管理: `op` `deop` `kick` `ban` `ban-ip` `pardon` `pardon-ip` `banlist` `whitelist` `stop` `save-all` `save-on` `save-off` `reload`（BAN・ホワイトリストはバニラ形式の `banned-players.json` などに保存）
+- RimeMC 独自: `/rime sync`・`/rime status`（OP）
+
+ゲームルール（`gamerule`、全 59 種）は `world/rime-gamerules.txt` に保存され、実際の処理に反映されます（`keep_inventory` `mob_griefing` `do_daylight_cycle` 相当の `advance_time`、`random_tick_speed`、`fall_damage` などのダメージ系、`spawn_mobs`・`spawn_monsters`・行商人・略奪隊・ファントム、`raids`、`players_sleeping_percentage`、`block_drops`・`mob_drops`、爆発のドロップ減衰など）。スコアボード・チーム・ボスバー・ワールドボーダー・タグ・ストレージは `world/rime-commands.json` に保存されます。
 
 ## モブと戦闘
 

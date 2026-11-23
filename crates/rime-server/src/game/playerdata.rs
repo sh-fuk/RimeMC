@@ -35,6 +35,8 @@ pub struct Saved {
     pub xp: (i32, f32, i32),
     pub respawn: Option<[i32; 3]>,
     pub respawn_dim: u8,
+    /// set by `/spawnpoint`: no bed or anchor needed
+    pub respawn_forced: bool,
     pub seen_credits: bool,
     pub dim: crate::world::storage::Dim,
 }
@@ -149,7 +151,7 @@ pub fn to_nbt(p: &Player) -> Tag {
                 ("pos".into(), Tag::IntArray(vec![r[0], r[1], r[2]])),
                 ("yaw".into(), Tag::Float(0.0)),
                 ("pitch".into(), Tag::Float(0.0)),
-                ("forced".into(), Tag::Byte(0)),
+                ("forced".into(), Tag::Byte(v.respawn_forced as i8)),
             ]),
         ));
     }
@@ -238,6 +240,7 @@ pub fn from_nbt(t: &Tag) -> Option<Saved> {
             Some(Tag::String(k)) => crate::world::storage::Dim::from_key(k).map(|d| d.index()).unwrap_or(0),
             _ => 0,
         },
+        respawn_forced: t.get("respawn").and_then(|r| r.get("forced")).and_then(|f| f.as_i64()).unwrap_or(0) != 0,
         seen_credits: num("seenCredits").unwrap_or(0.0) != 0.0,
         dim: match t.get("Dimension") {
             Some(Tag::String(k)) => crate::world::storage::Dim::from_key(k).unwrap_or(crate::world::storage::Dim::Overworld),
@@ -315,6 +318,7 @@ impl Saved {
         (v.xp_level, v.xp_progress, v.xp_total) = self.xp;
         v.respawn = self.respawn;
         v.respawn_dim = self.respawn_dim;
+        v.respawn_forced = self.respawn_forced;
         v.seen_credits = self.seen_credits;
         if self.dead {
             v.living.health = 0.0;

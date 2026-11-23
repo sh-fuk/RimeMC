@@ -33,6 +33,8 @@ pub struct Vitals {
     pub respawn: Option<[i32; 3]>,
     /// the respawn point's dimension (`Dim::index`)
     pub respawn_dim: u8,
+    /// set by `/spawnpoint`: no bed or anchor needed
+    pub respawn_forced: bool,
     /// the end credits were shown (`seenCredits`)
     pub seen_credits: bool,
     /// (bed position, `sleepCounter`) while in bed
@@ -67,6 +69,7 @@ impl Default for Vitals {
             eating: None,
             respawn: None,
             respawn_dim: 0,
+            respawn_forced: false,
             seen_credits: false,
             sleeping: None,
             since_rest: 0,
@@ -141,7 +144,8 @@ impl Vitals {
             }
             let max = self.living.max_health();
             let hurt = self.living.health > 0.0 && self.living.health < max;
-            if self.saturation > 0.0 && hurt && self.food >= 20 {
+            let regen = crate::game::rules::on("natural_health_regeneration");
+            if regen && self.saturation > 0.0 && hurt && self.food >= 20 {
                 self.food_timer += 1;
                 if self.food_timer >= 10 {
                     let f = self.saturation.min(6.0);
@@ -149,7 +153,7 @@ impl Vitals {
                     self.add_exhaustion(f);
                     self.food_timer = 0;
                 }
-            } else if self.food >= 18 && hurt {
+            } else if regen && self.food >= 18 && hurt {
                 self.food_timer += 1;
                 if self.food_timer >= 80 {
                     self.heal(1.0);
@@ -353,11 +357,17 @@ impl Vitals {
 
     /// Back to full health at respawn (attributes reset, effects cleared).
     pub fn respawn(&mut self) {
-        let (r, d, c) = (self.respawn, self.respawn_dim, self.seen_credits);
+        let (r, d, c, f) = (self.respawn, self.respawn_dim, self.seen_credits, self.respawn_forced);
+        let xp = (self.xp_level, self.xp_progress, self.xp_total);
         *self = Vitals::default();
+        if crate::game::rules::on("keep_inventory") {
+            (self.xp_level, self.xp_progress, self.xp_total) = xp;
+            self.xp_dirty = true;
+        }
         self.respawn = r;
         self.respawn_dim = d;
         self.seen_credits = c;
+        self.respawn_forced = f;
     }
 }
 

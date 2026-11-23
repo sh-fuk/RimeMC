@@ -40,6 +40,8 @@ pub mod ride;
 pub mod leash;
 pub mod minecart;
 pub mod survival;
+pub mod rules;
+pub mod cmdapi;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
@@ -495,6 +497,10 @@ pub enum Request {
     OpenEntity(i32, blockentity::Screen, &'static str),
     /// trade with a villager / wandering trader
     OpenMerchant(i32),
+    /// teleport, possibly to another dimension
+    Travel(crate::world::storage::Dim, [f64; 3], f32, f32),
+    /// resend the command tree (op status changed)
+    Commands,
 }
 
 impl Player {
@@ -997,6 +1003,9 @@ impl Game {
 
     /// Spawn the loot of a broken block.
     pub fn drop_loot(&self, p: [i32; 3], state: BlockState, tool: Option<i32>) {
+        if !rules::on("block_drops") {
+            return;
+        }
         let drops = self.data.block_drops(state, tool, &mut rand::thread_rng());
         let mut rng = rand::thread_rng();
         for st in drops {
@@ -1167,6 +1176,10 @@ impl Game {
     pub fn tick(&self) {
         let _level = self.level.lock();
         let now = self.now.fetch_add(1, Ordering::Relaxed) + 1;
+        if !rules::on("advance_time") {
+            // the day clock stands still (game time keeps counting)
+            self.time_offset.fetch_sub(1, Ordering::Relaxed);
+        }
         self.tick_furnaces();
         // freshly generated fluids start flowing (vanilla post processing)
         let fresh = std::mem::take(&mut *self.world.pending_fluid.lock());
@@ -1466,7 +1479,7 @@ impl Game {
         self.tick_custom_spawners();
         for (c, owner) in booms {
             // PrimedTnt.explode: power 4 at y + height / 16
-            self.explode_full([c[0], c[1] + 0.98 / 16.0, c[2]], 4.0, false, owner, Some(false));
+            self.explode_full([c[0], c[1] + 0.98 / 16.0, c[2]], 4.0, false, owner, Some(crate::game::rules::on("tnt_explosion_drop_decay")));
         }
         for (p, state) in landed {
             match self.world.get_block(p[0], p[1], p[2]) {

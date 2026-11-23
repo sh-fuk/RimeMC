@@ -120,7 +120,7 @@ pub async fn proxy(client: CryptStream<TcpStream>, st: Arc<ServerState>, profile
     let uuid = profile.uuid.as_u128();
     let file = crate::game::playerdata::path(&st.world_dir, profile.uuid);
     let mut state = crate::game::playerdata::load_raw(&file);
-    let pos = state.as_deref().and_then(crate::game::playerdata::from_bytes).filter(|s| !s.dead).map(|s| s.pos).unwrap_or(st.spawn);
+    let pos = state.as_deref().and_then(crate::game::playerdata::from_bytes).filter(|s| !s.dead).map(|s| s.pos).unwrap_or(st.spawn());
     let cell = CellId::of_chunk(0, (pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4, st.cfg.fleet.cell_shift);
     let Some((mut node, mut addr)) = rs.node_for(cell).await else { anyhow::bail!("no fleet node available") };
     let (cmd_tx, mut cmd_rx) = mpsc::channel(4);

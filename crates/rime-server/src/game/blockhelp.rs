@@ -125,10 +125,15 @@ impl Game {
     }
 
     /// `TntBlock.prime` / `PrimedTnt`
-    pub fn prime_tnt(&self, p: [i32; 3], owner: Option<i32>) {
+    /// false (and the block stays) when the `tnt_explodes` rule is off
+    pub fn prime_tnt(&self, p: [i32; 3], owner: Option<i32>) -> bool {
+        if !crate::game::rules::on("tnt_explodes") {
+            return false;
+        }
         self.spawn_tnt(p, owner, 80);
         let c = [p[0] as f64 + 0.5, p[1] as f64, p[2] as f64 + 0.5];
         self.play_sound("minecraft:entity.tnt.primed", 1, c, 1.0, 1.0);
+        true
     }
 
     pub fn spawn_tnt(&self, p: [i32; 3], owner: Option<i32>, fuse: i32) {
@@ -328,8 +333,9 @@ impl Game {
                         }
                     }
                 } else if fs.name() == "tnt" {
-                    self.prime_tnt(front, None);
-                    self.remove_block(front, false);
+                    if self.prime_tnt(front, None) {
+                        self.remove_block(front, false);
+                    }
                     return (Some(st), None);
                 } else if (fs.name().ends_with("campfire") || fs.name().ends_with("candle") || fs.name().ends_with("candle_cake")) && fs.prop("lit") == Some("false") && fs.prop("waterlogged") != Some("true") {
                     self.set_block(front, block::with_bool(fs, "lit", true), flags::ALL | 8);

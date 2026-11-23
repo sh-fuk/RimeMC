@@ -131,7 +131,8 @@ impl Game {
         let was_raining = self.raining();
         let (o_rain, o_thunder, rain, thunder) = {
             let mut w = self.weather.lock();
-            if w.clear_time > 0 {
+            if !crate::game::rules::on("advance_weather") {
+            } else if w.clear_time > 0 {
                 w.clear_time -= 1;
                 w.thunder_time = if w.thundering { 0 } else { 1 };
                 w.rain_time = if w.raining { 0 } else { 1 };

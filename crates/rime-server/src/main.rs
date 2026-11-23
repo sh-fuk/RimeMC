@@ -4,6 +4,7 @@
 // they are attached to live player sessions by the play-state protocol.
 #[allow(dead_code)]
 mod anticheat;
+mod command;
 mod components;
 mod config;
 mod control;
@@ -78,7 +79,7 @@ pub struct ServerState {
     pub config_data: net::config_data::ConfigData,
     pub seed: i64,
     /// where new players appear (feet position)
-    pub spawn: [f64; 3],
+    spawn_pos: Mutex<[f64; 3]>,
     /// world directory (player data lives in `playerdata/`)
     pub world_dir: std::path::PathBuf,
     pub pregen: Mutex<Option<Pregen>>,
@@ -111,6 +112,17 @@ impl ServerState {
     pub fn levels(&self) -> [&Arc<game::Game>; 3] {
         [&self.game, &self.nether, &self.end]
     }
+    /// Where new players appear (feet position).
+    pub fn spawn(&self) -> [f64; 3] {
+        *self.spawn_pos.lock()
+    }
+    /// `/setworldspawn`
+    pub fn set_spawn(&self, p: [f64; 3]) {
+        *self.spawn_pos.lock() = p;
+        if let Err(e) = std::fs::write(self.world_dir.join("rime-spawn.txt"), format!("{} {} {}", p[0], p[1], p[2])) {
+            tracing::error!("saving the world spawn: {e}");
+        }
+    }
     /// Everyone online, in any dimension.
     pub fn all_players(&self) -> Vec<Arc<game::Player>> {
         self.levels().iter().flat_map(|g| g.players()).collect()
@@ -131,6 +143,7 @@ impl ServerState {
 
     /// Writes every online player's file (autosave, sync, shutdown).
     pub fn save_players(&self) {
+        command::state::save();
         for p in self.all_players() {
             if let Err(e) = game::playerdata::save(&self.world_dir, &p) {
                 tracing::error!("saving player {}: {e:#}", p.name);
@@ -181,7 +194,7 @@ impl ServerState {
             tracing::info!("RimeFleet: this node {} the redstone node", if active { "is now" } else { "is no longer" });
         }
     }
-    fn request_stop(&self) {
+    pub(crate) fn request_stop(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         self.shutdown.notify_waiters();
         self.shutdown.notify_one();
@@ -229,6 +242,10 @@ impl ServerState {
     /// Unified command dispatcher with permission checks.
     pub async fn dispatch(self: &Arc<Self>, sender: &CommandSender, line: &str) -> String {
         let line = line.trim().trim_start_matches('/');
+        if matches!(sender, CommandSender::Console) && !line.starts_with("rime") && command::knows(line) {
+            let out = command::run_console(self, line);
+            return format!("OK {out}");
+        }
         let mut words = line.split_whitespace();
         let first = words.next().unwrap_or("");
         let (cmd, arg) = if first == "rime" { (words.next().unwrap_or("help"), words.next()) } else { (first, words.next()) };
@@ -314,6 +331,9 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
     }
     let seed = load_or_create_seed(&world_dir, cfg.world.seed)?;
     let ops = Ops::load(&dir.join("ops.json"))?;
+    game::rules::load(&world_dir);
+    command::state::load(&world_dir);
+    command::cmds2::load_lists(&dir);
 
     // official vanilla data (registries, tags, worldgen) — downloaded from Mojang once
     let vanilla = vanilla::VanillaData::ensure(&dir)?;
@@ -398,7 +418,7 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
         end,
         config_data,
         seed,
-        spawn,
+        spawn_pos: Mutex::new(spawn),
         world_dir: world_dir.clone(),
         pregen: Mutex::new(None),
         bans: Mutex::new(Default::default()),
@@ -410,6 +430,7 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
         stopping: AtomicBool::new(false),
         started: Instant::now(),
     });
+    command::set_server(&state);
 
     // ---- pre-generation pool (leaves one core for the tick thread)
     if state.cfg.pregen.enabled {
@@ -429,12 +450,12 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
         );
         // spawn area first: everything within view distance of the spawn
         let view = state.cfg.server.view_distance as i32;
-        let (scx, scz) = ((state.spawn[0].floor() as i32) >> 4, (state.spawn[2].floor() as i32) >> 4);
+        let (scx, scz) = ((state.spawn()[0].floor() as i32) >> 4, (state.spawn()[2].floor() as i32) >> 4);
         let mut spawn: Vec<(i32, i32)> = (-view..=view).flat_map(|x| (-view..=view).map(move |z| (x, z))).collect();
         spawn.sort_by_key(|(x, z)| x * x + z * z);
         let spawn: Vec<(i32, i32)> = spawn.into_iter().map(|(x, z)| (x + scx, z + scz)).collect();
         p.enqueue(&spawn);
-        p.enqueue(&predict((state.spawn[0], state.spawn[2]), (0.0, 0.0), view, 1.0, state.cfg.pregen.candidates));
+        p.enqueue(&predict((state.spawn()[0], state.spawn()[2]), (0.0, 0.0), view, 1.0, state.cfg.pregen.candidates));
         *state.pregen.lock() = Some(p);
     }
 
@@ -588,7 +609,7 @@ fn move_through_portals(state: &ServerState) {
                     Some(([s[0] as f64 + 0.5, (s[1] - 1) as f64, s[2] as f64 + 0.5], 0.0))
                 }
                 _ => {
-                    let sp = state.spawn;
+                    let sp = state.spawn();
                     load(sp[0] as i32, sp[2] as i32, 1);
                     Some((sp, 0.0))
                 }
@@ -614,6 +635,10 @@ fn tick_loop(state: Arc<ServerState>) {
                 g.tick();
             }
             move_through_portals(&state);
+            command::cmds2::tick_border(&state, sched.tick);
+            if sched.tick % 20 == 0 {
+                command::cmds2::update_player_criteria(&state);
+            }
             if plugins::active() {
                 plugins::tick();
             }

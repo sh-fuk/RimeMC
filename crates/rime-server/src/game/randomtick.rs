@@ -11,6 +11,7 @@ use crate::registry::{blocks, vstate, BlockRegistry, BlockState};
 use crate::world::chunk::{HEIGHT, MIN_Y};
 
 /// `GameRules.RANDOM_TICK_SPEED`
+#[allow(dead_code)]
 pub const RANDOM_TICK_SPEED: usize = 3;
 
 /// Blocks with at least one randomly ticking state (dumped from 26.1).
@@ -180,7 +181,7 @@ impl Game {
             let picks: Vec<([i32; 3], BlockState)> = {
                 let mut out = Vec::new();
                 for sec in 0..(HEIGHT / 16) {
-                    for _ in 0..RANDOM_TICK_SPEED {
+                    for _ in 0..crate::game::rules::get("random_tick_speed").clamp(0, 4096) {
                         let (x, y, z) = (rng.gen_range(0..16), MIN_Y + sec * 16 + rng.gen_range(0..16), rng.gen_range(0..16));
                         out.push(([cx * 16 + x, y, cz * 16 + z], BlockState(0)));
                     }

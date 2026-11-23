@@ -33,7 +33,7 @@ toml = "1.2.1"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 ureq = "3.5.2"
-uuid = { version = "1.29.3", features = ["v3", "v4"] }
+uuid = { version = "1.29.3", features = ["v3", "v4", "serde"] }
 wgpu = { version = "30.0.2", optional = true }
 xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
 zip = { version = "9.8.0", default-features = false, features = ["deflate"] }

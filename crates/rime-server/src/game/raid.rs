@@ -166,6 +166,9 @@ impl Game {
 
     /// `Raids.createOrExtendRaid`
     pub fn start_raid(&self, center: [i32; 3], omen: i32) {
+        if !super::rules::on("raids") {
+            return;
+        }
         let pos = [center[0] as f64 + 0.5, center[1] as f64, center[2] as f64 + 0.5];
         if let Some(i) = self.raid_at(pos) {
             let mut raids = self.raids.lock();

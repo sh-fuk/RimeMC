@@ -190,7 +190,7 @@ fn weight(n: &str) -> i32 {
 }
 
 /// `Enchantment.canEnchant` (supported items)
-fn can_enchant(n: &str, st: &Stack, data: &GameData) -> bool {
+pub(crate) fn can_enchant(n: &str, st: &Stack, data: &GameData) -> bool {
     ench_raw(n).is_some_and(|r| set_contains(&r["supported_items"], st.item, data))
 }
 

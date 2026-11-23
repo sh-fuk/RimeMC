@@ -46,8 +46,9 @@ pub fn use_block(g: &Game, p: [i32; 3], s: BlockState, cx: &Ctx) -> Use {
     let item = cx.held.map(|h| Items::get().name(h.item)).unwrap_or("");
     // useItemOn: items acting on blocks
     if matches!(item, "flint_and_steel" | "fire_charge") && s.name() == "tnt" {
-        g.prime_tnt(p, Some(cx.player.eid));
-        g.set_block(p, blocks::AIR, flags::ALL | flags::SUPPRESS_DROPS);
+        if g.prime_tnt(p, Some(cx.player.eid)) {
+            g.set_block(p, blocks::AIR, flags::ALL | flags::SUPPRESS_DROPS);
+        }
         return Use::Consumed;
     }
     // FlintAndSteelItem.useOn / FireChargeItem.useOn
@@ -96,13 +97,14 @@ pub fn use_block(g: &Game, p: [i32; 3], s: BlockState, cx: &Ctx) -> Use {
                     crate::game::fluid::fluid_state(q).fluid() == Some(crate::game::fluid::Fluid::Water)
                 });
                 let c = [p[0] as f64 + 0.5, p[1] as f64 + 0.5, p[2] as f64 + 0.5];
-                g.explode_full(c, 5.0, true, None, if wet { None } else { Some(true) });
+                g.explode_full(c, 5.0, true, None, if wet { None } else { Some(crate::game::rules::on("block_explosion_drop_decay")) });
                 return Use::Consumed;
             }
             let mut v = cx.player.vit.lock();
             let nether = crate::world::storage::Dim::Nether.index();
             if v.respawn != Some(p) || v.respawn_dim != nether {
                 v.respawn = Some(p);
+                v.respawn_forced = false;
                 v.respawn_dim = nether;
                 drop(v);
                 g.play_sound("minecraft:block.respawn_anchor.set_spawn", 4, [p[0] as f64 + 0.5, p[1] as f64 + 0.5, p[2] as f64 + 0.5], 1.0, 1.0);
@@ -335,7 +337,7 @@ fn bed_use(g: &Game, p: [i32; 3], s: BlockState, cx: &Ctx) -> Use {
         g.set_block(foot, blocks::AIR, flags::ALL | flags::SUPPRESS_DROPS);
         g.set_block(head, blocks::AIR, flags::ALL | flags::SUPPRESS_DROPS);
         let c = [head[0] as f64 + 0.5, head[1] as f64 + 0.5, head[2] as f64 + 0.5];
-        g.explode_full(c, 5.0, true, None, Some(true));
+        g.explode_full(c, 5.0, true, None, Some(crate::game::rules::on("block_explosion_drop_decay")));
         return Use::Consumed;
     }
     if flag(hs, "occupied") {
@@ -367,6 +369,7 @@ fn start_sleep(g: &Game, pl: &Arc<Player>, head: [i32; 3], hs: BlockState) {
         let mut v = pl.vit.lock();
         if v.respawn != Some(head) || v.respawn_dim != 0 {
             v.respawn = Some(head);
+            v.respawn_forced = false;
             v.respawn_dim = 0;
             drop(v);
             msg(g, pl, "block.minecraft.set_spawn", false);
@@ -388,6 +391,22 @@ fn start_sleep(g: &Game, pl: &Arc<Player>, head: [i32; 3], hs: BlockState) {
 }
 
 /// `BedBlock.findStandUpPosition` (simplified: the free sides of the bed)
+/// `ServerPlayer.findRespawnAndUseSpawnBlock`: a bed or anchor, or for a
+/// forced point (`/spawnpoint`) any spot with room to stand.
+pub fn respawn_pos(g: &Game, p: [i32; 3], forced: bool) -> Option<[f64; 3]> {
+    if let Some(s) = stand_up_pos(g, p) {
+        return Some(s);
+    }
+    let hs = g.bs(p);
+    if forced && class(hs) != Class::Bed && hs.name() != "respawn_anchor" {
+        let room = |q: [i32; 3]| !rstate::suffocating(g.bs(q)) && !vstate::liquid(g.bs(q));
+        if room(p) && room(rel(p, UP)) {
+            return Some([p[0] as f64 + 0.5, p[1] as f64 + 0.1, p[2] as f64 + 0.5]);
+        }
+    }
+    None
+}
+
 pub fn stand_up_pos(g: &Game, head: [i32; 3]) -> Option<[f64; 3]> {
     let hs = g.bs(head);
     if hs.name() == "respawn_anchor" {
@@ -471,24 +490,25 @@ impl Game {
     pub fn tick_sleep(&self) {
         let players = self.players();
         let mut any = false;
-        let mut all = true;
+        let (mut total, mut deep) = (0usize, 0usize);
         for p in &players {
             if p.gamemode.load(Ordering::Relaxed) == 3 {
                 continue;
             }
+            total += 1;
             let mut v = p.vit.lock();
-            match &mut v.sleeping {
-                Some((head, n)) => {
-                    any = true;
-                    *n = (*n + 1).min(110);
-                    if *n < 100 {
-                        all = false;
-                    }
-                    let _ = head;
+            if let Some((_, n)) = &mut v.sleeping {
+                any = true;
+                *n = (*n + 1).min(110);
+                if *n >= 100 {
+                    deep += 1;
                 }
-                None => all = false,
             }
         }
+        // players_sleeping_percentage: share of players that must sleep
+        let pct = crate::game::rules::get("players_sleeping_percentage").max(0) as usize;
+        let need = ((total * pct).div_ceil(100)).max(1);
+        let all = pct <= 100 && deep >= need;
         // woken by day / a broken bed
         for p in &players {
             let bed = p.vit.lock().sleeping.map(|x| x.0);

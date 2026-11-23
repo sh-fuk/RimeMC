@@ -94,7 +94,12 @@ impl Game {
 
     /// World clock ticks (sent as `set_time`'s day time minus 1000).
     pub fn clock(&self) -> u64 {
-        self.now.load(Ordering::Relaxed) + self.time_offset.load(Ordering::Relaxed)
+        self.now.load(Ordering::Relaxed).wrapping_add(self.time_offset.load(Ordering::Relaxed))
+    }
+
+    /// `/time add`
+    pub fn add_time(&self, n: u64) {
+        self.time_offset.fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn set_day_time(&self, t: u64) {
@@ -820,7 +825,7 @@ impl Game {
             Act::Proj(p) => pacts.push(p),
             Act::MobEvents { eid, chunk, pos, events } => self.mob_events(eid, chunk, pos, events),
             Act::Thunder { bolt, cause, area, fire } => self.thunder(bolt, cause, area, fire),
-            Act::Explode { pos, power, fire, by } => self.explode_full(pos, power, fire, by, Some(true)),
+            Act::Explode { pos, power, fire, by } => self.explode_full(pos, power, fire, by, crate::game::rules::on("mob_griefing").then(|| crate::game::rules::on("mob_explosion_drop_decay"))),
             Act::Breath { owner, pos } => {
                 let c = super::projectile::Cloud { owner: Some(owner), potion: Some("harming".into()), scale: 1.0, radius: 5.0, radius_on_use: 0.0, radius_per_tick: 0.0, duration: 200, wait_time: 0, reapplication_delay: 20, victims: Vec::new(), color: 0x9900ff };
                 let eid = self.next_eid();
@@ -1295,11 +1300,16 @@ impl Game {
             (m.clone(), e.pos)
         };
         let by_player = m.living.last_hurt_by_player.is_some() || m.living.last_hurt_by_mob.is_some_and(|(k, _)| self.players().iter().any(|p| p.eid == k));
+        let killer = src.causing.as_ref().and_then(|c| self.players().into_iter().find(|p| p.eid == c.eid));
+        if let (Some(k), Some(st)) = (&killer, crate::command::server()) {
+            crate::command::cmds2::on_death(&st, &m.ty.name().to_string(), Some(&k.name), true, false);
+        }
+        let drops = crate::game::rules::on("mob_drops");
         // death sound
         let pitch = (rng.r#gen::<f32>() - rng.r#gen::<f32>()) * 0.2 + if m.is_baby() { 1.5 } else { 1.0 };
         self.sound(&m.ty.death_sound(), pos, m.ty.hostile(), 1.0, pitch);
         // LivingEntity.dropAllDeathLoot: the loot table, with this mob and its killer
-        if !m.is_baby() || !m.ty.ageable() {
+        if drops && (!m.is_baby() || !m.ty.ageable()) {
             let attacker = src.causing.as_ref().map(|c| c.info.type_name.to_string());
             let attacker_variant = src.causing.as_ref().and_then(|c| {
                 let ents = self.entities.lock();
@@ -1336,7 +1346,7 @@ impl Game {
             }
         }
         // dropCustomDeathLoot: equipment by drop chance
-        for (slot, s) in m.eq.iter().enumerate().take(6) {
+        for (slot, s) in m.eq.iter().enumerate().take(if drops { 6 } else { 0 }) {
             let Some(mut s) = *s else { continue };
             let chance = m.drop_chance[slot];
             if chance > 0.0 && (chance > 1.0 || by_player && rng.r#gen::<f32>() < chance) {
@@ -1348,13 +1358,13 @@ impl Game {
                 self.spawn_item([pos[0], pos[1] + 0.5, pos[2]], s, [rng.gen_range(-0.1..0.1), 0.2, rng.gen_range(-0.1..0.1)], 10);
             }
         }
-        if let Some(c) = m.v.carry {
+        if let Some(c) = m.v.carry.filter(|_| drops) {
             if let Some(id) = Items::get().id(c.name()) {
                 self.spawn_item([pos[0], pos[1] + 0.5, pos[2]], Stack::new(id, 1), [0.0, 0.2, 0.0], 10);
             }
         }
         // experience (only when a player was involved)
-        if by_player && !m.is_baby() {
+        if drops && by_player && !m.is_baby() {
             let xp = experience(&m, &mut rng);
             if xp > 0 {
                 self.award_xp_orbs(pos, xp);
@@ -1376,7 +1386,7 @@ impl Game {
     /// mobs, and shows the blast.
     pub fn explode(&self, c: [f64; 3], power: f32, _by: &'static str) {
         // PrimedTnt explodes at y + height / 16; tntExplosionDropDecay is false
-        self.explode_full([c[0], c[1] + 0.98 / 16.0, c[2]], power, false, None, Some(false));
+        self.explode_full([c[0], c[1] + 0.98 / 16.0, c[2]], power, false, None, Some(crate::game::rules::on("tnt_explosion_drop_decay")));
     }
 
     pub fn entity_box(&self, eid: i32) -> Option<Aabb> {
@@ -1398,7 +1408,7 @@ impl Game {
 
     /// Fireballs and skulls: mob explosions (mobExplosionDropDecay).
     pub fn explode_with_fire(&self, c: [f64; 3], power: f32, fire: bool) {
-        self.explode_full(c, power, fire, None, Some(true));
+        self.explode_full(c, power, fire, None, crate::game::rules::on("mob_griefing").then(|| crate::game::rules::on("mob_explosion_drop_decay")));
     }
 
     /// `ServerExplosion.explode`. `blocks`: None keeps the blocks, Some(decay)
@@ -1548,7 +1558,7 @@ impl Game {
 
     /// `NaturalSpawner.spawnForChunk` for the chunks around each player.
     fn natural_spawns(&self, env: &Env, rng: &mut impl Rng) {
-        if env.players.is_empty() {
+        if env.players.is_empty() || !super::rules::on("spawn_mobs") {
             return;
         }
         // mob counts per category near each player
@@ -1570,7 +1580,7 @@ impl Game {
                 if cat == "creature" && env.now % 400 != 0 {
                     continue;
                 }
-                if cat == "monster" && env.difficulty == 0 {
+                if cat == "monster" && (env.difficulty == 0 || !super::rules::on("spawn_monsters")) {
                     continue;
                 }
                 let count = mobs.iter().filter(|(p, c)| *c == cat && dist2(*p, *ppos) < 128.0 * 128.0).count();
