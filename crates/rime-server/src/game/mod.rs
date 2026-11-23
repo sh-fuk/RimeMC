@@ -12,6 +12,8 @@ pub mod level;
 pub mod blockentity;
 pub mod merchant;
 pub mod pickup;
+pub mod raid;
+pub mod spawners;
 pub mod combat;
 pub mod consume;
 pub mod hazards;
@@ -584,6 +586,10 @@ pub struct Game {
     pub(crate) rides: Mutex<ride::Rides>,
     /// who is on a lead
     pub(crate) leashes: Mutex<leash::Leashes>,
+    pub raids: Mutex<Vec<raid::Raid>>,
+    pub spawners: Mutex<spawners::Spawners>,
+    /// players with Raid Omen: (centre, omen level, ticks left)
+    pub omens: Mutex<HashMap<i32, ([i32; 3], i32, i32)>>,
 }
 
 pub(crate) struct GW<'a>(pub(crate) &'a Game);
@@ -626,6 +632,9 @@ impl Game {
             portal_cd: Mutex::new(HashMap::new()),
             rides: Mutex::new(ride::Rides::default()),
             leashes: Mutex::new(leash::Leashes::default()),
+            raids: Mutex::new(Vec::new()),
+            spawners: Mutex::new(spawners::Spawners::default()),
+            omens: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1453,6 +1462,8 @@ impl Game {
         self.tick_leashes();
         self.tick_merchants();
         self.tick_mob_pickup();
+        self.tick_raids();
+        self.tick_custom_spawners();
         for (c, owner) in booms {
             // PrimedTnt.explode: power 4 at y + height / 16
             self.explode_full([c[0], c[1] + 0.98 / 16.0, c[2]], 4.0, false, owner, Some(false));

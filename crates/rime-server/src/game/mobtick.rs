@@ -1326,7 +1326,12 @@ impl Game {
                 smelts: weapon.is_some_and(|w| w.enchantment_level("fire_aspect") > 0),
                 vehicle: None,
             };
-            for s in self.data.roll_entity_loot(&m.ty.loot_table(), &ctx, &mut rng) {
+            for mut s in self.data.roll_entity_loot(&m.ty.loot_table(), &ctx, &mut rng) {
+                // set_ominous_bottle_amplifier (uniform 0..=4)
+                if Items::get().name(s.item) == "ominous_bottle" && s.patch().ominous.is_none() {
+                    let a = rng.gen_range(0..=4u8);
+                    s = s.with_patch(|p| p.ominous = Some(a));
+                }
                 self.spawn_item([pos[0], pos[1] + 0.5, pos[2]], s, [rng.gen_range(-0.1..0.1), 0.2, rng.gen_range(-0.1..0.1)], 10);
             }
         }

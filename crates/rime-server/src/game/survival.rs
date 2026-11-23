@@ -37,6 +37,8 @@ pub struct Vitals {
     pub seen_credits: bool,
     /// (bed position, `sleepCounter`) while in bed
     pub sleeping: Option<([i32; 3], i32)>,
+    /// `Stats.TIME_SINCE_REST` (phantoms)
+    pub since_rest: i32,
 }
 
 /// `Entity.getTicksRequiredToFreeze`
@@ -67,6 +69,7 @@ impl Default for Vitals {
             respawn_dim: 0,
             seen_credits: false,
             sleeping: None,
+            since_rest: 0,
         }
     }
 }

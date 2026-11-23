@@ -104,8 +104,17 @@ impl Game {
                 self.consume_effect(p, e, &mut rng);
             }
         }
-        // PotionContents.onConsume
+        // OminousBottleAmplifier.onConsume: Bad Omen for 100 minutes
         let patch = stack.patch();
+        if crate::data::Items::get().name(stack.item) == "ominous_bottle" {
+            let amp = patch.ominous.unwrap_or(0) as i32;
+            self.with_player(p, |l, _, body| {
+                l.remove_effect(Effect::BadOmen);
+                l.add_effect(&body.info, Instance::new(Effect::BadOmen, 120000, amp));
+            });
+            self.play_sound("minecraft:item.ominous_bottle.dispose", 7, pos, 1.0, 1.0);
+        }
+        // PotionContents.onConsume
         if let Some(pot) = &patch.potion {
             let scale = stack.defaults().raw.get("potion_duration_scale").and_then(|s| s.as_f64()).unwrap_or(1.0) as f32;
             let effects: Vec<_> = potion_effects(pot).to_vec();

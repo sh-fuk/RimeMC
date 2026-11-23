@@ -42,6 +42,8 @@ pub struct Patch {
     pub banner: Vec<(String, u8)>,
     /// `dyed_color` (RGB)
     pub dyed_color: Option<i32>,
+    /// `ominous_bottle_amplifier`
+    pub ominous: Option<u8>,
 }
 
 /// Network ids of the synchronized data-driven registries (trim materials,
@@ -351,6 +353,11 @@ pub fn write_patch(b: &mut Vec<u8>, comp: u32) {
         }
         added.push((type_id("minecraft:banner_patterns"), x));
     }
+    if let Some(a) = p.ominous {
+        let mut x = Vec::new();
+        x.vi(a as i32);
+        added.push((type_id("minecraft:ominous_bottle_amplifier"), x));
+    }
     if let Some(rgb) = p.dyed_color {
         let mut x = Vec::new();
         x.i32(rgb);
@@ -473,6 +480,9 @@ pub fn to_nbt(comp: u32) -> Option<Tag> {
     if p.intangible {
         c.push(("minecraft:intangible_projectile".into(), Tag::Compound(vec![])));
     }
+    if let Some(a) = p.ominous {
+        c.push(("minecraft:ominous_bottle_amplifier".into(), Tag::Int(a as i32)));
+    }
     if let Some(rgb) = p.dyed_color {
         c.push(("minecraft:dyed_color".into(), Tag::Int(rgb)));
     }
@@ -523,6 +533,7 @@ pub fn from_nbt(t: &Tag) -> u32 {
     p.repair_cost = t.get("minecraft:repair_cost").and_then(|d| d.as_i64()).map(|d| d as i32);
     p.potion = t.get("minecraft:potion_contents").and_then(|pc| pc.get("potion").or(Some(pc))).and_then(|x| x.as_str()).map(|s| s.trim_start_matches("minecraft:").to_string());
     p.intangible = t.get("minecraft:intangible_projectile").is_some();
+    p.ominous = t.get("minecraft:ominous_bottle_amplifier").and_then(|d| d.as_i64()).map(|d| d.clamp(0, 4) as u8);
     p.dyed_color = t.get("minecraft:dyed_color").and_then(|d| d.as_i64().or_else(|| d.get("rgb").and_then(|x| x.as_i64()))).map(|d| d as i32);
     if let Some(tr) = t.get("minecraft:trim") {
         let s = |k: &str| tr.get(k).and_then(|v| v.as_str()).map(|x| x.trim_start_matches("minecraft:").to_string());
