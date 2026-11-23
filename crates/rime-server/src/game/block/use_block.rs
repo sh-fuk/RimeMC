@@ -220,6 +220,7 @@ pub fn use_block(g: &Game, p: [i32; 3], s: BlockState, cx: &Ctx) -> Use {
         }
         Class::Bell => {
             sound(g, p, "minecraft:block.bell.use", 2.0, 1.0);
+            cx.player.award_custom("bell_ring", 1);
             g.block_event(p, s, 1, cx.face as i32);
             return Use::Consumed;
         }
@@ -298,6 +299,7 @@ fn cake_use(g: &Game, p: [i32; 3], s: BlockState, cx: &Ctx) -> Use {
     v.eat(2, 0.1);
     v.dirty = true;
     drop(v);
+    cx.player.award_custom("eat_cake_slice", 1);
     if name.ends_with("candle_cake") {
         // CandleCakeBlock: eating drops the candle
         if let Some(c) = Items::get().id(name.trim_end_matches("_cake")) {
@@ -386,6 +388,7 @@ fn start_sleep(g: &Game, pl: &Arc<Player>, head: [i32; 3], hs: BlockState) {
     // LivingEntity.startSleeping
     g.set_block(head, with_bool(hs, "occupied", true), flags::ALL);
     pl.vit.lock().sleeping = Some((head, 0));
+    pl.award_custom("sleep_in_bed", 1);
     pl.requests.lock().push(crate::game::Request::Teleport([c[0], head[1] as f64 + 0.6875, c[2]], 0.0, 0.0));
     g.broadcast_sleep_pose(pl, Some(head));
 }

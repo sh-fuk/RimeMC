@@ -224,6 +224,19 @@ impl Game {
         e.vel = [pos[0] - e.pos[0], pos[1] - e.pos[1], pos[2] - e.pos[2]];
         e.pos = pos;
         e.on_ground = on_ground;
+        // Player.checkRidingStatistics
+        let d = (e.vel[0] * e.vel[0] + e.vel[1] * e.vel[1] + e.vel[2] * e.vel[2]).sqrt();
+        let cm = (d * 100.0).round() as i32;
+        let stat = match e.type_name().as_str() {
+            t if t.ends_with("minecart") => Some("minecart_one_cm"),
+            t if t.ends_with("boat") || t.ends_with("raft") => Some("boat_one_cm"),
+            "pig" => Some("pig_one_cm"),
+            "horse" | "donkey" | "mule" | "skeleton_horse" | "zombie_horse" | "llama" | "trader_llama" | "camel" | "camel_husk" => Some("horse_one_cm"),
+            "strider" => Some("strider_one_cm"),
+            "happy_ghast" => Some("happy_ghast_one_cm"),
+            "nautilus" | "zombie_nautilus" => Some("nautilus_one_cm"),
+            _ => None,
+        };
         match &mut e.kind {
             EKind::Boat { yaw: y, .. } => *y = yaw,
             EKind::Mob(m) => {
@@ -236,6 +249,9 @@ impl Game {
         }
         drop(ents);
         p.pose.lock().pos = pos;
+        if let Some(st) = stat.filter(|_| cm > 0) {
+            p.award_custom(st, cm);
+        }
     }
 
     /// Per tick: passengers follow their vehicles; untamed horses buck

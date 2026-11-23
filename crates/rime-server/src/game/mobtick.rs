@@ -1301,8 +1301,12 @@ impl Game {
         };
         let by_player = m.living.last_hurt_by_player.is_some() || m.living.last_hurt_by_mob.is_some_and(|(k, _)| self.players().iter().any(|p| p.eid == k));
         let killer = src.causing.as_ref().and_then(|c| self.players().into_iter().find(|p| p.eid == c.eid));
-        if let (Some(k), Some(st)) = (&killer, crate::command::server()) {
-            crate::command::cmds2::on_death(&st, &m.ty.name().to_string(), Some(&k.name), true, false);
+        if let Some(k) = &killer {
+            k.award_custom("mob_kills", 1);
+            k.award(super::stats::KILLED, m.ty.name(), 1);
+            if let Some(st) = crate::command::server() {
+                crate::command::cmds2::on_death(&st, m.ty.name(), Some(&k.name), true, false);
+            }
         }
         let drops = crate::game::rules::on("mob_drops");
         // death sound

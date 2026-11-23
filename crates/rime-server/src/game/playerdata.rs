@@ -275,6 +275,9 @@ pub fn load_raw(path: &Path) -> Option<Vec<u8>> {
 
 /// Writes atomically (temp file + rename), like vanilla's `.dat_old` dance.
 pub fn save(world: &Path, p: &Player) -> anyhow::Result<()> {
+    if let Err(e) = super::stats::save(world, p) {
+        tracing::warn!("saving stats of {}: {e:#}", p.name);
+    }
     save_raw(world, p.uuid, &to_nbt(p).to_root_bytes(""))
 }
 

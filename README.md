@@ -78,6 +78,10 @@ Minecraft Java Edition **26.1** で `localhost:25565` に接続します。オ�
 
 ゲームルール（`gamerule`、全 59 種）は `world/rime-gamerules.txt` に保存され、実際の処理に反映されます（`keep_inventory` `mob_griefing` `do_daylight_cycle` 相当の `advance_time`、`random_tick_speed`、`fall_damage` などのダメージ系、`spawn_mobs`・`spawn_monsters`・行商人・略奪隊・ファントム、`raids`、`players_sleeping_percentage`、`block_drops`・`mob_drops`、爆発のドロップ減衰など）。スコアボード・チーム・ボスバー・ワールドボーダー・タグ・ストレージは `world/rime-commands.json` に保存されます。
 
+### 統計
+
+バニラの統計（`ServerStatsCounter`）を記録し、統計画面に表示します。採掘・クラフト・使用・破損・拾得・投棄・キル・死因（ブロック/アイテム/モブ別）と、プレイ時間・移動距離（歩き・ダッシュ・スニーク・水泳・飛行・エリトラ・落下・登攀・各乗り物）・ジャンプ・与えた/受けたダメージ・死亡・キル数・就寝・取引・各ブロックの操作（チェスト・かまど・作業台など）などのカスタム統計を数えます。保存先はバニラと同じ `world/stats/<UUID>.json` です。スコアボードの統計基準（例: `minecraft.custom:minecraft.jump`、`minecraft.mined:minecraft.stone`）も動きます。
+
 ## モブと戦闘
 
 - **全 89 種**（26.1 の生き物すべて）。バニラと同じ Goal / Target セレクタ（優先度・フラグ・割り込み・2 tick ごとの評価）、経路探索（歩行・水陸両用・水中・飛行・壁登り、パスタイプごとのペナルティ）、移動・視線・ジャンプ制御、`travel` の物理（摩擦・水中・溶岩・浮遊・低速落下・はしご）をバニラの順序で実行します。

@@ -28,6 +28,8 @@ pub struct Inventory {
     pub window: Window,
     /// contents of an open block container (`Window::Container`)
     pub ext: Vec<Option<Stack>>,
+    /// results taken from a crafting grid / workstation (statistics)
+    pub crafted: Vec<Stack>,
     /// slots changed since the last sync: (window id, slot)
     pub dirty: Vec<(u8, i16)>,
     drag: Option<(u8, Vec<i16>)>,
@@ -41,7 +43,7 @@ pub struct Inventory {
 
 impl Default for Inventory {
     fn default() -> Self {
-        Self { slots: [None; SLOTS], table: [None; 10], cursor: None, state_id: 0, window: Window::Player, ext: Vec::new(), dirty: Vec::new(), drag: None, quick_furnace_target: None, menu: Default::default(), enchant_seed: rand::random() }
+        Self { slots: [None; SLOTS], table: [None; 10], cursor: None, state_id: 0, window: Window::Player, ext: Vec::new(), crafted: Vec::new(), dirty: Vec::new(), drag: None, quick_furnace_target: None, menu: Default::default(), enchant_seed: rand::random() }
     }
 }
 
@@ -260,6 +262,14 @@ impl Inventory {
     }
 
     fn take_result(&mut self, data: &GameData) -> Option<Stack> {
+        let r = self.take_result_inner(data);
+        if let Some(s) = r {
+            self.crafted.push(s);
+        }
+        r
+    }
+
+    fn take_result_inner(&mut self, data: &GameData) -> Option<Stack> {
         if self.menu_screen().is_some() {
             return super::menu::take(self, data);
         }

@@ -247,6 +247,7 @@ pub async fn run_with_state<S: Io>(mut sock: CryptStream<S>, st: Arc<ServerState
         me.held.store(s.held, Ordering::Relaxed);
         *me.vit.lock() = s.vitals();
     }
+    *me.stats.lock() = crate::game::stats::load(&st.world_dir, uuid);
     st.online.store(st.all_players().len() as u32, Ordering::Relaxed);
     tracing::info!("{name} joined the game ({uuid}, entity {})", me.eid);
 
@@ -260,6 +261,9 @@ pub async fn run_with_state<S: Io>(mut sock: CryptStream<S>, st: Arc<ServerState
 
     // ---- leave
     let replaced = me.kicked.load(Ordering::Relaxed);
+    if !replaced {
+        me.award_custom("leave_game", 1);
+    }
     match crate::fleet_net::node_link() {
         // replaced by a newer login: that session owns the player now
         _ if replaced => {}
@@ -788,6 +792,10 @@ impl Session {
 
     async fn on_tick(&mut self) -> Flow {
         self.tick += 1;
+        {
+            let sleeping = self.me.vit.lock().sleeping.is_some();
+            self.me.tick_stats(self.sneaking, sleeping);
+        }
         let requests = std::mem::take(&mut *self.me.requests.lock());
         for r in requests {
             match r {
@@ -1046,6 +1054,24 @@ impl Session {
             self.st.broadcast_all(self.game.encode("system_chat", &chat));
         }
         tracing::info!("{} died: {}", self.me.name, msg_json);
+        // ServerPlayer.die statistics
+        self.me.award_custom("deaths", 1);
+        self.me.reset_stat(crate::game::stats::CUSTOM, "time_since_death");
+        self.me.reset_stat(crate::game::stats::CUSTOM, "time_since_rest");
+        if let Some(eid) = credit {
+            match self.st.all_players().into_iter().find(|p| p.eid == eid) {
+                Some(k) => {
+                    k.award_custom("player_kills", 1);
+                    k.award(crate::game::stats::KILLED, "player", 1);
+                    self.me.award(crate::game::stats::KILLED_BY, "player", 1);
+                }
+                None => {
+                    if let Some(s) = self.game.entity_snap(eid) {
+                        self.me.award(crate::game::stats::KILLED_BY, &s.ty, 1);
+                    }
+                }
+            }
+        }
         // scoreboard criteria
         let killer = credit.and_then(|eid| match self.st.all_players().into_iter().find(|p| p.eid == eid) {
             Some(p) => Some((p.name.clone(), true)),
@@ -1694,12 +1720,20 @@ impl Session {
                 _ => {}
             }
         } else if pid == sb("client_command") {
-            if r.varint()? == 0 {
-                if self.won_game {
-                    self.credits_done = true;
-                } else {
-                    self.respawn();
+            match r.varint()? {
+                0 => {
+                    if self.won_game {
+                        self.credits_done = true;
+                    } else {
+                        self.respawn();
+                    }
                 }
+                1 => {
+                    // the statistics screen
+                    let b = self.me.stats.lock().packet_body(true);
+                    self.send("award_stats", &b);
+                }
+                _ => {}
             }
         } else if pid == sb("client_information") {
             let _locale = r.string(16)?;
@@ -1787,6 +1821,7 @@ impl Session {
         // Player.checkMovementStatistics / jumpFromGround
         let (dx, dz) = (to[0] - from[0], to[2] - from[2]);
         let h = (dx * dx + dz * dz).sqrt();
+        self.movement_stats(from, to, on_ground, dy, ctx);
         if gm == 0 || gm == 2 {
             let mut v = self.me.vit.lock();
             if ctx.in_liquid {
@@ -1799,6 +1834,50 @@ impl Session {
             }
         }
         self.was_on_ground = on_ground;
+    }
+
+    /// `Player.checkMovementStatistics`, jumps and falls.
+    fn movement_stats(&self, from: [f64; 3], to: [f64; 3], on_ground: bool, dy: f64, ctx: &MoveContext) {
+        let (dx, dz) = (to[0] - from[0], to[2] - from[2]);
+        let cm = |d: f64| (d * 100.0).round() as i32;
+        let h = cm((dx * dx + dz * dz).sqrt());
+        let all = cm((dx * dx + dy * dy + dz * dz).sqrt());
+        let me = &self.me;
+        if self.was_on_ground && !on_ground && dy > 0.0 && !ctx.in_liquid && !ctx.climbing {
+            me.award_custom("jump", 1);
+        }
+        if all <= 0 {
+            return;
+        }
+        let eye_in_water = {
+            let p = [to[0].floor() as i32, (to[1] + 1.62).floor() as i32, to[2].floor() as i32];
+            self.game.world.get_block(p[0], p[1], p[2]).is_some_and(|b| crate::game::fluid::fluid_state(b).fluid().is_some_and(|f| matches!(f, crate::game::fluid::Fluid::Water)))
+        };
+        if ctx.in_liquid && self.sprinting && eye_in_water {
+            me.award_custom("swim_one_cm", all);
+        } else if eye_in_water {
+            me.award_custom("walk_under_water_one_cm", all);
+        } else if ctx.in_liquid {
+            me.award_custom("walk_on_water_one_cm", h);
+        } else if ctx.climbing {
+            if dy > 0.0 {
+                me.award_custom("climb_one_cm", cm(dy));
+            }
+        } else if on_ground {
+            if self.sprinting {
+                me.award_custom("sprint_one_cm", h);
+            } else if self.sneaking {
+                me.award_custom("crouch_one_cm", h);
+            } else {
+                me.award_custom("walk_one_cm", h);
+            }
+        } else if self.gliding {
+            me.award_custom("aviate_one_cm", all);
+        } else if dy < 0.0 {
+            me.award_custom("fall_one_cm", cm(-dy));
+        } else if h > 25 {
+            me.award_custom("fly_one_cm", h);
+        }
     }
 
     fn move_context(&self, to: [f64; 3]) -> MoveContext {
@@ -1986,6 +2065,7 @@ impl Session {
                     })
                 };
                 if let Some(t) = taken {
+                    self.me.award_custom("drop", 1);
                     self.throw(t, false);
                     self.game.flush_inventory(&self.me);
                 }
@@ -2055,6 +2135,12 @@ impl Session {
                 self.game.prevent_drop_from_other_part([pos.0, pos.1, pos.2], cur);
             }
             self.game.player_change_block([pos.0, pos.1, pos.2], after, gm == 0, tool);
+            if gm == 0 {
+                self.me.award(crate::game::stats::MINED, cur.name(), 1);
+                if let Some(t) = tool {
+                    self.me.award(crate::game::stats::USED, Items::get().name(t), 1);
+                }
+            }
             self.me.vit.lock().add_exhaustion(0.005);
             self.ack(seq);
             self.after_change(pos);
@@ -2066,6 +2152,7 @@ impl Session {
 
     /// Throw an item from the player's eyes in the look direction.
     fn throw(&self, st: Stack, random: bool) {
+        self.me.award(crate::game::stats::DROPPED, Items::get().name(st.item), st.count as i32);
         let pose = *self.me.pose.lock();
         let (yaw, pitch) = (pose.yaw.to_radians() as f64, pose.pitch.to_radians() as f64);
         let mut rng = rand::thread_rng();
@@ -2143,6 +2230,10 @@ impl Session {
             let ok = predicted.iter().all(|(loc, pred)| contents.get(*loc as usize).is_some_and(|s| as_pair(*s) == *pred)) && as_pair(inv.cursor) == cursor;
             (out, ok)
         };
+        let crafted = std::mem::take(&mut self.me.inv.lock().crafted);
+        for c in crafted {
+            self.me.award(crate::game::stats::CRAFTED, Items::get().name(c.item), c.count as i32);
+        }
         for t in outcome.thrown {
             self.throw(t, false);
         }
@@ -2356,6 +2447,7 @@ impl Session {
                 self.throw(t, false);
             }
         }
+        self.me.award_custom("interact_with_crafting_table", 1);
         let menu = Registries::get().id("minecraft:menu", "minecraft:crafting").unwrap_or(12);
         let mut b = Vec::new();
         b.vi(id as i32).vi(menu).raw(&text_nbt("Crafting"));
@@ -2365,6 +2457,9 @@ impl Session {
 
     fn open_container(&mut self, p: [i32; 3], screen: crate::game::blockentity::Screen, title: &str) {
         use crate::game::blockentity as be;
+        if let Some(stat) = self.game.world.get_block(p[0], p[1], p[2]).and_then(|b| interact_stat(b.name())) {
+            self.me.award_custom(stat, 1);
+        }
         if screen.transient() {
             self.open_menu(p, screen, title);
             return;
@@ -2446,6 +2541,7 @@ impl Session {
         use crate::game::blockentity::Screen;
         let game = &*self.game.clone();
         let Some((offers, level, xp, villager, title)) = game.start_trading(&self.me, eid) else { return };
+        self.me.award_custom("talked_to_villager", 1);
         self.next_window = self.next_window % 100 + 1;
         let id = self.next_window;
         {
@@ -2552,7 +2648,7 @@ impl Session {
                 MenuEvent::Sound(s) => game.play_sound(s, 4, centre, 1.0, rand::random::<f32>() * 0.1 + 0.9),
                 MenuEvent::XpOrbs(n) => game.award_xp_orbs(centre, n),
                 MenuEvent::AnvilUsed => crate::game::workstation::anvil_used(game, pos, creative),
-                MenuEvent::Stat(_) => {}
+                MenuEvent::Stat(s) => self.me.award_custom(s, 1),
                 MenuEvent::Trade(i) => {
                     let eid = self.me.inv.lock().menu.merchant;
                     game.merchant_traded(&self.me, eid, i);
@@ -2826,6 +2922,7 @@ impl Session {
         if fluid::fluid_state(state).fluid().is_some() {
             game.schedule([target.0, target.1, target.2], crate::game::TickKind::Fluid, 5);
         }
+        self.me.award(crate::game::stats::USED, Items::get().name(item.item), 1);
         if gm != 1 {
             self.me.inv.lock().consume(slot, 1);
             game.flush_inventory(&self.me);
@@ -2833,6 +2930,33 @@ impl Session {
         self.ack(seq);
         Flow::Continue
     }
+}
+
+/// The custom statistic for opening a block's screen.
+fn interact_stat(block: &str) -> Option<&'static str> {
+    Some(match block {
+        "chest" => "open_chest",
+        "trapped_chest" => "trigger_trapped_chest",
+        "ender_chest" => "open_enderchest",
+        "barrel" => "open_barrel",
+        "furnace" => "interact_with_furnace",
+        "blast_furnace" => "interact_with_blast_furnace",
+        "smoker" => "interact_with_smoker",
+        "brewing_stand" => "interact_with_brewingstand",
+        "beacon" => "interact_with_beacon",
+        "dropper" => "inspect_dropper",
+        "dispenser" => "inspect_dispenser",
+        "hopper" => "inspect_hopper",
+        "lectern" => "interact_with_lectern",
+        "cartography_table" => "interact_with_cartography_table",
+        "loom" => "interact_with_loom",
+        "stonecutter" => "interact_with_stonecutter",
+        "grindstone" => "interact_with_grindstone",
+        "smithing_table" => "interact_with_smithing_table",
+        "anvil" | "chipped_anvil" | "damaged_anvil" => "interact_with_anvil",
+        b if b.ends_with("shulker_box") => "open_shulker_box",
+        _ => return None,
+    })
 }
 
 pub fn spawn_block(p: [f64; 3]) -> (i32, i32, i32) {

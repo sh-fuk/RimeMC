@@ -748,6 +748,7 @@ impl Game {
 
     /// `AbstractVillager.notifyTrade` (+ `Villager.rewardTradeXp`).
     pub fn merchant_traded(&self, p: &Arc<Player>, eid: i32, idx: usize) {
+        p.award_custom("traded_with_villager", 1);
         let mut rng = rand::thread_rng();
         let res = self.with_merchant(eid, |m, pos| {
             let villager = m.ty.is("villager");

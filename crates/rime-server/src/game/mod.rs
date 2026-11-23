@@ -41,6 +41,7 @@ pub mod leash;
 pub mod minecart;
 pub mod survival;
 pub mod rules;
+pub mod stats;
 pub mod cmdapi;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -477,6 +478,8 @@ pub struct Player {
     pub dim: std::sync::atomic::AtomicU8,
     /// last `player_input` flags (forward 1, back 2, left 4, right 8, jump 16, shift 32, sprint 64)
     pub input: std::sync::atomic::AtomicU8,
+    /// statistics (`ServerStatsCounter`)
+    pub stats: Mutex<stats::Stats>,
 }
 
 /// Something another part of the server asks a player's session to do.
@@ -702,6 +705,7 @@ impl Game {
             requests: Mutex::new(Vec::new()),
             dim: std::sync::atomic::AtomicU8::new(self.dim.index()),
             input: std::sync::atomic::AtomicU8::new(0),
+            stats: Mutex::new(stats::Stats::default()),
         });
         m.insert(eid, p.clone());
         Some(p)
@@ -1282,6 +1286,7 @@ impl Game {
         let mut removed: Vec<(i32, (i32, i32))> = Vec::new();
         let mut landed: Vec<([i32; 3], BlockState)> = Vec::new();
         let mut inv_changed: Vec<Arc<Player>> = Vec::new();
+        let mut picked: Vec<(Arc<Player>, i32, i32)> = Vec::new();
         let mut booms: Vec<([f64; 3], Option<i32>)> = Vec::new();
         // vehicles: who steers (client-moved) and riders' push intents
         let ridden: Vec<i32> = self.rides.lock().passengers.keys().copied().collect();
@@ -1432,6 +1437,7 @@ impl Game {
                     let mut b = Vec::new();
                     b.vi(e.eid).vi(p.eid).vi(taken as i32);
                     sends.push((chunk, self.encode("take_item_entity", &b)));
+                    picked.push((p.clone(), stack.item, taken as i32));
                     inv_changed.push(p.clone());
                     if left == 0 {
                         removed.push((e.eid, chunk));
@@ -1453,6 +1459,9 @@ impl Game {
         }
         for (eid, c) in removed {
             self.broadcast_chunk(c, &self.remove_packet(&[eid]));
+        }
+        for (p, item, n) in picked {
+            p.award(stats::PICKED_UP, crate::data::Items::get().name(item), n);
         }
         for p in inv_changed {
             self.flush_inventory(&p);
