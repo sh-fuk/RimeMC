@@ -389,6 +389,7 @@ fn start_sleep(g: &Game, pl: &Arc<Player>, head: [i32; 3], hs: BlockState) {
     g.set_block(head, with_bool(hs, "occupied", true), flags::ALL);
     pl.vit.lock().sleeping = Some((head, 0));
     pl.award_custom("sleep_in_bed", 1);
+    g.trigger_simple(pl, "slept_in_bed");
     pl.requests.lock().push(crate::game::Request::Teleport([c[0], head[1] as f64 + 0.6875, c[2]], 0.0, 0.0));
     g.broadcast_sleep_pose(pl, Some(head));
 }

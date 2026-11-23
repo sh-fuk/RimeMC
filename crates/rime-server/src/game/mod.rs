@@ -42,6 +42,10 @@ pub mod minecart;
 pub mod survival;
 pub mod rules;
 pub mod stats;
+pub mod advancement;
+pub mod recipebook;
+pub mod triggers;
+pub mod golem;
 pub mod cmdapi;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -480,6 +484,8 @@ pub struct Player {
     pub input: std::sync::atomic::AtomicU8,
     /// statistics (`ServerStatsCounter`)
     pub stats: Mutex<stats::Stats>,
+    /// advancement progress and unlocked recipes
+    pub adv: Mutex<advancement::Progress>,
 }
 
 /// Something another part of the server asks a player's session to do.
@@ -706,6 +712,7 @@ impl Game {
             dim: std::sync::atomic::AtomicU8::new(self.dim.index()),
             input: std::sync::atomic::AtomicU8::new(0),
             stats: Mutex::new(stats::Stats::default()),
+            adv: Mutex::new(advancement::Progress::default()),
         });
         m.insert(eid, p.clone());
         Some(p)

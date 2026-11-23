@@ -328,6 +328,8 @@ impl Game {
                         m.target = None;
                         m.nav.stop();
                         event(after, 7);
+                        let pp = p.clone();
+                        after.push(Box::new(move |g: &Game| g.trigger_entity(&pp, "tame_animal", eid)));
                     } else {
                         event(after, 6);
                     }

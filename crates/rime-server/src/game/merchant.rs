@@ -758,6 +758,7 @@ impl Game {
             o.uses += 1;
             let xp = o.xp;
             let reward = o.reward_xp;
+            let result = o.result;
             if villager {
                 mer.xp += xp;
                 mer.add_gossip(p.uuid, TRADING, 2);
@@ -767,9 +768,10 @@ impl Game {
                 }
             }
             let orbs = if reward { 3 + rng.gen_range(0..4) + if villager && mer.level_up { 5 } else { 0 } } else { 0 };
-            Some((pos, orbs, villager))
+            Some((pos, orbs, villager, result))
         });
-        let Some(Some((pos, orbs, villager))) = res else { return };
+        let Some(Some((pos, orbs, villager, result))) = res else { return };
+        self.trigger_villager_trade(p, eid, result);
         if orbs > 0 {
             self.award_xp_orbs([pos[0], pos[1] + 0.5, pos[2]], orbs);
         }
@@ -1066,6 +1068,9 @@ impl Game {
                 }
             }
         });
+        if let Some(p) = curer.and_then(|u| self.players().into_iter().find(|p| p.uuid == u)) {
+            self.trigger_simple(&p, "cured_zombie_villager");
+        }
     }
 
     /// `Zombie.killedEntity`: a villager killed by a zombie may turn into a

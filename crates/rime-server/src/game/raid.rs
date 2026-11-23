@@ -427,6 +427,8 @@ impl Game {
                     self.with_player(p, |l, _, body| {
                         l.add_effect(&body.info, Instance::new(Effect::HeroOfTheVillage, 48000, omen - 1));
                     });
+                    self.trigger_simple(p, "hero_of_the_village");
+                    p.award_custom("raid_win", 1);
                 }
             }
             self.play_sound("minecraft:event.raid.horn", 7, centre, 0.0, 1.0);

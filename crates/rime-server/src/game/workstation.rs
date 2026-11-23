@@ -281,6 +281,15 @@ fn beacon_tick(g: &Game, p: [i32; 3]) -> bool {
     let levels = if beam_clear(g, p) { beacon_levels(g, p) } else { 0 };
     g.lv(|l| l.beacons.insert(p, levels));
     let c = [p[0] as f64 + 0.5, p[1] as f64 + 0.5, p[2] as f64 + 0.5];
+    if levels > 0 && levels != before {
+        // CONSTRUCT_BEACON for players near the beacon
+        for pl in g.players() {
+            let q = pl.pose.lock().pos;
+            if (q[0] - c[0]).abs() <= 10.5 && (q[1] - c[1]).abs() <= 5.5 && (q[2] - c[2]).abs() <= 10.5 {
+                g.trigger_beacon(&pl, levels);
+            }
+        }
+    }
     if levels > 0 {
         g.play_sound("minecraft:block.beacon.ambient", 4, c, 1.0, 1.0);
         if before == 0 {

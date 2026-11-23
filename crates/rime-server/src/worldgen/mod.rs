@@ -126,6 +126,11 @@ impl VanillaGenerator {
     pub fn structure_mobs_at(&self, cat: &str, p: [i32; 3], on_nether_bricks: bool) -> Option<Vec<(String, u32, u32, u32)>> {
         self.structures.as_ref()?.mobs_at(self, cat, p, on_nether_bricks)
     }
+
+    /// Structures whose pieces contain `p` (`LocationPredicate.structures`).
+    pub fn structures_at(&self, p: [i32; 3]) -> Vec<String> {
+        self.structures.as_ref().map(|s| s.containing(self, p)).unwrap_or_default()
+    }
 }
 
 impl structure::Ctx for VanillaGenerator {

@@ -4,6 +4,7 @@
 pub mod args;
 mod cmds;
 pub mod cmds2;
+pub mod cmds3;
 mod execute;
 pub mod reader;
 pub mod selector;
@@ -686,6 +687,7 @@ pub fn tree() -> &'static Tree {
         let mut t = Tree::new();
         cmds::register(&mut t);
         cmds2::register(&mut t);
+        cmds3::register(&mut t);
         execute::register(&mut t);
         t
     })

@@ -248,6 +248,7 @@ pub async fn run_with_state<S: Io>(mut sock: CryptStream<S>, st: Arc<ServerState
         *me.vit.lock() = s.vitals();
     }
     *me.stats.lock() = crate::game::stats::load(&st.world_dir, uuid);
+    *me.adv.lock() = crate::game::advancement::load_player(&st.world_dir, uuid);
     st.online.store(st.all_players().len() as u32, Ordering::Relaxed);
     tracing::info!("{name} joined the game ({uuid}, entity {})", me.eid);
 
@@ -385,6 +386,12 @@ struct Session {
     portal_cooldown: i32,
     /// left the End through the exit portal: waiting for the credits to end
     won_game: bool,
+    /// inventory signature for `inventory_changed`
+    inv_sig: u64,
+    /// a dimension change to report to advancements: (from, to, position before)
+    pending_dim: Option<(crate::world::storage::Dim, crate::world::storage::Dim, [f64; 3])>,
+    /// overworld position when entering the nether (`enteredNetherPosition`)
+    nether_entry: Option<[f64; 3]>,
     credits_done: bool,
     combat: CombatChecker,
     vl: Violations,
@@ -430,6 +437,9 @@ impl Session {
             portal_time: 0,
             portal_cooldown: 0,
             won_game: false,
+            inv_sig: 0,
+            pending_dim: None,
+            nether_entry: None,
             credits_done: false,
             queue: Vec::new(),
             in_flight: 0,
@@ -529,6 +539,8 @@ impl Session {
         self.send("change_difficulty", &b);
         self.send_abilities();
         self.send_commands();
+        self.game.send_recipe_book(&self.me);
+        self.game.flush_advancements(&self.me);
         self.teleport(pose.pos, pose.yaw, pose.pitch);
         // tab list: everyone online, then announce me to everyone
         let all = self.st.all_players();
@@ -795,6 +807,7 @@ impl Session {
         {
             let sleeping = self.me.vit.lock().sleeping.is_some();
             self.me.tick_stats(self.sneaking, sleeping);
+            self.advancement_tick();
         }
         let requests = std::mem::take(&mut *self.me.requests.lock());
         for r in requests {
@@ -1058,9 +1071,12 @@ impl Session {
         self.me.award_custom("deaths", 1);
         self.me.reset_stat(crate::game::stats::CUSTOM, "time_since_death");
         self.me.reset_stat(crate::game::stats::CUSTOM, "time_since_rest");
+        self.game.trigger_killed_by(&self.me, credit, &src);
         if let Some(eid) = credit {
             match self.st.all_players().into_iter().find(|p| p.eid == eid) {
                 Some(k) => {
+                    let me_view = self.game.player_view(&self.me);
+                    self.game.trigger_player_killed(&k, &me_view, &src);
                     k.award_custom("player_kills", 1);
                     k.award(crate::game::stats::KILLED, "player", 1);
                     self.me.award(crate::game::stats::KILLED_BY, "player", 1);
@@ -1123,8 +1139,11 @@ impl Session {
         self.in_flight = 0;
         self.tracked.clear();
         self.close_window_silently();
+        let from = old.dim;
+        let at = self.me.pose.lock().pos;
         new.adopt(self.me.clone());
         self.game = new;
+        self.pending_dim = Some((from, dim, at));
     }
 
     /// `ServerPlayer.teleport` to another dimension: respawn packet, then
@@ -1434,6 +1453,8 @@ impl Session {
         b.i32(self.me.eid).u8(9);
         self.send("entity_event", &b);
         self.game.consume(&self.me, held);
+        self.me.award(crate::game::stats::USED, items.name(held.item), 1);
+        self.game.trigger_item(&self.me, "consume_item", held);
         // use_cooldown
         if let Some(t) = crate::game::consume::use_cooldown(&held) {
             {
@@ -1735,6 +1756,35 @@ impl Session {
                 }
                 _ => {}
             }
+        } else if pid == sb("command_suggestion") {
+            let id = r.varint()?;
+            let text = r.string(32500)?.to_string();
+            let line = text.trim_start_matches('/');
+            let off = text.len() - line.len();
+            if let Some((start, list)) = crate::command::cmds3::suggest(line) {
+                let mut b = Vec::new();
+                b.vi(id).vi((start + off) as i32).vi((line.len() - start) as i32).vi(list.len() as i32);
+                for m in &list {
+                    b.str(m).bool(false);
+                }
+                self.send("command_suggestions", &b);
+            }
+        } else if pid == sb("seen_advancements") {
+            // opening a tab: the server confirms the selection
+            if r.varint()? == 0 {
+                let tab = r.string(32767)?.to_string();
+                let t = crate::game::advancement::tree();
+                if t.ids.contains_key(&tab) {
+                    let mut b = Vec::new();
+                    b.bool(true).str(&tab);
+                    self.send("select_advancements_tab", &b);
+                }
+            }
+        } else if pid == sb("place_recipe") {
+            let _window = r.varint()?;
+            let display = r.varint()?;
+            let max = r.bool()?;
+            self.game.place_recipe(&self.me, display, max);
         } else if pid == sb("client_information") {
             let _locale = r.string(16)?;
             let v = (r.i8()? as i32).clamp(2, 32).min(self.st.cfg.server.view_distance as i32);
@@ -1834,6 +1884,51 @@ impl Session {
             }
         }
         self.was_on_ground = on_ground;
+    }
+
+    /// Per-tick advancement checks: inventory changes, location (every
+    /// second), the item being used.
+    fn advancement_tick(&mut self) {
+        let sig = {
+            let inv = self.me.inv.lock();
+            let mut h: u64 = 1469598103934665603;
+            for s in inv.slots.iter() {
+                let v = s.map_or(0u64, |s| (s.item as u64) << 24 ^ (s.count as u64) << 8 ^ s.comp as u64);
+                h = (h ^ v).wrapping_mul(1099511628211);
+            }
+            h
+        };
+        if sig != self.inv_sig {
+            self.inv_sig = sig;
+            self.game.trigger_inventory(&self.me);
+        }
+        self.game.trigger_simple(&self.me, "tick");
+        if let Some((from, to, before)) = self.pending_dim.take() {
+            use crate::world::storage::Dim;
+            self.game.trigger_changed_dimension(&self.me, from, to);
+            if from == Dim::Overworld && to == Dim::Nether {
+                self.nether_entry = Some(before);
+            } else if from == Dim::Nether && to == Dim::Overworld {
+                if let Some(start) = self.nether_entry.take() {
+                    self.game.trigger_distance(&self.me, "nether_travel", start);
+                }
+            } else if to != Dim::Nether {
+                self.nether_entry = None;
+            }
+        }
+        if self.tick % 20 == 0 {
+            self.game.trigger_simple(&self.me, "location");
+        }
+        let using = self.me.vit.lock().living.using.map(|u| u.hand);
+        if let Some(hand) = using {
+            let item = {
+                let inv = self.me.inv.lock();
+                if hand == 0 { inv.held(self.me.held.load(Ordering::Relaxed) as i16) } else { inv.slots[45] }
+            };
+            if let Some(it) = item {
+                self.game.trigger_using_item(&self.me, it);
+            }
+        }
     }
 
     /// `Player.checkMovementStatistics`, jumps and falls.
@@ -2231,8 +2326,11 @@ impl Session {
             (out, ok)
         };
         let crafted = std::mem::take(&mut self.me.inv.lock().crafted);
-        for c in crafted {
+        for (c, recipe) in crafted {
             self.me.award(crate::game::stats::CRAFTED, Items::get().name(c.item), c.count as i32);
+            if let Some(id) = recipe {
+                self.game.trigger_recipe_crafted(&self.me, &id);
+            }
         }
         for t in outcome.thrown {
             self.throw(t, false);
@@ -2640,6 +2738,10 @@ impl Session {
                     if !creative {
                         self.me.vit.lock().give_levels(-n);
                     }
+                    let item = self.me.inv.lock().get_w(0);
+                    if let Some(it) = item {
+                        self.game.trigger_enchanted(&self.me, it, n);
+                    }
                     let mut inv = self.me.inv.lock();
                     inv.enchant_seed = rand::random();
                     inv.menu.seed = inv.enchant_seed;
@@ -2752,6 +2854,10 @@ impl Session {
                 Use::Pass => {}
                 Use::Consumed => {
                     self.ack(seq);
+                    let p = [pos.0, pos.1, pos.2];
+                    if held.is_some() {
+                        self.game.trigger_block(&self.me, "item_used_on_block", p, clicked, held);
+                    }
                     return Flow::Continue;
                 }
                 Use::Crafting => {
@@ -2923,6 +3029,8 @@ impl Session {
             game.schedule([target.0, target.1, target.2], crate::game::TickKind::Fluid, 5);
         }
         self.me.award(crate::game::stats::USED, Items::get().name(item.item), 1);
+        self.game.trigger_block(&self.me, "placed_block", [target.0, target.1, target.2], state, Some(item));
+        self.game.check_build([target.0, target.1, target.2], Some(&self.me));
         if gm != 1 {
             self.me.inv.lock().consume(slot, 1);
             game.flush_inventory(&self.me);

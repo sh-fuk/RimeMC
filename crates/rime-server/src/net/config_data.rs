@@ -68,6 +68,12 @@ pub fn dynamic_id(registry: &str, name: &str) -> Option<i32> {
     m.get(name).copied().or_else(|| if name.contains(':') { None } else { m.get(&format!("minecraft:{name}")).copied() })
 }
 
+/// Entry name for a network id of a data-driven registry.
+pub fn dynamic_name(registry: &str, id: i32) -> Option<String> {
+    let m = DYNAMIC_IDS.get()?.get(registry)?;
+    m.iter().find(|(_, v)| **v == id).map(|(k, _)| k.clone())
+}
+
 pub struct ConfigData {
     /// (registry id, entries (key, network NBT of the value))
     pub registries: Vec<(String, Vec<(String, Vec<u8>)>)>,

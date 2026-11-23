@@ -196,16 +196,18 @@ impl Game {
         if hit {
             let dealt = (before - p.vit.lock().living.health).max(0.0);
             p.award_custom("damage_taken", super::stats::damage_units(dealt));
-            self.credit_damage(src, dealt);
+            self.trigger_hurt_player(p, src, amount, dealt, false);
+            self.credit_damage(src, p.eid, amount, dealt);
         }
         hit
     }
 
-    /// `damage_dealt` for the player behind a hit.
-    fn credit_damage(&self, src: &DamageSource, dealt: f32) {
+    /// `damage_dealt` and `player_hurt_entity` for the player behind a hit.
+    fn credit_damage(&self, src: &DamageSource, target: i32, amount: f32, dealt: f32) {
         if let Some(c) = src.causing.as_ref().filter(|c| c.player) {
             if let Some(k) = self.players().into_iter().find(|p| p.eid == c.eid) {
                 k.award_custom("damage_dealt", super::stats::damage_units(dealt));
+                self.trigger_hurt_entity(&k, target, src, amount, dealt, false);
             }
         }
     }
@@ -220,7 +222,7 @@ impl Game {
         let hit = self.with_mob(eid, |l, eq, body| l.hurt(eq, body, src, amount, &mut rand::thread_rng())).unwrap_or(false);
         if hit {
             let after = self.with_mob(eid, |l, _, _| l.health).unwrap_or(0.0);
-            self.credit_damage(src, (before - after).max(0.0));
+            self.credit_damage(src, eid, amount, (before - after).max(0.0));
             if let Some(c) = src.causing.as_ref().filter(|c| c.player) {
                 let villager = matches!(self.entities.lock().get(&eid).map(|e| &e.kind), Some(EKind::Mob(m)) if m.ty.is("villager"));
                 if villager {
@@ -406,6 +408,10 @@ impl Game {
                     let pkt = self.entity_event(p.eid, 35);
                     self.to_viewers_of(p, pkt, true);
                     inv_changed = true;
+                    if let Some(t) = crate::data::Items::get().id("totem_of_undying") {
+                        p.award(super::stats::USED, "totem_of_undying", 1);
+                        self.trigger_item(p, "used_totem", crate::data::Stack::new(t, 1));
+                    }
                 }
                 Event::HurtSound => {}
                 Event::Died(src) => p.requests.lock().push(Request::Died(Box::new(src))),

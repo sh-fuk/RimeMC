@@ -505,6 +505,18 @@ impl Structures {
         None
     }
 
+    /// `StructureManager.getStructureWithPieceAt`: names of the structures
+    /// with a piece containing `p`.
+    pub fn containing(&self, ctx: &dyn Ctx, p: P) -> Vec<String> {
+        let mut out = Vec::new();
+        for s in self.references(ctx, p[0] >> 4, p[2] >> 4) {
+            if Self::piece_boxes(&s).iter().any(|b| template::bb_inside(b, p)) {
+                out.push(self.structures[s.structure].name.clone());
+            }
+        }
+        out
+    }
+
     /// `Beardifier.forStructuresInChunk`
     pub fn beardifier(&self, ctx: &dyn Ctx, cx: i32, cz: i32) -> Option<Beardifier> {
         let (x0, z0) = (cx * 16, cz * 16);

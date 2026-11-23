@@ -1198,7 +1198,7 @@ impl Game {
     /// `Animal.spawnChildFromBreeding`
     fn breed(&self, a: i32, b: i32) {
         let mut rng = rand::thread_rng();
-        let (ty, pos, variant, chunk) = {
+        let (ty, pos, variant, chunk, cause) = {
             let mut ents = self.entities.lock();
             let Some(ea) = ents.get_mut(&a) else { return };
             let pos = ea.pos;
@@ -1211,12 +1211,16 @@ impl Game {
             ma.love = 0;
             let ty = ma.ty;
             let va = ma.v.variant;
+            let mut cause = ma.love_cause;
             if let Some(EKind::Mob(mb)) = ents.get_mut(&b).map(|e| &mut e.kind) {
                 mb.age = 6000;
                 mb.love = 0;
+                cause = cause.or(mb.love_cause);
             }
-            (ty, pos, va, chunk)
+            (ty, pos, va, chunk, cause)
         };
+        let breeder = cause.and_then(|c| self.players().into_iter().find(|p| p.eid == c));
+        let mut child = None;
         // turtles lay eggs instead; frogs carry spawn
         if ty.is("turtle") {
             if let Some(EKind::Mob(m)) = self.entities.lock().get_mut(&a).map(|e| &mut e.kind) {
@@ -1227,10 +1231,14 @@ impl Game {
                 m.v.has_egg = true;
             }
         } else {
-            self.spawn_mob_with(ty, pos, false, |m, _| {
+            child = Some(self.spawn_mob_with(ty, pos, false, |m, _| {
                 m.set_baby(true);
                 m.v.variant = variant;
-            });
+            }));
+        }
+        if let Some(p) = &breeder {
+            p.award_custom("animals_bred", 1);
+            self.trigger_bred(p, a, b, child);
         }
         self.broadcast_chunk(chunk, &self.entity_event(a, 18));
         self.award_xp_orbs(pos, rng.gen_range(1..=7));
@@ -1276,6 +1284,7 @@ impl Game {
 
     /// Death of a mob: loot, equipment, experience, slime splits.
     pub(super) fn mob_died(&self, eid: i32, src: &DamageSource) {
+        let victim_view = self.view(eid);
         let villager = matches!(self.entities.lock().get(&eid).map(|e| &e.kind), Some(EKind::Mob(m)) if m.ty.is("villager"));
         if villager {
             match src.causing.as_ref() {
@@ -1302,6 +1311,9 @@ impl Game {
         let by_player = m.living.last_hurt_by_player.is_some() || m.living.last_hurt_by_mob.is_some_and(|(k, _)| self.players().iter().any(|p| p.eid == k));
         let killer = src.causing.as_ref().and_then(|c| self.players().into_iter().find(|p| p.eid == c.eid));
         if let Some(k) = &killer {
+            if let Some(v) = &victim_view {
+                self.trigger_player_killed(k, v, src);
+            }
             k.award_custom("mob_kills", 1);
             k.award(super::stats::KILLED, m.ty.name(), 1);
             if let Some(st) = crate::command::server() {

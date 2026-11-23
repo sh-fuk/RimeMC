@@ -104,6 +104,11 @@ pub enum RecipeShape {
 pub struct Recipe {
     pub shape: RecipeShape,
     pub result: Stack,
+    /// recipe id without namespace (`oak_planks`)
+    pub id: String,
+    /// recipe book group and category (`building`, `redstone`, `equipment`, `misc`)
+    pub group: String,
+    pub category: String,
 }
 
 pub struct GameData {
@@ -277,9 +282,12 @@ impl GameData {
         }
         let _ = SPAWNERS.set(spawners.clone());
         let mut d = GameData { item_tags, block_tags, entity_tags, spawners, loot, recipes: Vec::new(), cooking: Vec::new(), menus: MenuData::default() };
-        for (_, path) in v.entries("recipe") {
+        for (name, path) in v.entries("recipe") {
             let json: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-            if let Some(r) = d.parse_recipe(&json) {
+            if let Some(mut r) = d.parse_recipe(&json) {
+                r.id = name;
+                r.group = json.get("group").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                r.category = json.get("category").and_then(|x| x.as_str()).unwrap_or("misc").to_string();
                 d.recipes.push(r);
             } else if let Some(c) = d.parse_cooking(&json) {
                 d.cooking.push(c);
@@ -471,7 +479,7 @@ impl GameData {
                         }
                     }
                 }
-                Some(Recipe { shape: RecipeShape::Shaped { w, h, cells }, result })
+                Some(Recipe { shape: RecipeShape::Shaped { w, h, cells }, result, id: String::new(), group: String::new(), category: String::new() })
             }
             "minecraft:crafting_shapeless" => {
                 let ings: Option<Vec<Ingredient>> = j.get("ingredients")?.as_array()?.iter().map(|i| self.ingredient(i)).collect();
@@ -479,7 +487,7 @@ impl GameData {
                 if ings.is_empty() || ings.len() > 9 {
                     return None;
                 }
-                Some(Recipe { shape: RecipeShape::Shapeless(ings), result })
+                Some(Recipe { shape: RecipeShape::Shapeless(ings), result, id: String::new(), group: String::new(), category: String::new() })
             }
             _ => None,
         }
@@ -487,6 +495,11 @@ impl GameData {
 
     /// Match a square crafting grid (`size` 2 or 3, row-major, item ids or None).
     pub fn craft(&self, grid: &[Option<i32>], size: usize) -> Option<Stack> {
+        self.craft_recipe(grid, size).map(|r| r.result)
+    }
+
+    /// The recipe a crafting grid matches.
+    pub fn craft_recipe(&self, grid: &[Option<i32>], size: usize) -> Option<&Recipe> {
         let filled: Vec<(usize, usize)> = (0..size * size).filter(|&i| grid[i].is_some()).map(|i| (i % size, i / size)).collect();
         if filled.is_empty() {
             return None;
@@ -513,7 +526,7 @@ impl GameData {
                             })
                         });
                         if ok {
-                            return Some(r.result);
+                            return Some(r);
                         }
                     }
                 }
@@ -540,7 +553,7 @@ impl GameData {
                         false
                     }
                     if assign(0, ings, &items, &mut used) {
-                        return Some(r.result);
+                        return Some(r);
                     }
                     continue 'recipes;
                 }

@@ -95,6 +95,11 @@ pub struct ServerState {
 
 impl ServerState {
     /// The game state of a dimension.
+    /// The level a player is in.
+    pub fn level_of_player(&self, p: &game::Player) -> &Arc<game::Game> {
+        self.level(Dim::from_index(p.dim.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+
     pub fn level(&self, d: Dim) -> &Arc<game::Game> {
         match d {
             Dim::Overworld => &self.game,
@@ -337,6 +342,7 @@ fn run(dir: &Path, rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
 
     // official vanilla data (registries, tags, worldgen) — downloaded from Mojang once
     let vanilla = vanilla::VanillaData::ensure(&dir)?;
+    game::advancement::load(&vanilla.path("minecraft/advancement"));
     let mut generator = Generator::new(seed, cfg.world.generator == config::GeneratorKind::Fast && cfg.gpu.enabled, cfg.gpu.min_batch);
     if cfg.world.generator == config::GeneratorKind::Vanilla {
         let load = |rel: &str| match rel.strip_prefix("structure/") {

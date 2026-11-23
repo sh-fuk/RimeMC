@@ -319,6 +319,7 @@ impl Game {
                             self.broadcast_chunk(c, &pkt);
                             self.broadcast_chunk(c, &self.entity_event(v, 7));
                         }
+                        self.trigger_entity(rider, "tame_animal", v);
                     } else {
                         // throw the rider off and rear
                         self.with_mob(v, |_, _, _| ());

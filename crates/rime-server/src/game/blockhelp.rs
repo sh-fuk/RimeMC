@@ -371,6 +371,7 @@ impl Game {
                         b = if name == "carved_pumpkin" { block::with_facing(b, if axis(d) == 1 { NORTH } else { opp(d) }) } else { b };
                         self.set_block(front, b, flags::ALL);
                         self.level_event(1000, p, 0);
+                        self.check_build(front, None);
                         return (rest, None);
                     }
                 }

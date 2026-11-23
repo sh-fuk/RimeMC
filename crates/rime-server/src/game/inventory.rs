@@ -29,7 +29,7 @@ pub struct Inventory {
     /// contents of an open block container (`Window::Container`)
     pub ext: Vec<Option<Stack>>,
     /// results taken from a crafting grid / workstation (statistics)
-    pub crafted: Vec<Stack>,
+    pub crafted: Vec<(Stack, Option<String>)>,
     /// slots changed since the last sync: (window id, slot)
     pub dirty: Vec<(u8, i16)>,
     drag: Option<(u8, Vec<i16>)>,
@@ -223,6 +223,28 @@ impl Inventory {
         }
     }
 
+    /// (grid size, window slots of the crafting grid), if one is open.
+    pub fn grid_layout(&self) -> Option<(usize, Vec<usize>)> {
+        let (c, s) = self.grid();
+        (!c.is_empty()).then_some((s, c))
+    }
+
+    /// Moves the crafting grid back into the inventory; returns what did not fit.
+    pub fn clear_grid(&mut self, held: i16) -> Vec<Stack> {
+        let (cells, _) = self.grid();
+        let mut left = Vec::new();
+        for c in cells {
+            if let Some(st) = self.get_w(c) {
+                self.set_w(c, None);
+                let n = self.add(st, held);
+                if n > 0 {
+                    left.push(Stack { count: n, ..st });
+                }
+            }
+        }
+        left
+    }
+
     fn grid(&self) -> (Vec<usize>, usize) {
         match self.window {
             Window::Player => ((1..=4).collect(), 2),
@@ -262,9 +284,16 @@ impl Inventory {
     }
 
     fn take_result(&mut self, data: &GameData) -> Option<Stack> {
+        let recipe = if self.menu_screen().is_none() {
+            let (cells, size) = self.grid();
+            let grid: Vec<Option<i32>> = cells.iter().map(|&i| self.get_w(i).map(|s| s.item)).collect();
+            if cells.is_empty() { None } else { data.craft_recipe(&grid, size).map(|r| r.id.clone()) }
+        } else {
+            None
+        };
         let r = self.take_result_inner(data);
         if let Some(s) = r {
-            self.crafted.push(s);
+            self.crafted.push((s, recipe));
         }
         r
     }
