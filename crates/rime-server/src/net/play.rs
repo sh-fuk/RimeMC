@@ -392,6 +392,8 @@ struct Session {
     pending_dim: Option<(crate::world::storage::Dim, crate::world::storage::Dim, [f64; 3])>,
     /// overworld position when entering the nether (`enteredNetherPosition`)
     nether_entry: Option<[f64; 3]>,
+    /// active effects at the last check (`effects_changed`)
+    effect_sig: Vec<(u8, i32)>,
     credits_done: bool,
     combat: CombatChecker,
     vl: Violations,
@@ -440,6 +442,7 @@ impl Session {
             inv_sig: 0,
             pending_dim: None,
             nether_entry: None,
+            effect_sig: Vec::new(),
             credits_done: false,
             queue: Vec::new(),
             in_flight: 0,
@@ -1918,6 +1921,11 @@ impl Session {
         }
         if self.tick % 20 == 0 {
             self.game.trigger_simple(&self.me, "location");
+            let sig: Vec<(u8, i32)> = self.me.vit.lock().living.effects.iter().map(|e| (e.effect as u8, e.amplifier)).collect();
+            if sig != self.effect_sig {
+                self.effect_sig = sig;
+                self.game.trigger_effects(&self.me, None);
+            }
         }
         let using = self.me.vit.lock().living.using.map(|u| u.hand);
         if let Some(hand) = using {
@@ -2440,6 +2448,11 @@ impl Session {
             }
             return;
         }
+        if name == "fishing_rod" {
+            let hand_slot = if hand == 1 { crate::game::combat::living::OFFHAND } else { crate::game::combat::living::MAINHAND };
+            game.use_fishing_rod(&self.me, held, hand_slot);
+            return;
+        }
         match name.as_str() {
             "bucket" => {
                 let hit = self.raycast(yaw, pitch, &|b| fluid::fluid_state(b).is_source() || b.is_solid());
@@ -2451,10 +2464,12 @@ impl Session {
                         _ => return,
                     };
                     game.player_change_block([c.0, c.1, c.2], blocks::AIR, false, None);
+                    let full = Stack::new(items.id(filled).unwrap_or(0), 1);
+                    self.me.award(crate::game::stats::USED, "bucket", 1);
+                    game.trigger_item(&self.me, "filled_bucket", full);
                     if gm != 1 {
                         let mut inv = self.me.inv.lock();
                         inv.consume(slot, 1);
-                        let full = Stack::new(items.id(filled).unwrap_or(0), 1);
                         if inv.slots[slot].is_none() {
                             inv.set(slot, Some(full));
                         } else if inv.add(full, slot as i16 - 36) > 0 {
@@ -2576,7 +2591,11 @@ impl Session {
                 return;
             }
         }
-        if be::unpack_loot(&mut t, screen.size(), &game.data) || game.world.block_entity(p).is_none() {
+        let loot_table = t.get("LootTable").and_then(|v| v.as_str()).map(str::to_string);
+        if loot_table.is_some() && be::unpack_loot(&mut t, screen.size(), &game.data) {
+            game.trigger_container_loot(&self.me, loot_table.as_deref().unwrap_or(""));
+            game.world.set_block_entity(p, Some(t.clone()), false);
+        } else if game.world.block_entity(p).is_none() {
             game.world.set_block_entity(p, Some(t.clone()), false);
         }
         self.next_window = self.next_window % 100 + 1;

@@ -28,6 +28,8 @@ pub enum EKind {
     Knot,
     /// `ItemFrame` / `GlowItemFrame` (pos is the frame's centre)
     Frame { item: Option<Stack>, rotation: u8, facing: u8, glow: bool, fixed: bool },
+    /// `FishingHook`
+    Bobber(Box<super::fishing::Bobber>),
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +72,7 @@ impl Entity {
             EKind::Boat { .. } => (0.6875, 0.5625),
             EKind::Minecart(_) => (0.49, 0.7),
             EKind::Knot => (0.1875, 0.5),
+            EKind::Bobber(_) => (0.125, 0.25),
         }
     }
 }

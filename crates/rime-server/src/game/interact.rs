@@ -34,6 +34,16 @@ impl Game {
     pub fn interact_mob(&self, p: &Arc<Player>, eid: i32, hand: i32) -> bool {
         let slot = if hand == 1 { 45 } else { 36 + p.held.load(Ordering::Relaxed) as usize };
         let held = p.inv.lock().slots[slot];
+        let ok = self.interact_mob_inner(p, eid, hand);
+        if ok {
+            self.trigger_interact_entity(p, held, eid);
+        }
+        ok
+    }
+
+    fn interact_mob_inner(&self, p: &Arc<Player>, eid: i32, hand: i32) -> bool {
+        let slot = if hand == 1 { 45 } else { 36 + p.held.load(Ordering::Relaxed) as usize };
+        let held = p.inv.lock().slots[slot];
         let creative = p.gamemode.load(Ordering::Relaxed) == 1;
         if p.gamemode.load(Ordering::Relaxed) == 3 {
             return false;

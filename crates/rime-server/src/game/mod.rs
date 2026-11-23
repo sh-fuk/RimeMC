@@ -46,6 +46,7 @@ pub mod advancement;
 pub mod recipebook;
 pub mod triggers;
 pub mod golem;
+pub mod fishing;
 pub mod cmdapi;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1041,6 +1042,7 @@ impl Game {
             EKind::Boat { ty, .. } => (regs.id("minecraft:entity_type", &format!("minecraft:{ty}")).unwrap_or(0), 0),
             EKind::Minecart(c) => (regs.id("minecraft:entity_type", &format!("minecraft:{}", c.ty)).unwrap_or(0), 0),
             EKind::Knot => (regs.id("minecraft:entity_type", "minecraft:leash_knot").unwrap_or(0), 0),
+            EKind::Bobber(b) => (regs.id("minecraft:entity_type", "minecraft:fishing_bobber").unwrap_or(0), b.owner),
             EKind::Frame { glow, facing, .. } => (regs.id("minecraft:entity_type", if *glow { "minecraft:glow_item_frame" } else { "minecraft:item_frame" }).unwrap_or(0), *facing as i32),
             _ => unreachable!(),
         };
@@ -1322,7 +1324,7 @@ impl Game {
                 if matches!(e.kind, EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. } | EKind::Fangs { .. }) {
                     continue;
                 }
-                if let EKind::Frame { .. } | EKind::Knot = e.kind {
+                if let EKind::Frame { .. } | EKind::Knot | EKind::Bobber(_) = e.kind {
                     continue;
                 }
                 if let EKind::Crystal { .. } = e.kind {
@@ -1372,7 +1374,7 @@ impl Game {
                             continue;
                         }
                     }
-                    EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. } | EKind::Fangs { .. } | EKind::Crystal { .. } | EKind::Frame { .. } | EKind::Boat { .. } | EKind::Minecart(_) | EKind::Knot => {}
+                    EKind::Mob(_) | EKind::Projectile(_) | EKind::Cloud(_) | EKind::Lightning { .. } | EKind::Fangs { .. } | EKind::Crystal { .. } | EKind::Frame { .. } | EKind::Boat { .. } | EKind::Minecart(_) | EKind::Knot | EKind::Bobber(_) => {}
                     EKind::Tnt { fuse, owner } => {
                         *fuse -= 1;
                         if *fuse <= 0 {
@@ -1488,6 +1490,7 @@ impl Game {
             block::container::hopper_cart_tick(self, eid, pos);
         }
         self.tick_rides();
+        self.tick_bobbers();
         self.tick_leashes();
         self.tick_merchants();
         self.tick_mob_pickup();

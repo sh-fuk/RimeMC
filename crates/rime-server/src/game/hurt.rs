@@ -147,6 +147,7 @@ impl Game {
             EKind::Fangs { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "evoker_fangs", ..Default::default() } },
             EKind::Tnt { .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "tnt", ..Default::default() } },
             EKind::Knot => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "leash_knot", ..Default::default() } },
+            EKind::Bobber(_) => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: "fishing_bobber", ..Default::default() } },
             EKind::Boat { ty, .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: ty, ..Default::default() } },
             EKind::Minecart(c) => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: c.ty, ..Default::default() } },
             EKind::Frame { glow, .. } => EntityRef { eid, player: false, living: false, pos: e.pos, info: EntInfo { type_name: if *glow { "glow_item_frame" } else { "item_frame" }, ..Default::default() } },

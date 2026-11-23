@@ -32,6 +32,7 @@ impl Entity {
             EKind::Boat { ty, .. } => (*ty).into(),
             EKind::Minecart(c) => c.ty.to_string(),
             EKind::Knot => "leash_knot".into(),
+            EKind::Bobber(_) => "fishing_bobber".into(),
             EKind::Frame { glow, .. } => if *glow { "glow_item_frame" } else { "item_frame" }.into(),
         }
     }

@@ -399,6 +399,25 @@ impl GameData {
 
     /// Rolls a non-block loot table ("chests/simple_dungeon",
     /// "entities/zombie"); items are merged into stacks.
+    /// `gameplay/fishing`: junk / treasure / fish by weight + quality × luck
+    /// (treasure only in open water).
+    pub fn roll_fishing(&self, luck: i32, open_water: bool, _biome: Option<&str>, rng: &mut impl Rng) -> Vec<Stack> {
+        let w = |weight: i32, quality: i32| (weight + quality * luck).max(0);
+        let parts = [("junk", w(10, -2)), ("treasure", if open_water { w(5, 2) } else { 0 }), ("fish", w(85, -1))];
+        let total: i32 = parts.iter().map(|p| p.1).sum();
+        if total <= 0 {
+            return Vec::new();
+        }
+        let mut r = rng.gen_range(0..total);
+        for (name, weight) in parts {
+            if r < weight {
+                return self.roll_loot(&format!("gameplay/fishing/{name}"), rng);
+            }
+            r -= weight;
+        }
+        Vec::new()
+    }
+
     pub fn roll_loot(&self, table: &str, rng: &mut impl Rng) -> Vec<Stack> {
         let key = strip(table);
         let Some(t) = self.loot.get(key) else { return Vec::new() };

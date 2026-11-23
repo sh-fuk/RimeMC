@@ -111,6 +111,7 @@ impl Game {
             if let Some(vp) = vp {
                 p.pose.lock().pos = vp;
             }
+            self.trigger_simple(&p, "started_riding");
         }
         self.broadcast_passengers(v);
         true
